@@ -139,10 +139,16 @@ export function createGateway({ pool, paramPool, senders, config, log = () => {}
       /**
        * 上游可能以 HTTP 200 包业务错误码（本项目多处如此：3001/3007/3012/1113 都在 body 的
        * `code` 字段），故**必须解析 body 判定**，不能只看 `res.status`。
-       * 只有 200 且 `code === 0`（或无 `code`，即普通成功响应/非 JSON body）才算成功；
-       * body 读取失败也按成功处理（上游已 200，交给客户端解析）。
+       * 只有 200 且 `code === 0`（或无 `code`，即普通成功响应/非 JSON body）才算成功。
+       *
+       * 关键：`Response.body` 是**一次性流**，直接 `res.text()` 会把它消费掉，之后调用方
+       * `response.json()` 会抛 "Body is unusable"，或（流式）`res.body.getReader()` 抛
+       * "ReadableStream is locked" 并被 finally 静默吞掉 → 客户端拿到 **200 + 空 body**。
+       * 故先 `clone()` 出副本用于判定，原响应体留给调用方消费。
+       * （测试用的假响应对象没有 clone，回退为直接读取——那时 body 语义由假对象自己保证。）
        */
-      const text = await res.text().catch(() => '')
+      const probe = typeof res.clone === 'function' ? res.clone() : res
+      const text = await probe.text().catch(() => '')
       const code = parseCode(text)
       const isOk = res.status === 200 && (code === null || code === 0)
       if (isOk) {

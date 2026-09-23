@@ -520,3 +520,55 @@ describe('gateway 配置缺省与防御性边界', () => {
     expect(Date.now() - t0).toBeLessThan(1000)
   })
 })
+
+// 【关键回归】响应体一次性：网关判定业务码时绝不能消费掉返回给调用方的 body。
+// 早期实现用 `await res.text()` 直接读原响应，导致调用方 response.json() 抛
+// "Body is unusable"（非流式 502）或流式拿到 200+空 body（ReadableStream is locked
+// 被 finally 静默吞掉）。172 个测试全绿也掩盖了它，因为上游全是假对象。
+// 本测试用**真实 Response**，堵住这个集成盲区。
+describe('gateway 不破坏响应体（真实 Response）', () => {
+  const realPool = () => ({
+    pick: () => ({ account: { id: 'a1', type: 'oauth', jwt: 'J', apiKey: null, stats: {} }, waitMs: 0 }),
+    markSuccess: async () => {},
+    markError: async () => {},
+  })
+
+  it('非流式：成功后调用方仍能读取 JSON body', async () => {
+    const payload = { id: 'm1', content: [{ type: 'text', text: '你好' }], usage: { input_tokens: 3, output_tokens: 2 }, stop_reason: 'end_turn' }
+    const g = createGateway({
+      pool: realPool(), paramPool: { take: async () => 'P' },
+      senders: { oauth: async () => new Response(JSON.stringify(payload), { status: 200, headers: { 'content-type': 'application/json' } }), apikey: async () => new Response() },
+      config: { maxRetries: 2 },
+    })
+    const { response } = await g.complete({ model: 'GLM-5.3' }, {})
+    const data = await response.json() // 此处曾抛 "Body is unusable"
+    expect(data.content[0].text).toBe('你好')
+  })
+
+  it('流式：成功后调用方仍能逐块读取 body', async () => {
+    const sse = 'event: message_start\ndata: {"type":"message_start"}\n\nevent: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"}}\n\n'
+    const g = createGateway({
+      pool: realPool(), paramPool: { take: async () => 'P' },
+      senders: { oauth: async () => new Response(sse, { status: 200, headers: { 'content-type': 'text/event-stream' } }), apikey: async () => new Response() },
+      config: { maxRetries: 2 },
+    })
+    const { response } = await g.complete({ model: 'GLM-5.3', stream: true }, {})
+    const reader = response.body.getReader() // 此处曾抛 "ReadableStream is locked"
+    const chunks = []
+    for (;;) {
+      const { done, value } = await reader.read()
+      if (done) break
+      chunks.push(new TextDecoder().decode(value))
+    }
+    expect(chunks.join('')).toContain('message_start')
+  })
+
+  it('上游 200 包业务错误码时仍被判定为失败（clone 不削弱判定）', async () => {
+    const g = createGateway({
+      pool: realPool(), paramPool: { take: async () => 'P' },
+      senders: { oauth: async () => new Response('{"code":3012,"msg":"blocked"}', { status: 200 }), apikey: async () => new Response() },
+      config: { maxRetries: 0 },
+    })
+    await expect(g.complete({ model: 'GLM-5.3' }, {})).rejects.toMatchObject({ code: 3012 })
+  })
+})

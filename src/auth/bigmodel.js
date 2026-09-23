@@ -70,5 +70,12 @@ export async function beginBigModelLogin({ fetchImpl = fetch, callbackHost = '12
     }
   }
 
-  return { authorizeUrl, result, cancel: () => rejectResult(new Error('cancelled')), close: () => server.close() }
+  // close() 要真正释放端口：`server.close()` 只停止接受新连接，已建立的 keep-alive
+  // 连接会让端口一直占着（谁探测过一次就会留下这样一条），故同时销毁残留连接。
+  const close = () => {
+    try { server.closeAllConnections?.() } catch {}
+    return server.close()
+  }
+
+  return { authorizeUrl, result, cancel: () => rejectResult(new Error('cancelled')), close }
 }

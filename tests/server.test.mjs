@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeEach } from 'vitest'
 import request from 'supertest'
+import http from 'node:http'
 import os from 'node:os'
 import fs from 'node:fs'
 import path from 'node:path'
@@ -43,7 +44,11 @@ function buildDeps(over = {}) {
   const gateway = {
     complete: over.complete ?? (async () => ({ response: defaultResponse, account: { id: 'x' } })),
   }
-  return { config, store, pool, paramPool, requestLog, gateway, fetchImpl: over.fetchImpl, log: () => {}, ...over.appOverrides }
+  // 注意：over 里除 complete/fetchImpl 之外的键（loginTtlMs/now/isLocal 等 createApp 的注入点）
+  // 必须透传给 createApp —— 早期只展开 over.appOverrides，导致 buildDeps({loginTtlMs}) 被静默丢弃，
+  // 回收测试因此用着 10 分钟的真实 TTL，永远看不到回收。
+  const { complete, fetchImpl, appOverrides, ...rest } = over
+  return { config, store, pool, paramPool, requestLog, gateway, fetchImpl, log: () => {}, ...rest, ...appOverrides }
 }
 
 describe('auth & misc routes', () => {
@@ -132,6 +137,161 @@ describe('account login & management', () => {
     const r = await request(app).post('/accounts/balance/refresh')
     expect(r.status).toBe(200)
     expect(r.body.results[0].ok).toBe(true)
+  })
+})
+
+// P1：管理面 async 路由内部 await 抛错（磁盘满/权限错）——Express 4 **不会**自动捕获
+// async 处理器抛出的异常，旧实现既不给响应（请求永久挂死到超时）又产生 unhandled
+// rejection（Node ≥15 默认模式下可能终止进程）。
+// 断言方式：supertest 不设 deadline，若实现仍挂死则整个测试超时失败；正确的实现回 500。
+describe('管理面 async 路由的异常处理', () => {
+  const throwingStore = (base, msg = 'disk full') => Object.assign(Object.create(base), {
+    update: () => Promise.reject(new Error(msg)),
+    save: () => Promise.reject(new Error(msg)),
+    list: () => base.list(),
+    get: (id) => base.get(id),
+    delete: (id) => base.delete(id),
+  })
+
+  it('/accounts/set：store.update 抛错时返回 500，而不是挂死', async () => {
+    const base = buildDeps()
+    await base.store.save(newAccountFields({ provider: 'bigmodel', type: 'oauth', jwt: 'j', userInfo: { user_id: '9' } }))
+    const app = createApp({ ...base, store: throwingStore(base.store) })
+    const r = await request(app).post('/accounts/set').send({ id: 'bigmodel:9', enabled: false })
+    expect(r.status).toBe(500)
+    expect(r.body.error.message).toBeTruthy()
+  })
+
+  it('/accounts/login/:provider/poll：store.save 抛错时返回 500，而不是挂死', async () => {
+    const base = buildDeps({
+      fetchImpl: async (url) => (url.includes('/oauth/token')
+        ? { json: async () => ({ code: 0, data: { token: 'ZJWT' } }) }
+        : { json: async () => ({}) }),
+    })
+    const app = createApp({ ...base, store: throwingStore(base.store, 'permission denied') })
+    const start = await request(app).post('/accounts/login/bigmodel/start')
+    const url = new URL(start.body.authorizeUrl)
+    await fetch(`${decodeURIComponent(url.searchParams.get('redirect'))}?state=${url.searchParams.get('state')}&authCode=AC`)
+    const poll = await request(app).post('/accounts/login/bigmodel/poll').send({ loginId: start.body.loginId })
+    expect(poll.status).toBe(500)
+    expect(poll.body.error.message).toBeTruthy()
+  })
+
+  it('/accounts/balance/refresh：某账号 update 抛错不拖垮整个路由', async () => {
+    const base = buildDeps()
+    await base.store.save(newAccountFields({ provider: 'bigmodel', type: 'oauth', jwt: 'JW', userInfo: { user_id: '5' } }))
+    const app = createApp({
+      ...base,
+      store: throwingStore(base.store),
+      fetchImpl: async () => ({
+        status: 200,
+        json: async () => ({ code: 0, data: { balances: [{ entitlement_id: 'e', total_units: 10, used_units: 1, available_units: 9 }] } }),
+      }),
+    })
+    const r = await request(app).post('/accounts/balance/refresh')
+    expect(r.status).toBe(200)
+    expect(r.body.results[0].ok).toBe(false)
+  })
+})
+
+// 常驻服务不应因单个请求异常退出：main() 必须注册 unhandledRejection/uncaughtException
+// 处理器并保持进程存活（Node ≥15 默认模式下 unhandledRejection 会终止进程）。
+// 这里不真的启动 main()（会起监听端口/launchFarmBrowser），改为断言其源码级行为：
+// 两个处理器在 main() 内注册且**不**调用 process.exit。
+describe('main() 的进程级健壮性', () => {
+  it('注册 unhandledRejection 与 uncaughtException，且不因之退出进程', async () => {
+    const src = fs.readFileSync(new URL('../src/server.js', import.meta.url), 'utf8')
+    const mainBody = src.slice(src.indexOf('export async function main()'))
+    expect(mainBody).toMatch(/process\.on\(\s*['"]unhandledRejection['"]/)
+    expect(mainBody).toMatch(/process\.on\(\s*['"]uncaughtException['"]/)
+    // 处理器内部不得调用 process.exit（那等于"忽略了却仍然退出"）。
+    // 只看两个 process.on(...) 到 "const store = new AccountStore" 之间的处理器体，
+    // 避开 main() 开头"缺 API_KEY 即 exit(1)"这条合法的启动期失败路径。
+    const start = mainBody.indexOf("process.on('unhandledRejection'")
+    const handlers = mainBody.slice(start, mainBody.indexOf('const store = new AccountStore'))
+    expect(start).toBeGreaterThan(-1)
+    expect(handlers).not.toMatch(/process\.exit/)
+  })
+})
+
+// 废弃登录回收：`/accounts/login/:provider/start` 后既不 poll 也不 cancel（用户关标签页、
+// 网络断）的登录，其回调 server 持续监听、logins 条目永久滞留。
+// 实测旧实现 30 次废弃 start → 30/30 端口仍监听，长期运行必然耗尽资源。
+describe('废弃登录的回收', () => {
+  // 回调 server 的真实端口可从 authorizeUrl 的 redirect 参数解析出来 —— 这是黑盒可观测的
+  // "端口仍在监听"证据，无需暴露内部 Map。
+  const callbackPort = (authorizeUrl) => {
+    const redirect = decodeURIComponent(new URL(authorizeUrl).searchParams.get('redirect'))
+    return new URL(redirect).port
+  }
+  // 向回调端口发一次请求：监听中 → resolve(true)，已关闭 → resolve(false)
+  // agent:false 禁用 keep-alive 连接复用：否则首次探测建立的 socket 会被后续探测复用，
+  // 即使 server 已 close 也会 "连得上"，导致断言永远看到端口存活。
+  const portAlive = (port) => new Promise((resolve) => {
+    const req = http.request({ host: '127.0.0.1', port, path: '/oauth/callback/bigmodel', method: 'GET', agent: false, headers: { connection: 'close' } }, () => resolve(true))
+    req.on('error', () => resolve(false))
+    req.end()
+  })
+
+  // server.close() 与 closeAllConnections() 都是异步的：回收后端口释放需要若干轮事件循环。
+  // 固定 sleep 在某些机器上不够稳，改为轮询等待端口真正关闭（上限 2s）。
+  const waitPortClosed = async (port) => {
+    for (let i = 0; i < 40; i++) {
+      if (!(await portAlive(port))) return true
+      await new Promise((r) => setTimeout(r, 50))
+    }
+    return false
+  }
+
+  const start = async (app) => {
+    const r = await request(app).post('/accounts/login/bigmodel/start')
+    expect(r.status).toBe(200)
+    return r.body
+  }
+
+  it('超时未 poll/cancel 的登录会被回收：回调端口关闭且 poll 回 404', async () => {
+    let t = 1_000_000
+    const app = createApp(buildDeps({ loginTtlMs: 1000, now: () => t }))
+    const abandoned = await start(app)
+    const port = callbackPort(abandoned.authorizeUrl)
+    expect(await portAlive(port)).toBe(true) // 回调 server 初始确实在监听
+
+    t += 2000 // 超过 TTL，登录被废弃（既不 poll 也不 cancel）
+
+    // 任意一次 start 触发惰性回收
+    await start(app)
+    // 双证据：条目已移除（poll 404）且回调端口已释放（close() 生效）。
+    const poll = await request(app).post('/accounts/login/bigmodel/poll').send({ loginId: abandoned.loginId })
+    expect(poll.status).toBe(404)
+    expect(await waitPortClosed(port)).toBe(true) // 端口已释放
+  })
+
+  it('TTL 内未超时的登录不受影响（回收不误伤进行中的登录）', async () => {
+    let t = 1_000_000
+    const app = createApp(buildDeps({ loginTtlMs: 1000, now: () => t }))
+    const live = await start(app)
+    const port = callbackPort(live.authorizeUrl)
+
+    t += 500 // 未超时
+    await start(app) // 触发回收检查
+    await new Promise((r) => setTimeout(r, 100))
+
+    expect(await portAlive(port)).toBe(true) // 仍在监听
+    const poll = await request(app).post('/accounts/login/bigmodel/poll').send({ loginId: live.loginId })
+    expect(poll.status).toBe(200)
+    expect(poll.body.status).toBe('pending')
+  })
+
+  it('poll 也会触发回收（不依赖新的 start）', async () => {
+    let t = 1_000_000
+    const app = createApp(buildDeps({ loginTtlMs: 1000, now: () => t }))
+    const abandoned = await start(app)
+    const port = callbackPort(abandoned.authorizeUrl)
+    t += 2000
+
+    // 只有 poll，没有新的 start
+    const poll = await request(app).post('/accounts/login/bigmodel/poll').send({ loginId: abandoned.loginId })
+    expect(poll.status).toBe(404)
   })
 })
 

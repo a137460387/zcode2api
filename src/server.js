@@ -28,6 +28,31 @@ export function createApp(deps) {
   app.use(express.json({ limit: '32mb' }))
   const logins = new Map()
 
+  /**
+   * 废弃登录的回收时限：`/start` 后既不 poll 也不 cancel 的登录（用户关标签页、
+   * 网络断）其回调 server 会持续监听、`logins` 条目永久滞留（实测 30 次废弃 start
+   * → 30/30 端口仍监听）。BigModel 回调服务与 Z.AI 轮询的实际耗时都远短于 10 分钟。
+   * 可经 deps.loginTtlMs 注入更短的值以便测试（生产走默认）。
+   */
+  const LOGIN_TTL_MS = deps.loginTtlMs ?? 10 * 60_000
+  const now = deps.now ?? Date.now
+  /**
+   * 惰性回收：在每次 start/poll 时顺带清理超时条目（`cancel()` 让挂起的登录 promise
+   * 落地，`close?.()` 释放回调 server 的监听端口，最后从 Map 删除）。
+   * 不另起定时器：定时器会给 createApp 引入需要显式回收的句柄（测试难以干净退出），
+   * 而 start/poll 本就是这条生命周期唯一的入口，挂在这里足够及时。
+   */
+  const reapExpiredLogins = () => {
+    const t = now()
+    for (const [id, entry] of logins) {
+      if (t - entry.at < LOGIN_TTL_MS) continue
+      try { entry.login.cancel?.() } catch (e) { log(`[accounts] login cancel failed: ${e?.message ?? e}`) }
+      try { entry.login.close?.() } catch (e) { log(`[accounts] login close failed: ${e?.message ?? e}`) }
+      logins.delete(id)
+      log(`[accounts] reaped abandoned login ${id} (${entry.provider})`)
+    }
+  }
+
   // `isLocal` 可注入（deps.isLocal）：Socket.remoteAddress 是只读的 getter，
   // 测试无法伪造成非本机来源，导致"非本机必须校验面板密码"这条安全边界无从覆盖。
   const isLocal = deps.isLocal ?? ((req) => {
@@ -151,18 +176,32 @@ export function createApp(deps) {
     res.json({ accounts: pool.status(), paramPool: paramPool.status(), farmUrl, requests: requestLog.list(50) })
   })
 
-  app.post('/accounts/set', panelAuth, async (req, res) => {
+  /**
+   * async 路由包装器：Express 4 **不会**捕获 async 处理器返回的 rejected promise。
+   * 未包装时处理器内部 `await store.update(...)` 抛错（磁盘满/权限错）会导致：
+   * 请求**永不响应**（挂死到客户端超时）且产生 unhandled rejection
+   * （Node ≥15 默认模式下可能终止进程）。
+   * 这里统一 catch 并回 500 JSON（已发头则只能结束响应）。
+   * 不引入 express-async-errors 之类的新依赖——包装一层即可。
+   */
+  const wrap = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch((err) => {
+    log(`[server] ${req.method} ${req.originalUrl} failed: ${err?.message ?? err}`)
+    if (res.headersSent) return res.end()
+    return res.status(500).json({ error: { message: err?.message ?? 'internal error' } })
+  })
+
+  app.post('/accounts/set', panelAuth, wrap(async (req, res) => {
     const { id, enabled } = req.body
     const updated = await store.update(id, { enabled: Boolean(enabled) })
     if (!updated) return res.status(404).json({ error: { message: 'account not found' } })
     res.json({ ok: true })
-  })
+  }))
 
   app.post('/accounts/delete', panelAuth, (req, res) => {
     res.json({ ok: store.delete(req.body.id) })
   })
 
-  app.post('/accounts/balance/refresh', panelAuth, async (req, res) => {
+  app.post('/accounts/balance/refresh', panelAuth, wrap(async (req, res) => {
     const results = []
     for (const acc of store.list().filter((a) => a.type === 'oauth' && a.jwt)) {
       try {
@@ -174,10 +213,11 @@ export function createApp(deps) {
       }
     }
     res.json({ results })
-  })
+  }))
 
-  app.post('/accounts/login/:provider/start', panelAuth, async (req, res) => {
+  app.post('/accounts/login/:provider/start', panelAuth, wrap(async (req, res) => {
     const { provider } = req.params
+    reapExpiredLogins()
     try {
       let login
       if (provider === 'bigmodel') {
@@ -188,14 +228,15 @@ export function createApp(deps) {
         return res.status(404).json({ error: { message: 'unknown provider' } })
       }
       const loginId = crypto.randomUUID()
-      logins.set(loginId, { provider, login, at: Date.now() })
+      logins.set(loginId, { provider, login, at: now() })
       res.json({ loginId, authorizeUrl: login.authorizeUrl })
     } catch (e) {
       res.status(502).json({ error: { message: e.message } })
     }
-  })
+  }))
 
-  app.post('/accounts/login/:provider/poll', panelAuth, async (req, res) => {
+  app.post('/accounts/login/:provider/poll', panelAuth, wrap(async (req, res) => {
+    reapExpiredLogins()
     const { loginId } = req.body
     const entry = logins.get(loginId)
     if (!entry) return res.status(404).json({ error: { message: 'login not found' } })
@@ -219,7 +260,7 @@ export function createApp(deps) {
       return res.json({ status: 'ready', account })
     }
     return res.json({ status: 'failed', error: winner.e.message })
-  })
+  }))
 
   app.post('/accounts/login/:provider/cancel', panelAuth, (req, res) => {
     const entry = logins.get(req.body.loginId)
@@ -241,6 +282,17 @@ export async function main() {
     process.exit(1)
   }
   const log = (msg) => console.log(msg)
+  /**
+   * 常驻服务不应因单个请求的异常而退出。Node ≥15 默认模式下 unhandledRejection 会终止进程，
+   * 而网关/管理面里任何一处遗漏的 await 都可能触发它——一次磁盘满就能让整个代理下线。
+   * 这里记录日志并**保持存活**；真正的致命错误（如端口占用）会在启动阶段直接抛出。
+   */
+  process.on('unhandledRejection', (reason) => {
+    log(`[zcode2api] unhandledRejection（已忽略，服务继续运行）: ${reason?.stack ?? reason}`)
+  })
+  process.on('uncaughtException', (err) => {
+    log(`[zcode2api] uncaughtException（已忽略，服务继续运行）: ${err?.stack ?? err}`)
+  })
   const store = new AccountStore(config.poolDir)
   const pool = new AccountPool(store, { minIntervalMs: config.minIntervalMs, cooldown3012Ms: config.cooldown3012Ms })
   const paramPool = new ParamPool({ ttlMs: config.paramTtlMs, maxSize: config.poolSize })
