@@ -214,3 +214,39 @@ describe('看板管理面鉴权', () => {
   })
 
 })
+
+// 非本机访问的安全边界：看板/管理面必须校验面板密码。
+// Socket.remoteAddress 是只读 getter，无法用 supertest 伪造远端来源，故通过注入
+// deps.isLocal 覆盖这条边界（否则"非本机需密码"完全无测试保护）。
+describe('看板非本机鉴权', () => {
+  const remoteDeps = (over = {}) => {
+    const base = buildDeps()
+    return { ...base, isLocal: () => false, config: { ...base.config, panelPassword: 'pw' }, ...over }
+  }
+
+  it('非本机无密码 → 401', async () => {
+    const app = createApp(remoteDeps())
+    expect((await request(app).get('/')).status).toBe(401)
+    expect((await request(app).get('/pool/status')).status).toBe(401)
+    expect((await request(app).post('/accounts/delete').send({ id: 'x' })).status).toBe(401)
+  })
+
+  it('非本机带正确密码 → 通过', async () => {
+    const app = createApp(remoteDeps())
+    const r = await request(app).get('/pool/status').set('x-panel-password', 'pw')
+    expect(r.status).toBe(200)
+    expect(Array.isArray(r.body.accounts)).toBe(true)
+  })
+
+  it('非本机密码错误 → 401', async () => {
+    const app = createApp(remoteDeps())
+    expect((await request(app).get('/pool/status').set('x-panel-password', 'wrong')).status).toBe(401)
+  })
+
+  it('未配置面板密码时，非本机一律拒绝（不能默认放行）', async () => {
+    const base = buildDeps()
+    const app = createApp({ ...base, isLocal: () => false, config: { ...base.config, panelPassword: '' } })
+    expect((await request(app).get('/pool/status')).status).toBe(401)
+    expect((await request(app).get('/pool/status').set('x-panel-password', '')).status).toBe(401)
+  })
+})

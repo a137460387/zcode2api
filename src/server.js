@@ -28,10 +28,12 @@ export function createApp(deps) {
   app.use(express.json({ limit: '32mb' }))
   const logins = new Map()
 
-  const isLocal = (req) => {
+  // `isLocal` 可注入（deps.isLocal）：Socket.remoteAddress 是只读的 getter，
+  // 测试无法伪造成非本机来源，导致"非本机必须校验面板密码"这条安全边界无从覆盖。
+  const isLocal = deps.isLocal ?? ((req) => {
     const addr = req.socket.remoteAddress ?? ''
     return addr === '127.0.0.1' || addr === '::1' || addr === '::ffff:127.0.0.1'
-  }
+  })
   const panelAuth = (req, res, next) => {
     if (isLocal(req)) return next()
     if (config.panelPassword && req.get('x-panel-password') === config.panelPassword) return next()
