@@ -1,0 +1,6 @@
+node_modules/
+accounts/
+certs/*
+!certs/README.txt
+.env
+*.log
