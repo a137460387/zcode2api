@@ -73,6 +73,10 @@ describe('loadConfig', () => {
     expect(loadConfig({ rootDir: '/tmp/x', env: { COOLDOWN_3012_MIN: '-1' } }).cooldown3012Ms).toBe(30 * 60_000)
   })
 
+  it('rejects a zero account min interval so throttling cannot be disabled', () => {
+    expect(loadConfig({ rootDir: '/tmp/x', env: { ACCOUNT_MIN_INTERVAL_MS: '0' } }).minIntervalMs).toBe(2000)
+  })
+
   it('falls back to defaults for non-finite numbers', () => {
     expect(loadConfig({ rootDir: '/tmp/x', env: { PORT: 'abc' } }).port).toBe(8787)
     expect(loadConfig({ rootDir: '/tmp/x', env: { PORT: 'Infinity' } }).port).toBe(8787)

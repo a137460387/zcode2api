@@ -37,7 +37,7 @@ export function loadConfig({ rootDir = process.cwd(), env = process.env } = {}) 
     chromePath: env.CHROME_PATH || '',
     poolSize: num(env.POOL_SIZE, 6, 1),
     paramTtlMs: num(env.PARAM_TTL_MS, 8 * 60_000, 0),
-    minIntervalMs: num(env.ACCOUNT_MIN_INTERVAL_MS, 2000, 0),
+    minIntervalMs: num(env.ACCOUNT_MIN_INTERVAL_MS, 2000, 1),
     cooldown3012Ms: num(env.COOLDOWN_3012_MIN, 30, 0) * 60_000,
     maxRetries: num(env.MAX_RETRIES, 2, 0),
   }
