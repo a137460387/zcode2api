@@ -42,5 +42,11 @@ export async function beginZaiLogin({ fetchImpl = fetch } = {}) {
     throw new Error('cancelled')
   })()
 
+  // 立即挂一个空 handler：`result` 在模块内部创建，调用方（先返回 authorizeUrl 给客户端、
+  // 下一次 HTTP 轮询请求才来读结果）无法同步挂 .catch，中间窗口内的 reject 会成为
+  // unhandled rejection——在 Node ≥15 默认模式下会终止进程。这里先"认领"该 promise，
+  // 调用方之后的 .catch 仍能正常拿到错误。
+  result.catch(() => {})
+
   return { authorizeUrl: d.authorize_url, result, cancel: () => { cancelled = true } }
 }

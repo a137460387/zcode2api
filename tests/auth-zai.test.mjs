@@ -50,3 +50,38 @@ describe('beginZaiLogin', () => {
     await expect(login.result).rejects.toThrow('failed')
   })
 })
+
+describe('beginZaiLogin 的 reject 时序安全', () => {
+  // result 在模块内部创建；真实用法是"start 先把 authorizeUrl 返回给客户端，
+  // 下一次 HTTP 轮询请求才来读结果"。中间窗口内若 result 已 reject，
+  // 未及时认领会成为 unhandled rejection（Node ≥15 默认终止进程）。
+  it('reject 时不产生 unhandled rejection（调用方稍后才 attach）', async () => {
+    const unhandled = []
+    const onUnhandled = (e) => unhandled.push(e)
+    process.on('unhandledRejection', onUnhandled)
+    try {
+      const fetchImpl = async (url) =>
+        url.endsWith('/oauth/cli/init')
+          ? {
+              json: async () => ({
+                code: 0,
+                data: {
+                  flow_id: 'F', poll_token: 'PT', authorize_url: 'https://chat.z.ai/x',
+                  expires_at: Math.floor(Date.now() / 1000) + 60, poll_interval_sec: 0,
+                },
+              }),
+            }
+          : { json: async () => ({ code: 0, data: { status: 'failed' } }) }
+
+      const login = await beginZaiLogin({ fetchImpl })
+      // 模拟调用方稍后才读结果（期间不挂任何 handler）
+      await new Promise((r) => setTimeout(r, 1100))
+      await expect(login.result).rejects.toThrow('authorization failed')
+      // 给 unhandledRejection 的检测留出时间
+      await new Promise((r) => setTimeout(r, 100))
+      expect(unhandled).toEqual([])
+    } finally {
+      process.off('unhandledRejection', onUnhandled)
+    }
+  })
+})
