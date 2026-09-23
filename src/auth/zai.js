@@ -14,7 +14,9 @@ export async function beginZaiLogin({ fetchImpl = fetch } = {}) {
   const initJson = await initRes.json()
   const d = initJson.data
   if (initJson.code !== 0 || !d?.authorize_url || !d?.flow_id) {
-    throw new Error(`zai init failed: ${JSON.stringify(initJson).slice(0, 200)}`)
+    // 只回显 code/msg：init 失败时响应体可能含 token / poll_token 等敏感字段，
+    // 整包拼进错误信息会把凭据写进日志与看板。
+    throw new Error(`zai init failed: code=${initJson.code} ${String(initJson.msg ?? '').slice(0, 200)}`)
   }
 
   let cancelled = false
@@ -29,8 +31,14 @@ export async function beginZaiLogin({ fetchImpl = fetch } = {}) {
       const pj = await pr.json()
       const st = pj.data?.status
       if (st === 'ready') {
+        // ready 但没有 token 说明响应不完整；静默返回 undefined 会把坏凭据传给网关，
+        // 后面每次请求都 401 且难以定位，宁可在这里就失败。
+        const token = pj.data?.token
+        if (typeof token !== 'string' || !token) {
+          throw new Error('authorization returned no token')
+        }
         return {
-          token: pj.data.token,
+          token,
           accessToken: pj.data.zai?.access_token ?? null,
           refreshToken: null,
           userInfo: pj.data.user ?? {},

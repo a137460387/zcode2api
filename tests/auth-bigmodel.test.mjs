@@ -65,3 +65,44 @@ describe('beginBigModelLogin', () => {
     login.close()
   })
 })
+
+describe('beginBigModelLogin 资源与重放防护', () => {
+  it('回调成功后停止监听，且同一 authCode 不会被重复交换', async () => {
+    let exchanges = 0
+    const fetchImpl = async () => {
+      exchanges++
+      return { json: async () => ({ code: 0, data: { token: 'J', bigmodel: { access_token: 'A', refresh_token: 'R' } } }) }
+    }
+    const login = await beginBigModelLogin({ fetchImpl })
+    const url = new URL(login.authorizeUrl)
+    const redirect = decodeURIComponent(url.searchParams.get('redirect'))
+    const state = url.searchParams.get('state')
+
+    const ok = await fetch(`${redirect}?state=${state}&authCode=AC1`)
+    expect(ok.status).toBe(200)
+    await login.result
+    expect(exchanges).toBe(1)
+
+    // 重放同一回调：不应再次交换 token（服务已停止监听或幂等拒绝）
+    let replayStatus = null
+    try {
+      replayStatus = (await fetch(`${redirect}?state=${state}&authCode=AC1`)).status
+    } catch {
+      replayStatus = 'connection-refused' // 端口已释放，属预期
+    }
+    expect(exchanges).toBe(1)
+    expect(replayStatus === 'connection-refused' || replayStatus === 200).toBe(true)
+    login.close()
+  })
+
+  it('state 不匹配时不交换 token', async () => {
+    let exchanges = 0
+    const fetchImpl = async () => { exchanges++; return { json: async () => ({}) } }
+    const login = await beginBigModelLogin({ fetchImpl })
+    const redirect = decodeURIComponent(new URL(login.authorizeUrl).searchParams.get('redirect'))
+    const r = await fetch(`${redirect}?state=WRONG&authCode=AC`)
+    expect(r.status).toBe(400)
+    expect(exchanges).toBe(0)
+    login.close()
+  })
+})

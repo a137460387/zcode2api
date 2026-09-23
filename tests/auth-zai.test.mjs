@@ -85,3 +85,34 @@ describe('beginZaiLogin 的 reject 时序安全', () => {
     }
   })
 })
+
+describe('beginZaiLogin 错误处理健壮性', () => {
+  it('init 失败时错误信息不回显敏感字段', async () => {
+    const fetchImpl = async () => ({
+      json: async () => ({ code: 7, msg: 'bad', data: { token: 'LEAKED_JWT', poll_token: 'LEAKED_PT' } }),
+    })
+    let err = null
+    try { await beginZaiLogin({ fetchImpl }) } catch (e) { err = e }
+    expect(err).not.toBeNull()
+    expect(err.message).not.toContain('LEAKED_JWT')
+    expect(err.message).not.toContain('LEAKED_PT')
+    expect(err.message).toContain('code=7')
+  })
+
+  it('ready 但缺 token 时 reject，而不是静默返回坏凭据', async () => {
+    const fetchImpl = async (url) =>
+      url.endsWith('/oauth/cli/init')
+        ? {
+            json: async () => ({
+              code: 0,
+              data: {
+                flow_id: 'F', poll_token: 'PT', authorize_url: 'https://chat.z.ai/x',
+                expires_at: Math.floor(Date.now() / 1000) + 60, poll_interval_sec: 0,
+              },
+            }),
+          }
+        : { json: async () => ({ code: 0, data: { status: 'ready', user: {}, zai: { access_token: 'A' } } }) }
+    const login = await beginZaiLogin({ fetchImpl })
+    await expect(login.result).rejects.toThrow('no token')
+  })
+})

@@ -40,6 +40,7 @@ describe('launchFarmBrowser（降级契约：绝不抛异常）', () => {
   })
 
   it('goto 抛错时返回 null、打日志、不抛异常', async () => {
+    const closeFn = vi.fn(async () => {})
     vi.doMock('playwright', () => ({
       chromium: {
         launch: async () => ({
@@ -50,7 +51,7 @@ describe('launchFarmBrowser（降级契约：绝不抛异常）', () => {
               },
             }),
           }),
-          close: vi.fn(),
+          close: closeFn,
         }),
       },
     }))
@@ -59,6 +60,9 @@ describe('launchFarmBrowser（降级契约：绝不抛异常）', () => {
     await expect(fresh({ url: 'http://127.0.0.1:1/farm', log })).resolves.toBeNull()
     expect(log.mock.calls[0][0]).toContain('自动农场启动失败')
     expect(log.mock.calls[0][0]).toContain('net::ERR_CONNECTION_REFUSED')
+    // 启动成功后失败必须回收浏览器，否则每次失败都留下一组孤儿 Chrome 进程
+    // （审查实测：goto 失败一次泄漏 8 个 chrome.exe 且持续存活）。
+    expect(closeFn).toHaveBeenCalledTimes(1)
   })
 
   it('log 缺省为 no-op 时同样不抛异常', async () => {

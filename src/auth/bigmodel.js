@@ -14,6 +14,15 @@ export async function beginBigModelLogin({ fetchImpl = fetch, callbackHost = '12
   // 标记为已处理；result 本身仍是同一个 promise，对调用方的返回值与语义完全不变。
   result.catch(() => {})
 
+  // 一次登录只允许换一次 token：回调可能被重放（浏览器重试/用户刷新页面），
+  // 重复用同一 authCode 打 broker 会浪费一次往返，且第二次大概率返回错误并覆盖首次结果。
+  let exchanged = false
+  const settle = (fn) => {
+    if (exchanged) return
+    exchanged = true
+    fn()
+  }
+
   const server = http.createServer((req, res) => {
     const url = new URL(req.url ?? '/', `http://${req.headers.host ?? callbackHost}`)
     const reply = (status, text) => {
@@ -22,14 +31,21 @@ export async function beginBigModelLogin({ fetchImpl = fetch, callbackHost = '12
     }
     if (req.method !== 'GET' || url.pathname !== CALLBACK_PATH) return reply(404, 'not found')
     if (url.searchParams.get('state') !== state) return reply(400, 'state mismatch')
+    if (exchanged) return reply(200, '授权已处理，可关闭此窗口。')
     const err = url.searchParams.get('error')
     const code = url.searchParams.get('authCode') ?? url.searchParams.get('code') ?? ''
     if (err || !code) {
       reply(400, '授权失败，可关闭此窗口')
-      return rejectResult(new Error(err || 'missing authCode'))
+      server.close()
+      return settle(() => rejectResult(new Error(err || 'missing authCode')))
     }
     reply(200, '授权成功，请返回 zcode2api 看板。')
-    exchange(code, url.origin + CALLBACK_PATH, state).then(resolveResult, rejectResult)
+    // 结果已确定：回调服务使命完成，立即停止监听（端口/socket 不再占用）
+    server.close()
+    exchange(code, url.origin + CALLBACK_PATH, state).then(
+      (v) => settle(() => resolveResult(v)),
+      (e) => settle(() => rejectResult(e)),
+    )
   })
 
   await new Promise((resolve) => server.listen(0, callbackHost, resolve))
