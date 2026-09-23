@@ -66,12 +66,22 @@ export class AccountPool {
    *   **不会随时间自愈**，等待是无意义的。调用方必须停止重试并暴露需人工干预的信号
    *   （T15：直接 503 + 告警，不能按 `waitMs` 空转重试）。
    * - `0` — 此刻就有健康账号可用（全员都不受节流/冷却约束）。
-   * - `> 0` — 真实剩余等待：**按 `pick()` 实际会走的两层选择算**，而不是逐个账号取最小。
-   *   - 若存在"有历史的健康号"仍在节流窗内 → 这些历史号里最早的解禁时刻（`lastUsed + minIntervalMs - t`）。
-   *     此时**从未用过的号不算数**：按两层门它们同样不放行（冷池的"新号不等待"只在窗内清空后生效）。
-   *   - 否则（历史号窗内已清空）→ 若存在从未用过的健康号则为 0（它们会立刻被放行）；
-   *     没有新号时取冷却中的号里最早的 `cooldownUntil - t`。
-   *   - 两者皆无（没有健康号、也没有从未用过/已过窗的健康号）→ `Infinity` → 归 0。
+   * - `> 0` — 真实剩余等待：**按 `pick()` 实际会走的顺序算**，而不是逐个账号取最小。
+   *   - 若存在**窗内的健康历史号** → 取它们中最早的过窗时刻（`lastUsed + minIntervalMs - t`）。
+   *     此时**不得**与更早的冷却解禁时刻取 min（见下）。
+   *   - 否则（健康号里已无窗内历史号）→ 若存在从未用过的健康号则为 0（它们会立刻被放行）；
+   *     没有健康号可发时取**可自愈冷却账号**里最早的 `cooldownUntil - t`。
+   *
+   * 阈值一律只取"窗内历史号最早过窗"，**不与冷却解禁取 min、也不取 max**：
+   * 冷却号既不健康、也就不参与 `pick()` 的 `used`/`fresh` 门（`healthy()` 已把
+   * `cooldownUntil > t` 排除），它早解禁既不能提前发号（窗内历史号仍挡门）、也不能推迟发号
+   * （窗内历史号一过窗，健康号立刻可发，与冷却号无关）。把它并进来无论 min 还是 max 都是错。
+   *
+   * **为什么"窗内历史号"优先且不与冷却取 min（修复轮 3 定案）**：`pick()` 的门是"只要存在
+   * 任何窗内的历史号就全体不发号"。因此当健康号仍在窗内时，哪怕某个冷却号更早解禁，
+   * 那个时刻也**拿不到号**——`pick()` 会被节流门挡住。把 `waitMs` 与冷却解禁取 min 会报出一个
+   * 派不上用场的更小值，调用方按它等待后重试仍拿不到号，白白空转一次 round-trip（实测低估
+   * 1000ms：健康号窗内剩 2000ms + 另一号冷却剩 1000ms 时旧实现报 1000ms）。
    *
    * 关键：**不能对所有账号取 `nextThrottleAt` 最小值再归零**。从未用过的号 `nextThrottleAt` 恒为 0
    * 却既不是"已过窗的历史号"也不是"随时可发的新号"（历史号还在窗内时它不放行），把它当 0
@@ -84,24 +94,32 @@ export class AccountPool {
       (a) => a.enabled !== false && a.needsRelogin !== true && a.noPackage !== true,
     )
     if (!selfHealing.length) return null
+    /**
+     * 与 `pick()` 的节流门**用同一个判定**：`blocking` = 健康（`healthy()` 已含冷却窗口）
+     * 且 `lastUsed > 0` 且仍在自己窗内的账号。只要它非空，`pick()` 就一律不发号，
+     * 故真实等待是**最后一个窗内历史号过窗**的时刻——`pick()` 要求"任何"窗内历史号都清空。
+     * 冷却号不在此列（它不健康，进不了 `pick()` 的门，也不影响门何时打开）。
+     */
     const healthyAccs = all.filter((a) => this.healthy(a))
-    const used = healthyAccs.filter((a) => this.lastUsed(a) > 0)
-    const fresh = healthyAccs.filter((a) => this.lastUsed(a) === 0)
-    let best = Infinity
-    // 仍在窗内的历史号：按 pick 的门，任何一个还在窗内就全员不发号
-    for (const a of used) {
-      const wait = this.lastUsed(a) + this.minIntervalMs - t
-      if (wait > best) continue
-      best = wait
+    let blockingEnd = 0
+    for (const a of healthyAccs) {
+      const used = this.lastUsed(a)
+      if (used > 0) blockingEnd = Math.max(blockingEnd, used + this.minIntervalMs)
     }
-    // 历史号窗内已清空（或本就没有历史号）：从没用过的号立刻能被放行
-    if (best <= 0 && fresh.length) best = 0
-    // 冷却是硬门槛，无论有无新号都算
+    if (blockingEnd > t) return Math.max(0, blockingEnd - t)
+    // 健康号里已无窗内历史号：从未用过的号立刻能被放行；否则等最早的可自愈冷却解禁
+    if (healthyAccs.some((a) => this.lastUsed(a) === 0)) return 0
+    // 已过窗的历史健康号此刻即可发号（`blockingEnd <= t` 且它不在冷却中）→ 不需等待
+    const passedWindow = healthyAccs.some((a) => this.lastUsed(a) > 0)
+    if (passedWindow) return 0
+    // 没有任何可发的健康号：等最早的可自愈冷却解禁；没有则须人工干预
+    let earliestCool = Infinity
     for (const a of selfHealing) {
       const cd = a.cooldownUntil ?? 0
-      if (cd > t) best = Math.min(best, cd - t)
+      if (cd > t) earliestCool = Math.min(earliestCool, cd)
     }
-    return Math.max(0, best)
+    if (earliestCool === Infinity) return null
+    return Math.max(0, earliestCool - t)
   }
 
   /**
@@ -193,7 +211,7 @@ export class AccountPool {
     /**
      * 两层选择，第一层区分"本池见过"与"从未用过"——这是连拍坍缩的根因所在。
      *
-     * - **有使用历史的号**（`lastUsed > 0`）：受 `minIntervalMs` 约束，`nextThrottleAt = used + minIntervalMs`。
+     * - **有使用历史的号**：受 `minIntervalMs` 约束，`nextThrottleAt = lastUsed + minIntervalMs`。
      * - **从未用过的号**（`lastUsed === 0`）：没有可节流的历史，随时可用（冷池必须能发号）。
      *
      * 只看 `nextThrottleAt` 排序是错的：历史号在窗内被夹到 `t + minIntervalMs`，而无历史号的
@@ -201,38 +219,47 @@ export class AccountPool {
      * 同一个刚用过的号也会被反复选中——正是实测 37,1,1,1 / 9997,1,1,1 的坍缩形态。
      * 故：**只要有历史号还在窗内，就先不发号**（哪怕还有从未用过的号），把 `waitMs` 交回调用方；
      * 窗内清空后，优先补偿节流窗已过的历史号（least-recently-used），最后才铺新号。
+     *
+     * **门必须对全体历史号生效（修复轮 3 定案，Critical）**：修复轮 2 里门只看"按
+     * `nextThrottleAt` 排序后的 `used[0]`"，只在它的 `wait > 0` 时才挡全体。但 `nextThrottleAt`
+     * 序与挑号用的 `lastUsed` 序**在数学上不同**：池中只要有一个"早已过窗"的号（它必然是
+     * `nextThrottleAt` 最小者），`used[0]` 就永远是它、`wait` 永远是 0 → 门被打开；随后挑号按
+     * `lastUsed` 升序（或亲和绑定优先）完全可以选中**另一个仍在窗内的号**，于是它在距上次使用
+     * 仅 1ms 时又被发出。随机序列实测违反率 43%（最小同号间隔 1ms）——门与挑号基于两套不一致的
+     * 排序，正是"常见情况正确"而非不变量的根源。
+     *
+     * 正解：门与挑号必须基于**同一个条件**——"是否存在仍在自己窗内的历史号"。门改用
+     * `blocking = all.filter(a => a.lastUsed(a) > 0 && nextThrottleAt(a) > t)`，只要它非空就
+     * 一律不发号，`waitMs` 取 `earliestWaitMs()`（全体窗内健康历史号中**最晚**过窗者的剩余）。
+     * 于是排序不再影响"能不能发"——只有当**没有任何历史号在窗内**时才进入挑号，此时 `pool2`
+     * 里所有历史号都已过窗，亲和在其中挑谁都不违反 `minIntervalMs`。
      */
     const used = healthy.filter((a) => this.lastUsed(a) > 0)
     const fresh = healthy.filter((a) => this.lastUsed(a) === 0)
-    used.sort((a, b) => this.nextThrottleAt(a) - this.nextThrottleAt(b) || this.lastUsed(a) - this.lastUsed(b))
-    if (used.length) {
-      const earliest = used[0]
-      const wait = Math.max(0, this.nextThrottleAt(earliest) - t)
-      /**
-       * 最早的**有历史**号仍在窗内 → 全员（含从未用过的）都不发号。
-       * 亲和号若落在这一批里，同样按此挡住（它不被特殊照顾，见 `pick()` 文档注释）。
-       * `waitMs` 取 `earliestWaitMs()` 而非只取 health 的节流值，两者在"健康号还在窗内"时相等，
-       * 但用同一个来源能保证"全部账号都还在窗内"之外的情形（例如窗内历史号已停在
-       * 冷却中的旁边）也报出真实剩余等待。
-       */
-      if (wait > 0) {
-        return {
-          account: null,
-          waitMs: this.earliestWaitMs(all),
-          reason: 'all accounts within min interval (throttled)',
-        }
+    /**
+     * 节流门：**全体历史号**中仍有任何一个在窗内 → 全体不发号（含从未用过的号与亲和号）。
+     * 这里刻意不按 `used[0]` 判定，也不再按排序结果判定——见上方说明。
+     */
+    const blocking = used.filter((a) => this.nextThrottleAt(a) > t)
+    if (blocking.length) {
+      return {
+        account: null,
+        waitMs: this.earliestWaitMs(all),
+        reason: 'all accounts within min interval (throttled)',
       }
+    }
+    if (used.length) {
       /**
-       * 窗内已清空，此时才轮到轮询。从未用过的号视为"最久未用"（`lastUsed = 0`），
-       * 故与已过窗的历史号合并后按 least-recently-used 取号：既保证连拍后逐个换号，
-       * 也保证新号不会被已用过的号长期压住。平秩用 `nextThrottleAt`（历史号在窗内早已排除，
-       * 这里只可能是都已过窗）。
+       * 窗内已清空（`blocking` 为空），此时才轮到轮询。从未用过的号视为"最久未用"
+       * （`lastUsed = 0`），故与已过窗的历史号合并后按 least-recently-used 取号：既保证连拍后
+       * 逐个换号，也保证新号不会被已用过的号长期压住。平秩用 `nextThrottleAt`（历史号在窗内
+       * 早已被挡下，这里只可能是都已过窗）。
        */
       const pool2 = fresh.concat(used)
       pool2.sort((a, b) => this.lastUsed(a) - this.lastUsed(b) || this.nextThrottleAt(a) - this.nextThrottleAt(b))
       /**
        * 亲和绑定在**轮到挑谁**时优先：只要绑定号落在本次候选（即它已过窗、或它是从未用过的号），
-       * 就发它，保证会话粘性。它若还在节流窗内，根本进不了这里——上面的 `wait > 0` 门已经
+       * 就发它，保证会话粘性。它若还在节流窗内，根本进不了这里——上面的 `blocking` 门已经
        * 把"还有历史号在窗内"的全体挡下（返回 null + 真实 waitMs），所以本行不可能发出窗内的号。
        *
        * 注意与"回落"的分工：绑定号在窗内时不是"换给它"，而是**全体不发号**（含它自己也拿不到），
@@ -352,6 +379,14 @@ export class AccountPool {
      */
     const live = new Set(all.map((a) => a.id))
     for (const id of this.lastPick.keys()) if (!live.has(id)) this.lastPick.delete(id)
+    /**
+     * 顺带回收**过期的亲和绑定**（修复轮 3）：`sessionKey` 直接来自客户端可任意设置的
+     * `x-session-id`，一个低成本客户端可刷出无数不同 header，实测 10 万个不同 header →
+     * `affinity.size = 100000` 且只增不减（`pick` 只在命中时读、过期绑定既不删也不复用，
+     * 却一直占着 Map 条目）。过 TTL 的绑定与"从未绑定"等价（`pick` 里 `t - hit.at < AFFINITY_TTL`
+     * 判定），故在此安全删除，与 `lastPick` 的清理同处、同样依赖 `status()` 被周期性调用。
+     */
+    for (const [key, hit] of this.affinity) if (t - hit.at >= AFFINITY_TTL) this.affinity.delete(key)
     return all.map((a) => ({
       id: a.id,
       provider: a.provider,

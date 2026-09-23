@@ -5,6 +5,8 @@ import path from 'node:path'
 import { AccountStore, newAccountFields } from '../src/auth/store.js'
 import { AccountPool } from '../src/accounts.js'
 
+const AFFINITY_TTL = 2 * 60 * 60 * 1000
+
 let store, pool, clock
 beforeEach(() => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'z2a-pool-'))
@@ -158,10 +160,139 @@ describe('AccountPool.pick', () => {
     expect([a.id, b.id]).toContain(s1)
     expect([a.id, b.id]).toContain(s2)
     expect(s2).not.toBe(s1) // 两号各被一个会话粘住（修复轮 2：同窗内不得把 s1 的号再发一次）
-    // 两个会话各自粘住自己的号
+    // 两个会话各自粘住自己的号。
+    // **修复轮 3 更正**：这里必须**逐个推进时钟**（每个会话各过一次节流窗）再 pick。
+    // 旧版在同刻连发两次（`pick('s1')` 后不推进就 `pick('s2')`）也能通过，是因为当时错误的门
+    // 只看 `used[0]` 而放行了仍在窗内的号——正是本轮修掉的 Critical（同号间隔可短至 1ms）。
+    // 新门要求"任何窗内历史号都清空"，故同刻第二次 pick 必然拿到 null；要验证亲和粘性
+    // 就必须让时钟越过刚被占用的号的窗口。
     clock.t += 2000
     expect(pool.pick('s1').account.id).toBe(s1)
+    clock.t += 2000
     expect(pool.pick('s2').account.id).toBe(s2)
+  })
+
+  // ---- 修复轮 3 新增：① Critical — 节流门必须对全体历史号生效（不变量，而非"常见情况正确"） ----
+  // 复审用 400 组随机序列证明旧门的违反率 43%（最小同号间隔 1ms）。根因：门只看按
+  // `nextThrottleAt` 排序的 `used[0]`，而挑号用的是 `lastUsed` 序 + 亲和绑定优先——
+  // **两套排序数学上不同**。池中只要有一个"早已过窗"的号，它必然是 `nextThrottleAt` 最小者，
+  // 门看到它的 wait=0 就打开；随后挑号完全可能选中另一个仍在窗内的号（尤其亲和绑定优先时），
+  // 于是它在距上次使用仅 50ms 时又被发出。正解：门与挑号基于同一个条件——
+  // `blocking = 全体 lastUsed>0 且 nextThrottleAt > t 的号`，非空即全体不发号。
+  it('throttle gate covers ALL in-window accounts, not just the earliest (fix-round-3 Critical)', async () => {
+    const t = 1_000_000
+    // A 早已过窗（旧实现里 used[0]，wait=0 → 把门打开）；B/C 刚用过仍在窗内。
+    const accounts = [
+      { id: 'A', stats: { lastUsedAt: t - 60_000 } },
+      { id: 'B', stats: { lastUsedAt: t - 100 } },
+      { id: 'C', stats: { lastUsedAt: t - 200 } },
+    ]
+    const p = new AccountPool(
+      { list: () => accounts, update: () => Promise.resolve(null) },
+      { minIntervalMs: 2000, cooldown3012Ms: 30 * 60_000, now: () => t },
+    )
+    for (const a of accounts) p.lastPick.set(a.id, a.stats.lastUsedAt)
+    const r = p.pick(null)
+    // 旧实现：返回 A（门被"已过窗的 A"打开）。B/C 仍在窗内 → 必须全体不发号。
+    expect(r.account).toBeNull()
+    expect(r.reason).toContain('throttl')
+    // 门要求**所有**窗内历史号都过窗才重开，故真实剩余 = 最晚过窗者 B 的 (t-100)+2000-t = 1900ms
+    expect(r.waitMs).toBe(1900)
+  })
+  it('affinity hit cannot pick an in-window account opened by another passed-window account (repro-throttle2)', async () => {
+    const t = 1_000_001
+    const accounts = [
+      { id: 'X', stats: { lastUsedAt: t - 60_000 } }, // 已过窗
+      { id: 'Y', stats: { lastUsedAt: t - 50 } },     // 窗内，且是亲和绑定
+    ]
+    const p = new AccountPool(
+      { list: () => accounts, update: () => Promise.resolve(null) },
+      { minIntervalMs: 2000, cooldown3012Ms: 30 * 60_000, now: () => t },
+    )
+    for (const a of accounts) p.lastPick.set(a.id, a.stats.lastUsedAt)
+    p.affinity.set('sess', { accountId: 'Y', at: t - 1000 })
+    const r = p.pick('sess')
+    // 旧实现返回 Y（距上次使用仅 50ms 又被发出）= 绕过节流。必须 null。
+    expect(r.account).toBeNull()
+    expect(r.reason).toContain('throttl')
+    expect(r.waitMs).toBe(1950)
+  })
+  // 规模化不变量属性测试：这是把 43% 违反率钉死的用例。照 reviewer-repro-real.mjs 的场景，
+  // 断言**任何两次同号发号的间隔 >= minIntervalMs**（冷启动首次除外）。
+  it('never issues the same account twice within minIntervalMs across 400 random sequences', async () => {
+    const MIN = 2000
+    let total = 0
+    let violations = 0
+    let worst = Infinity
+    // 内存 store：本用例验证的是**池的节流不变量**，与落盘无关，故用最轻量的 list/update
+    // 避免 400 次真实建目录/写盘拖慢（旧写法会超 5s 超时）。
+    for (let trial = 0; trial < 400; trial++) {
+      const clk = { t: 1_000_000 }
+      const n = 3 + Math.floor(Math.random() * 3) // 3-5 号
+      const accs = Array.from({ length: n }, (_, i) => ({
+        id: `u${trial}-${i}-${Math.random().toString(36).slice(2, 8)}`,
+        enabled: true,
+        cooldownUntil: 0,
+        needsRelogin: false,
+        noPackage: false,
+        strikes: 0,
+        stats: { requests: 0, inputTokens: 0, outputTokens: 0, lastUsedAt: 0, lastError: null },
+      }))
+      const pl = new AccountPool(
+        { list: () => accs, update: () => Promise.resolve(null) },
+        { minIntervalMs: MIN, cooldown3012Ms: 30 * 60_000, now: () => clk.t },
+      )
+      const seen = new Map()
+      for (let step = 0; step < 40; step++) {
+        clk.t += 1 + Math.floor(Math.random() * 1500)
+        const r = pl.pick(Math.random() < 0.5 ? 'sess' : null)
+        if (r.account) {
+          total++
+          const prev = seen.get(r.account.id)
+          if (prev !== undefined) {
+            const gap = clk.t - prev
+            if (gap < MIN) { violations++; worst = Math.min(worst, gap) }
+          }
+          seen.set(r.account.id, clk.t)
+        }
+      }
+    }
+    expect(total).toBeGreaterThan(0)
+    expect(violations).toBe(0)
+    expect(worst).toBe(Infinity)
+  }, 30_000)
+  // ---- 修复轮 3 新增：② Important — waitMs 不得低估（按它重试必须拿得到号） ----
+  // 旧实现把"冷却号解禁"与"健康号仍在窗内"取 Math.min，但节流门会挡住全体——冷却号解禁时
+  // 依然发不出号。实测低估 1000ms：按低估值重试拿不到号，客户端空转一次 round-trip。
+  it('waitMs is not underestimated when a cooling account frees earlier than the throttle window (repro-waitms)', async () => {
+    const a = await add()
+    const b = await add()
+    clock.t += 10_000
+    const used = pool.pick(null).account.id
+    const other = used === a.id ? b : a
+    await store.update(other.id, { cooldownUntil: clock.t + 1000 }) // 另一号冷却只剩 1s（比节流窗更早解禁）
+    const r = pool.pick(null)
+    expect(r.account).toBeNull()
+    expect(r.reason).toContain('throttl')
+    // 真实最早可发号 = 健康号过窗时刻 2000ms，绝不是冷却解禁的 1000ms。
+    expect(r.waitMs).toBe(2000)
+    expect(r.waitMs).not.toBe(1000)
+    // 契约验证：按 waitMs 等待后重试**必须拿到号**（冷却号已解禁、健康号已过窗）
+    clock.t += r.waitMs
+    expect(pool.pick(null).account).not.toBeNull()
+  })
+  // ---- 修复轮 3 新增：③ Low — affinity 陈旧条目在 status() 里回收 ----
+  it('sweeps expired affinity entries in status() (unbounded x-session-id growth)', async () => {
+    await add()
+    clock.t += 100_000
+    for (let i = 0; i < 5000; i++) pool.affinity.set(`sess-${i}`, { accountId: 'x', at: clock.t })
+    expect(pool.affinity.size).toBe(5000)
+    // 仍在 TTL 内 → 不清
+    pool.status()
+    expect(pool.affinity.size).toBe(5000)
+    clock.t += AFFINITY_TTL
+    pool.status()
+    expect(pool.affinity.size).toBe(0)
   })
 
   it('skips cooling / disabled / needsRelogin / noPackage accounts', async () => {
