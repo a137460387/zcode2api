@@ -214,11 +214,38 @@ describe('AccountStore concurrency', () => {
     expect(next.stats.requests).toBe(1)
   })
 
-  // update() 临界区内不得调用公开的 write()——那会经 withLock 自我排队，造成自我死锁。
-  it('does not self-deadlock when update() holds the lock', async () => {
+  // update() 临界区内不得调用公开的 save()——那会再排一次队，使写入插到队尾、
+  // 越过已在等待的同 id 任务，静默打乱调用顺序。（不是死锁：实测能正常 resolve，
+  // 但排队语义被破坏，故内部走 writeUnlocked。）
+  it('does not re-queue when update() holds the lock', async () => {
     const store = new AccountStore(dir)
-    store.save(newAccountFields({ provider: 'bigmodel', type: 'oauth', userInfo: { user_id: 'dl' } }))
+    await store.save(newAccountFields({ provider: 'bigmodel', type: 'oauth', userInfo: { user_id: 'dl' } }))
     await expect(store.update('bigmodel:dl', { enabled: false })).resolves.toMatchObject({ enabled: false })
+  })
+
+  // 反模式防线：对象式 patch 在锁外算好增量再传入，并发下会丢更新。
+  // 这是 T4/T15/T17 最容易写出的形态（"先 get 算 stats 再 update({stats})"），
+  // 故用一条显式断言把"必须用函数式 patch"这个要求钉住。
+  it('shows why object patches computed outside the lock lose updates (functional patch required)', async () => {
+    const store = new AccountStore(dir)
+    await store.save(newAccountFields({ provider: 'bigmodel', type: 'oauth', userInfo: { user_id: 'obj' } }))
+
+    // 反模式：临界区外读快照 → 算增量 → 以对象形式写回
+    await Promise.all(Array.from({ length: 20 }, () =>
+      (async () => {
+        const snap = store.get('bigmodel:obj') // 不等待排队中的写入 → 可能拿到旧值
+        await store.update('bigmodel:obj', { stats: { ...snap.stats, requests: snap.stats.requests + 1 } })
+      })()))
+
+    // 20 次并发自增，对象式 patch 只留下极少（此处实测为 1），证明该形态不可用
+    expect(store.get('bigmodel:obj').stats.requests).toBeLessThan(20)
+
+    // 正解：函数式 patch 在锁内读最新值，同样并发规模得到精确结果
+    const store2 = new AccountStore(dir)
+    await store2.save(newAccountFields({ provider: 'bigmodel', type: 'oauth', userInfo: { user_id: 'fn' } }))
+    await Promise.all(Array.from({ length: 20 }, () =>
+      store2.update('bigmodel:fn', (cur) => ({ stats: { ...cur.stats, requests: cur.stats.requests + 1 } }))))
+    expect(store2.get('bigmodel:fn').stats.requests).toBe(20)
   })
 
   it('save() is durable by the time the returned promise resolves', async () => {

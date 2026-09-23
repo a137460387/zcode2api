@@ -71,7 +71,8 @@ export class AccountStore {
    * 原子写盘（同步落盘，返回后 get()/list() 立即可见）。
    * 私有：**只允许在 withLock 临界区内调用**（内部名末尾的 Unlocked 即此意）。
    * 公开的 save()/update() 都经 withLock 进入，因此同一 id 的写永远不会互相覆盖。
-   * 之所以另起名字而不是把 write() 放进锁里：withLock 的回调若再排一次队会自我死锁。
+   * 之所以另起名字而不复用公开的 save()：save() 会再排一次队，使写入插到队尾，
+   * 从而可能越过已在等待的同 id 任务、静默打乱调用顺序（不是死锁，是排队语义被破坏）。
    */
   writeUnlocked(account) {
     const file = this.fileFor(account.id)
