@@ -139,11 +139,15 @@ describe('AccountPool.pick', () => {
   })
   // 会话亲和：同一 sessionKey 反复 pick 必须粘在同一账号上（health 允许时），
   // 且该绑定不会把别的会话也拖到同一个号上。同样不依赖创建顺序。
+  // **注意（修复轮 2）**：亲和命中同样要过 `minIntervalMs` 节流门，故"稳定性"必须在
+  // **时钟推进**下测——时钟不推进时同会话连拍本就该被挡住（否则 header 就是绕过节流的口子）。
   it('session affinity sticks to the same healthy account', async () => {
     const a = await add(), b = await add()
     const stuck = pool.pick('s1').account.id
     expect([a.id, b.id]).toContain(stuck)
+    clock.t += 2000 // 过一节流窗：亲和号解禁，且本轮没有更"久未用"的号能把它顶掉
     expect(pool.pick('s1').account.id).toBe(stuck)
+    clock.t += 2000
     expect(pool.pick('s1').account.id).toBe(stuck)
   })
   it('affinity is per-session (different sessions can land on different accounts)', async () => {
@@ -153,6 +157,7 @@ describe('AccountPool.pick', () => {
     const s2 = pool.pick('s2').account.id
     expect([a.id, b.id]).toContain(s1)
     expect([a.id, b.id]).toContain(s2)
+    expect(s2).not.toBe(s1) // 两号各被一个会话粘住（修复轮 2：同窗内不得把 s1 的号再发一次）
     // 两个会话各自粘住自己的号
     clock.t += 2000
     expect(pool.pick('s1').account.id).toBe(s1)
@@ -170,6 +175,103 @@ describe('AccountPool.pick', () => {
     await store.update(a.id, { needsRelogin: false, noPackage: true })
     expect(pool.pick(null).reason).toContain('cooling')
   })
+
+  // ---- 修复轮 2 新增：① Critical — 会话亲和分支不得绕过节流门 ----
+  // `sessionKey` 直接来自客户端可任意设置的 `x-session-id` 请求头，因此"带同一个 header +
+  // 客户端不节流连发"必须不能绕过 `minIntervalMs`。旧实现只查 `healthy()`（enabled/needsRelogin/
+  // noPackage/cooldown），不查节流窗，直接发号——实测同一 sessionKey 连拍 200 次得 200/200 全落
+  // 同一个号（非亲和路径同期是 1 + 199 null）。被压的正是"刚用过的那个号"，与本任务第一轮
+  // Critical（37,1,1,1）是同一类风控防线失效，只是触发条件是带 header。
+  it('does not let an affinity hit bypass the throttle gate (burst on one sessionKey)', async () => {
+    const accs = [await add(), await add(), await add(), await add()]
+    const counts = new Map(accs.map((a) => [a.id, 0]))
+    let nulls = 0
+    for (let i = 0; i < 200; i++) {
+      const r = pool.pick('s-burst')
+      if (r.account) counts.set(r.account.id, counts.get(r.account.id) + 1)
+      else nulls++
+    }
+    // 时钟冻结下亲和**不能**把 200 次请求全压在一个号上；至多放行一次（与非亲和路径同门）。
+    expect(Math.max(...counts.values())).toBeLessThanOrEqual(1)
+    expect(nulls).toBe(199)
+  })
+  // 设计选择（修复轮 2 定案）：亲和号被节流时**不特殊照顾、也不等待它**，而是走与非亲和路径
+  // 完全相同的那两层门——"还有历史号在窗内就一律不发号"。于是：
+  //  - 绑定号仍在窗内 → `{account:null, waitMs:真实剩余, reason:'throttled'}`（不会把同一个号再发一次，
+  //    也不会硬等它——`pick` 是同步接口，等待是调用方按 `waitMs` 做的事）；
+  //  - 绑定号过窗后**依旧是它**（会话一致性得以保持，而不是被轮询换走）；
+  //  - 只有当它变得**不健康**（冷却/停用/需重登/无套餐）或亲和过期时，才真正**换号回落**。
+  // 这样"回落"只发生在"原号真的不能用了"，而"节流"由统一的 `throttled` 门处理，两者不混淆。
+  it('falls back to another account when the affinity account is throttled', async () => {
+    const a = await add(), b = await add()
+    const stuck = pool.pick('s1').account.id
+    // 时钟不推进：绑定号仍在窗内 → 不发号；waitMs 是真实剩余等待（不变相压号）
+    const throttled = pool.pick('s1')
+    expect(throttled.account).toBeNull()
+    expect(throttled.reason).toContain('throttl')
+    expect(throttled.waitMs).toBe(2000)
+    // 过一节流窗后仍是**同一个**绑定号（会话一致性不被轮询破坏）
+    clock.t += 2000
+    expect(pool.pick('s1').account.id).toBe(stuck)
+    // 真正的回落：绑定号变得不健康（冷却）时，换到另一个号，且亲和绑定被改写到新号
+    await store.update(stuck, { cooldownUntil: clock.t + 600_000 })
+    clock.t += 2000
+    const r = pool.pick('s1')
+    expect([a.id, b.id]).toContain(r.account?.id)
+    expect(r.account?.id).not.toBe(stuck)
+    expect(pool.affinity.get('s1').accountId).toBe(r.account.id)
+  })
+
+  // ---- 修复轮 2 新增：② Important — 全冷却时 waitMs 必须是真实剩余等待 ----
+  it('reports the true remaining wait when every account is cooling down', async () => {
+    const accs = [await add(), await add(), await add()]
+    for (const [i, acc] of accs.entries()) {
+      await store.update(acc.id, { cooldownUntil: clock.t + 30 * 60_000 + i * 1000 })
+    }
+    const r0 = pool.pick(null)
+    expect(r0.account).toBeNull()
+    expect(r0.reason).toContain('cooling')
+    // 旧实现硬编码 waitMs: 0 —— 每个请求都会立即失败/立即重试
+    expect(r0.waitMs).toBe(30 * 60_000)
+    expect(r0.waitMs).not.toBe(0)
+    // 随钟递减而非恒定
+    clock.t += 60_000
+    expect(pool.pick(null).waitMs).toBe(29 * 60_000)
+    clock.t += 120_000
+    expect(pool.pick(null).waitMs).toBe(27 * 60_000)
+    // 过窗即放行
+    clock.t += 27 * 60_000
+    expect(pool.pick(null).account).not.toBeNull()
+  })
+  // ---- 修复轮 2 新增：④ 可区分信号 — "等一会儿就好" vs "需要人工干预" ----
+  // 后者的 `waitMs` 必须是 `null`（而不是 0 / 正数）：T15 看到 null 就应停止重试并返回
+  // 503/告警等待人工登录或启用，绝不能把它当成"立刻重试"。
+  it('signals waitMs=null when no account can become available without human action', async () => {
+    const a = await add(), b = await add(), c = await add()
+    await store.update(a.id, { enabled: false })
+    await store.update(b.id, { needsRelogin: true })
+    await store.update(c.id, { noPackage: true })
+    const r = pool.pick(null)
+    expect(r.account).toBeNull()
+    expect(r.waitMs).toBeNull()
+    expect(r.reason).toContain('cooling') // 既有文案保留（T15/T17 已按 'cooling' 断言）
+    expect(r.warn).toBe('human action required')
+    // 与"冷却中"（可自愈）明确区分：冷却给得出正数 waitMs
+    const d = await add()
+    await store.update(d.id, { cooldownUntil: clock.t + 5000 })
+    const r2 = pool.pick(null)
+    expect(r2.waitMs).toBe(5000)
+    expect(r2.warn).toBeUndefined()
+    // 纯节流情形同样给正数 waitMs（不需要人工干预）
+    await store.update(d.id, { enabled: false })
+    await store.update(store.list()[0].id, {})
+    const e = await add()
+    pool.pick(null)
+    const r3 = pool.pick(null)
+    expect(r3.account).toBeNull()
+    expect(r3.reason).toContain('throttl')
+    expect(r3.waitMs).toBe(2000)
+  })
 })
 
 // ---- 修复轮 1 新增：内存账 / 磁盘账分叉（C） ----
@@ -182,9 +284,9 @@ describe('AccountPool memory vs disk accounting', () => {
     clock.t = 1_010_000
     await pool.markSuccess(store.get(a.id)) // 只更新磁盘的 lastUsedAt = 1.01e6
     expect(store.get(a.id).stats.lastUsedAt).toBe(1_010_000)
-    // 旧实现用 ?? 取内存优先 → lastUsed = 1e6 → readyAt = 1002000（比正确值早 10s 放行，放宽风控）
+    // 旧实现用 ?? 取内存优先 → lastUsed = 1e6 → nextThrottleAt = 1002000（比正确值早 10s 放行，放宽风控）
     expect(pool.lastUsed(store.get(a.id))).toBe(1_010_000)
-    expect(pool.readyAt(store.get(a.id))).toBe(1_012_000)
+    expect(pool.nextThrottleAt(store.get(a.id))).toBe(1_012_000)
   })
   it('warns once (with account id and error) when the lastUsedAt write fails', async () => {
     const a = await add()

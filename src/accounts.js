@@ -31,7 +31,7 @@ export class AccountPool {
    *
    * 不能用 `??`（内存优先）：内存账只会被本进程的 `stampUsed` 更新，而落盘值还会被
    * `markSuccess` 以及**别的进程**写。若内存里存着 1e6、磁盘上已是 1.01e6（例如本进程刚
-   * `markSuccess` 过），`??` 会取到更旧的 1e6，于是 `readyAt` 算出 1002000 而非 1012000——
+   * `markSuccess` 过），`??` 会取到更旧的 1e6，于是 `nextThrottleAt` 算出 1002000 而非 1012000——
    * **提前 10s 放行**，方向恰好是放宽风控，不可接受。取 max 只会让节流更保守，不会更松。
    *
    * 返回 0 表示"本池从未见过这个号被使用"（`lastUsedAt` 初值即 0）。
@@ -41,16 +41,67 @@ export class AccountPool {
   }
 
   /**
-   * 该账号下次可用时刻（池内时钟）。
+   * 该账号的下一个节流解禁时刻（池内时钟）。
    *
    * `used === 0` 表示"本池从未用过这个号"，此时**不能**返回 `0 + minIntervalMs`：
    * 那会把"从未用过"编码成一个恒在过去的绝对时刻（`2000`），对任何真实时钟都像"随时可用"，
    * 于是它永远插队到刚用过的号前面——正是连拍坍缩。故此时返回 `cooldownUntil` 本身，
    * 把"从未用过"与"刚用过在窗内"的区分交给 `pick()` 的两层选择，而不是在这里编造时刻。
+   *
+   * 注意：它**不是**"下次可用时刻"。从未用过的号 `nextThrottleAt` 恒为 0（看起来随时可用），
+   * 它是否真的能发号由 `pick()` 的"有历史号仍在窗内则一律不发号"这一层决定。真实剩余等待
+   * 请用 `earliestWaitMs()`，不要自己拿这个值减 `now`。
    */
-  readyAt(acc) {
+  nextThrottleAt(acc) {
     const used = this.lastUsed(acc)
     return Math.max(acc.cooldownUntil ?? 0, used > 0 ? used + this.minIntervalMs : 0)
+  }
+
+  /**
+   * 全池"最早多久之后会有账号可用"（池内时钟差）；**没有可自愈的账号时返回 `null`**。
+   *
+   * 三种返回值，对应调用方三种处置：
+   * - `null` — 池为空，或所有账号都不是"等一等就好"：被停用（`enabled=false`，含累计 5 次风控
+   *   被动停用）/ `needsRelogin`（401，要人重登）/ `noPackage`（1113，要人开套餐）。这些状态
+   *   **不会随时间自愈**，等待是无意义的。调用方必须停止重试并暴露需人工干预的信号
+   *   （T15：直接 503 + 告警，不能按 `waitMs` 空转重试）。
+   * - `0` — 此刻就有健康账号可用（全员都不受节流/冷却约束）。
+   * - `> 0` — 真实剩余等待：**按 `pick()` 实际会走的两层选择算**，而不是逐个账号取最小。
+   *   - 若存在"有历史的健康号"仍在节流窗内 → 这些历史号里最早的解禁时刻（`lastUsed + minIntervalMs - t`）。
+   *     此时**从未用过的号不算数**：按两层门它们同样不放行（冷池的"新号不等待"只在窗内清空后生效）。
+   *   - 否则（历史号窗内已清空）→ 若存在从未用过的健康号则为 0（它们会立刻被放行）；
+   *     没有新号时取冷却中的号里最早的 `cooldownUntil - t`。
+   *   - 两者皆无（没有健康号、也没有从未用过/已过窗的健康号）→ `Infinity` → 归 0。
+   *
+   * 关键：**不能对所有账号取 `nextThrottleAt` 最小值再归零**。从未用过的号 `nextThrottleAt` 恒为 0
+   * 却既不是"已过窗的历史号"也不是"随时可发的新号"（历史号还在窗内时它不放行），把它当 0
+   * 会把等待谎报成 0；反过来，对已过窗的历史号直接取 `lastUsed + minIntervalMs - t` 又会得到负数，
+   * 负数参与 `Math.min` 同样把结果压成 0——两种错法都会让 `waitMs` 变 0，调用方按 0 等待即空转重试。
+   */
+  earliestWaitMs(all) {
+    const t = this.now()
+    const selfHealing = all.filter(
+      (a) => a.enabled !== false && a.needsRelogin !== true && a.noPackage !== true,
+    )
+    if (!selfHealing.length) return null
+    const healthyAccs = all.filter((a) => this.healthy(a))
+    const used = healthyAccs.filter((a) => this.lastUsed(a) > 0)
+    const fresh = healthyAccs.filter((a) => this.lastUsed(a) === 0)
+    let best = Infinity
+    // 仍在窗内的历史号：按 pick 的门，任何一个还在窗内就全员不发号
+    for (const a of used) {
+      const wait = this.lastUsed(a) + this.minIntervalMs - t
+      if (wait > best) continue
+      best = wait
+    }
+    // 历史号窗内已清空（或本就没有历史号）：从没用过的号立刻能被放行
+    if (best <= 0 && fresh.length) best = 0
+    // 冷却是硬门槛，无论有无新号都算
+    for (const a of selfHealing) {
+      const cd = a.cooldownUntil ?? 0
+      if (cd > t) best = Math.min(best, cd - t)
+    }
+    return Math.max(0, best)
   }
 
   /**
@@ -58,98 +109,172 @@ export class AccountPool {
    *
    * 返回形态：
    * - `{ account, waitMs }`：选中该号；`waitMs` 是**选中后**到它下次可用的建议等待，
-   *   即 `readyAt(account) - now`。刚 `stampUsed` 过，故正常等于 `minIntervalMs`（节流窗开始）。
+   *   即 `nextThrottleAt(account) - now`。刚 `stampUsed` 过，故正常等于 `minIntervalMs`（节流窗开始）。
    * - `{ account: null, waitMs, reason }`：无号可用。**此时 `waitMs` 明确表示"最早的下一个
-   *   可用账号还需等多久"（`min(readyAt) - now`）**——调用方必须按它等待后重试，不能立即再取：
+   *   可用账号还需等多久"（`earliestWaitMs()`）**——调用方必须按它等待后重试，不能立即再取：
    *   现在等了多久就拿不到号。注意 `waitMs` 在两种形态下语义不同（选中=建议节流间隔；
    *   未选中=真实剩余等待），调用方须先判 `account` 是否非空再解释它。
+   *   特别地，**`waitMs === null` 表示"没有可自愈的等待"**：账号全被停用/需重登/无套餐
+   *   （含池为空），须人工干预。调用方**不得**把它当 `0` 处理（会变成无意义的重试循环，
+   *   且旧实现正是硬编码 `0`，实测 3 号各冷却 30min 时每请求都立即失败）。
    *
    * 无号可用的三类 `reason`（互相独立、文案可读）：
    * - `'no accounts'` — 池为空；
-   * - `'all accounts cooling down or disabled'` — 有不健康账号，但都被冷却/停用/需重登/无套餐挡住；
+   * - `'all accounts cooling down or disabled'` — 有不健康账号，但都被冷却/停用/需重登/无套餐挡住
+   *   （可能还叠加节流）。`waitMs` 为 `null` 当且仅当**没有一个**账号是"等一等就好"的。
+   *   此时额外带 `warn: 'human action required'` 作为可判别的显式信号（`reason` 文案保持不变，
+   *   以免破坏 T15/T17 对 `'cooling'` 的既有断言）。
    * - `'all accounts within min interval (throttled)'` — **所有健康账号都还在 `minIntervalMs`
-   *   节流窗内**（`waitMs` 给出最早剩余）。
+   *   节流窗内**（`waitMs` 给出最早剩余，恒为 `> 0`，绝不为 `null`：节流会自愈）。
    *
    * 第三类是本方法的风控语义核心：**没有"该号是否已过冷却窗"的门槛时，池内时钟不推进
    * （无 sessionKey、调用方不 sleep 或 sleep 不足）会让排序永远选中同一个"最早过期"的号。
    * 实测 4 账号 40 次连拍得 37,1,1,1、600 次得 9997,1,1,1——被压的恰是刚用过的那个号，
    * 正是 `minIntervalMs` 这道防线要防的场景。故全员在节流窗内时**拒绝发号**，把"多久能取到号"
    * 交回调用方（T15 网关据 `waitMs` 等待后重试），而不是让它超频压号。
+   *
+   * **会话亲和与节流的关系（修复轮 2 定案）**：`sessionKey` 直接来自客户端可任意设置的
+   * `x-session-id` 请求头，因此"带同一个 header + 客户端不节流连发"绝不能绕过 `minIntervalMs`
+   * （实测旧实现同一 sessionKey 连拍 200 次得 200/200 全落同一个号）。定案的语义是
+   * **"先决定能不能发号，再让亲和决定发给谁"**：
+   *
+   * 1. **能不能发号**完全由与非亲和路径相同的两层门决定（历史号仍在窗内 → 一律不发号；
+   *    窗内清空后才允许在"有历史的号 / 从未用过的号"里挑）。亲和分支**不**自行 `return`，
+   *    旧实现正是在那里直接发号，才让 header 成了绕过节流的口子。
+   * 2. **发给谁**才轮到亲和：绑定号若落在本次可发候选里就发它（会话粘性）。
+   *
+   * 由此得出"亲和号被节流时"的行为（本题要求的设计选择）：**既不硬等它，也不换号——而是
+   * 全体不发号**，返回 `{account:null, waitMs:真实剩余, reason:'throttled'}`，由调用方等
+   * `waitMs` 后重试；重试时绑定号已过窗，**依旧是它**，会话一致性得以保持。
+   * 选择理由：`pick` 是同步接口，要在池层"等待亲和号"只能阻塞或返回一个没有语义的号，
+   * 前者会把窗内阻塞放大成会话级吞吐瓶颈、后者直接违背风控；而"等 `waitMs` 再重试"本就是
+   * 非亲和路径既有的契约（调用方已在做），亲和路径复用它即可，行为统一、无特例。
+   * **真正换号回落只发生在绑定号变得不健康（冷却/停用/需重登/无套餐）或亲和绑定过期时**——
+   * 那时"等下去也不会是它"，才改写绑定给别的号。两种情形因此不混淆：
+   * "稍等一会就好"（throttled，正 `waitMs`）vs "这个号真的不能用了"（改绑回落）。
+   * 无论哪种，都**不绕过 `minIntervalMs`**：发出的号一定已过窗、且同样被 `stampUsed` 记账。
+   *
+   * 调用方契约（T15 网关，修复轮 2 明确）：**`account` 为 null 时，若 `waitMs` 是有限正数
+   * 必须 `await` 它之后再重试；若 `waitMs === null` 必须停止重试并返回需人工干预的错误。**
+   * 冷启动尖峰同理由调用方吸收：4 号冷池 10 并发时只有 1 个请求拿到号，其余 9 个会拿到
+   * `waitMs = minIntervalMs` 并应等待后重试（实测冷池 10 并发为 1 + 9×waitMs=2000，非失败）。
+   * 池层**不**为此放开"冷池允许多个新号同时在途"——那会让同一个上游在同一个 `minIntervalMs`
+   * 窗口内被两个新号并发打（新号打上游同样是高频），并使节流防线在不同账号间失去统一性。
    */
   pick(sessionKey) {
     const t = this.now()
     const all = this.store.list()
-    if (sessionKey) {
+    // 本会话的亲和绑定（若未过期）：只用于"挑谁"，不用于"能不能挑"——见下方注释。
+    const boundId = (() => {
+      if (!sessionKey) return null
       const hit = this.affinity.get(sessionKey)
-      if (hit && t - hit.at < AFFINITY_TTL) {
-        const acc = all.find((a) => a.id === hit.accountId)
-        if (acc && this.healthy(acc)) {
-          this.stampUsed(acc.id, t)
-          return { account: acc, waitMs: Math.max(0, this.readyAt(acc) - t) }
-        }
-      }
-    }
+      return hit && t - hit.at < AFFINITY_TTL ? hit.accountId : null
+    })()
     const healthy = all.filter((a) => this.healthy(a))
     if (!healthy.length) {
-      return { account: null, waitMs: 0, reason: all.length ? 'all accounts cooling down or disabled' : 'no accounts' }
+      const waitMs = this.earliestWaitMs(all)
+      return {
+        account: null,
+        waitMs,
+        reason: all.length ? 'all accounts cooling down or disabled' : 'no accounts',
+        // waitMs 为 null = 等不来（停用/需重登/无套餐），显式区别于"等一会儿就好"。
+        ...(waitMs === null ? { warn: 'human action required' } : {}),
+      }
     }
+    /**
+     * 会话亲和：**先算"现在到底能不能发号"，再让绑定只决定"发给谁"**。
+     *
+     * 关键顺序（修复轮 2 踩到的坑）：不能在亲和分支里直接 `return`，哪怕那里也查了节流窗。
+     * `nextThrottleAt(acc) <= t` 在"刚到点还没被记账"时成立，于是亲和分支会把**刚用过的那个号**
+     * 原样再发一次（实测：同一 sessionKey 在 t 与 t+2000 各 pick 一次，两次都返回同一个号）；
+     * 会话亲和必须**先过与非亲和路径完全相同的两层门**（历史号窗内一律不发号；窗内清空后
+     * 才允许在"有历史的号 / 从未用过的号"里挑），亲和只影响"挑谁"，不影响"能不能挑"。
+     */
     /**
      * 两层选择，第一层区分"本池见过"与"从未用过"——这是连拍坍缩的根因所在。
      *
-     * - **有使用历史的号**（`lastUsed > 0`）：受 `minIntervalMs` 约束，`readyAt = used + minIntervalMs`。
+     * - **有使用历史的号**（`lastUsed > 0`）：受 `minIntervalMs` 约束，`nextThrottleAt = used + minIntervalMs`。
      * - **从未用过的号**（`lastUsed === 0`）：没有可节流的历史，随时可用（冷池必须能发号）。
      *
-     * 只看 `readyAt` 排序是错的：历史号在窗内被夹到 `t + minIntervalMs`，而无历史号的 raw
-     * `readyAt` 是 `0 + minIntervalMs`（恒在过去），于是无历史号永远"更早可用"、被反复插队，
+     * 只看 `nextThrottleAt` 排序是错的：历史号在窗内被夹到 `t + minIntervalMs`，而无历史号的
+     * `nextThrottleAt` 是 0（恒在过去），于是无历史号永远"更早可用"、被反复插队，
      * 同一个刚用过的号也会被反复选中——正是实测 37,1,1,1 / 9997,1,1,1 的坍缩形态。
      * 故：**只要有历史号还在窗内，就先不发号**（哪怕还有从未用过的号），把 `waitMs` 交回调用方；
      * 窗内清空后，优先补偿节流窗已过的历史号（least-recently-used），最后才铺新号。
      */
     const used = healthy.filter((a) => this.lastUsed(a) > 0)
     const fresh = healthy.filter((a) => this.lastUsed(a) === 0)
-    used.sort((a, b) => this.readyAt(a) - this.readyAt(b) || this.lastUsed(a) - this.lastUsed(b))
+    used.sort((a, b) => this.nextThrottleAt(a) - this.nextThrottleAt(b) || this.lastUsed(a) - this.lastUsed(b))
     if (used.length) {
       const earliest = used[0]
-      const wait = Math.max(0, this.readyAt(earliest) - t)
-      // 最早的**有历史**号仍在窗内 → 全员（含从未用过的）都不发号。
-      if (wait > 0) return { account: null, waitMs: wait, reason: 'all accounts within min interval (throttled)' }
+      const wait = Math.max(0, this.nextThrottleAt(earliest) - t)
+      /**
+       * 最早的**有历史**号仍在窗内 → 全员（含从未用过的）都不发号。
+       * 亲和号若落在这一批里，同样按此挡住（它不被特殊照顾，见 `pick()` 文档注释）。
+       * `waitMs` 取 `earliestWaitMs()` 而非只取 health 的节流值，两者在"健康号还在窗内"时相等，
+       * 但用同一个来源能保证"全部账号都还在窗内"之外的情形（例如窗内历史号已停在
+       * 冷却中的旁边）也报出真实剩余等待。
+       */
+      if (wait > 0) {
+        return {
+          account: null,
+          waitMs: this.earliestWaitMs(all),
+          reason: 'all accounts within min interval (throttled)',
+        }
+      }
       /**
        * 窗内已清空，此时才轮到轮询。从未用过的号视为"最久未用"（`lastUsed = 0`），
        * 故与已过窗的历史号合并后按 least-recently-used 取号：既保证连拍后逐个换号，
-       * 也保证新号不会被已用过的号长期压住。平秩用 `readyAt`（历史号在窗内早已排除，
+       * 也保证新号不会被已用过的号长期压住。平秩用 `nextThrottleAt`（历史号在窗内早已排除，
        * 这里只可能是都已过窗）。
        */
       const pool2 = fresh.concat(used)
-      pool2.sort((a, b) => this.lastUsed(a) - this.lastUsed(b) || this.readyAt(a) - this.readyAt(b))
-      const chosen = pool2[0]
+      pool2.sort((a, b) => this.lastUsed(a) - this.lastUsed(b) || this.nextThrottleAt(a) - this.nextThrottleAt(b))
+      /**
+       * 亲和绑定在**轮到挑谁**时优先：只要绑定号落在本次候选（即它已过窗、或它是从未用过的号），
+       * 就发它，保证会话粘性。它若还在节流窗内，根本进不了这里——上面的 `wait > 0` 门已经
+       * 把"还有历史号在窗内"的全体挡下（返回 null + 真实 waitMs），所以本行不可能发出窗内的号。
+       *
+       * 注意与"回落"的分工：绑定号在窗内时不是"换给它"，而是**全体不发号**（含它自己也拿不到），
+       * 于是调用方等 `waitMs` 后重试，下一次它已过窗、依旧是它——会话一致性得以保持；
+       * 只有当绑定号变得**不健康**（冷却/停用/需重登/无套餐）或亲和过期时，才会真正换号回落。
+       */
+      const chosen = (boundId && pool2.find((a) => a.id === boundId)) || pool2[0]
       if (sessionKey) this.affinity.set(sessionKey, { accountId: chosen.id, at: t })
       this.stampUsed(chosen.id, t)
-      return { account: chosen, waitMs: Math.max(0, this.readyAt(chosen) - t) }
+      return { account: chosen, waitMs: Math.max(0, this.nextThrottleAt(chosen) - t) }
     }
-    const chosen = fresh[0]
+    const chosen = (boundId && fresh.find((a) => a.id === boundId)) || fresh[0]
     if (sessionKey) this.affinity.set(sessionKey, { accountId: chosen.id, at: t })
     this.stampUsed(chosen.id, t)
-    return { account: chosen, waitMs: Math.max(0, this.readyAt(chosen) - t) }
+    return { account: chosen, waitMs: Math.max(0, this.nextThrottleAt(chosen) - t) }
   }
 
   /**
    * 记录"这个号刚被选中/用过"：先同步写内存（下一次 `pick` 立刻可见），再异步落盘。
    *
-   * 不记账就无法轮询、也无法如实给出 `waitMs`——全新池里所有账号的 `readyAt` 恒等，
+   * 不记账就无法轮询、也无法如实给出 `waitMs`——全新池里所有账号的 `nextThrottleAt` 恒等，
    * 排序会退化为"永远返回 `list()` 首个"，`minIntervalMs` 这道风控防线形同虚设。
    *
-   * 写的是**传入的池内时刻**（而非 `Date.now()`），与 `markSuccess` 及 `readyAt` 的比较
-   * 基准共用同一条时间轴；注入假时钟时混用真实纪元会让两者相差数十年。
+   * 写的是**传入的池内时刻**（而非 `Date.now()`），与 `markSuccess` 及 `nextThrottleAt` 的比较
+   * 基准共用同一条时间轴；注入假时钟时混用真实纪元会让两者相差数十年。`nextThrottleAt` /
+   * `earliestWaitMs` 里的消息文案与比较也都以这条轴为准。
    *
    * 落盘走 `store.update` 的**函数式 patch**（Task 3：修改已有账号的唯一安全方式），
    * 并发不丢更新。不 `await`：`pick` 是同步接口，只投递一次安全的写入。
    */
   stampUsed(id, at = this.now()) {
     const prev = this.lastPick.get(id)
+    // 内存账**每次都推进**，只保留最新的池内时刻。
+    // 不能"窗内就不更新"：`lastUsed` 是 LRU 轮询的**唯一**依据，若窗内重复使用不推进内存账，
+    // 真实网关节奏（每请求 ~1ms，远小于 2000ms 窗）下刚用过的号会一直顶着旧时刻、被判成"最久未用"，
+    // 于是时钟每推进就再压它一次——正是 `minIntervalMs` 要防的超频。实测：亲和号连拍时
+    // 每次时钟推进 2000ms 仍反复选中同一个号（`lastPick` 停在 1e6 不动）。
     this.lastPick.set(id, at)
-    // 热路径省写：若本次仍落在上一笔记账的节流窗内，`readyAt` 由那笔更早的时刻决定，
-    // 落盘值不会改变任何 pick 结果（`lastUsed` 取 max，更早/相等都不占优）——直接跳过落盘，
-    // 避免连拍/会话亲和下每次 pick 都同步写盘（实测旧实现 1000 次 pick = 335ms）。
+    // 落盘则可以省：落盘值参与 `lastUsed` 的 max，但它**永远不会更大**——它只在 `stampUsed`
+    // 写入，而本进程的 `stampUsed` 每次都把内存账推到不小于磁盘的值。故本次仍落在上一笔
+    // 落盘的节流窗内时，磁盘值不可能改变任何 pick 结果（`lastUsed` 取 max，更早/相等都不占优），
+    // 直接跳过落盘，避免连拍/会话亲和下每次 pick 都同步写盘（实测旧实现 1000 次 pick = 335ms）。
     if (prev !== undefined && prev + this.minIntervalMs > at) return
     /**
      * 落盘失败**必须可见**：一条长期失败的写盘会让"别的进程/重启后看到的最后使用时间"
@@ -218,6 +343,12 @@ export class AccountPool {
     /**
      * 顺带回收内存账里已不存在的账号 id（账号删除后 `lastPick` 否则会无上限增长，
      * 实测删号后 size 仍为 60）。只清"磁盘上已没有"的键，不影响在场账号的节流状态。
+     *
+     * 为什么不另起定时器：`status()` 由看板以 ~3s 轮询（T18），真实部署下必然被周期性调用，
+     * 故清理挂在它上面足够及时；而起定时器会给 `pick()` 这条同步热路径引入额外的生命周期
+     * （句柄泄漏/测试里难以回收）。**依赖声明**：这条清理**依赖 `status()` 被周期性调用**，
+     * 若看板停用或轮询下线，`lastPick` 里已删账号的键会滞留到下一次 `status()` 为止——
+     * 只为已不存在的 id 多占几条内存，不影响任何发号/节流判定（`lastUsed` 只按在场账号查）。
      */
     const live = new Set(all.map((a) => a.id))
     for (const id of this.lastPick.keys()) if (!live.has(id)) this.lastPick.delete(id)
@@ -234,7 +365,7 @@ export class AccountPool {
       planCache: a.planCache ?? null,
       /**
        * 警告：`stats.lastUsedAt` 与 `stats.lastError.at` 存的是**池内时钟值**
-       * （与节流/`readyAt` 同轴，注入假时钟时不是真纪元毫秒）。看板层（T18）**不要**直接
+       * （与节流/`nextThrottleAt` 同轴，注入假时钟时不是真纪元毫秒）。看板层（T18）**不要**直接
        * `new Date(stats.lastUsedAt)` —— 会得到 1970 附近的时刻。需要人类可读时间时，
        * 由管理端用自己的真实时钟换算，或另存一份真实时间戳。
        */
