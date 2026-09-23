@@ -16,7 +16,9 @@ const parseCode = (text) => {
 }
 
 export function createGateway({ pool, paramPool, senders, config, log = () => {} }) {
-  const maxRetries = config.maxRetries ?? 0
+  // 默认值与 config.js 的 maxRetries 保持一致：漏传时应取"有重试"而不是"零重试"
+  // （`config.maxRetries ?? 0` 会让换号/换参在漏传时静默失效，与 `> undefined` 恒 false 是同一类错误）。
+  const maxRetries = config.maxRetries ?? 2
   /**
    * 单次请求内为"等号"允许的总时长上限。池对"节流中"（秒级，正常路径）与"冷却中"
    * （30min~24h，等下去本次请求也不会成功）都返回正数 `waitMs`，网关无法区分二者，
@@ -95,11 +97,15 @@ export function createGateway({ pool, paramPool, senders, config, log = () => {}
           const wait = waitMs ?? 0
           // 只按**累计时长**设防（见 maxPickWaitMs 注释）：不用尝试次数，否则并发下
           // N 个请求各自计数同一个节流事件，会把合法等待误判为失败。
-          if (waitedMs + wait > maxPickWaitMs) {
+          // `wait === 0` 视为错误形态（当前池不会产生：无号时恒有正 waitMs 或 null+warn），
+          // 直接失败而不是空转——否则 waitedMs 不推进会变成死循环。
+          if (wait <= 0 || waitedMs + wait > maxPickWaitMs) {
             throw new GatewayError({
               status: 503,
               code: 3012,
-              message: `no usable account: next available in ~${Math.round(wait / 1000)}s (${reason})`,
+              message: wait > 0
+                ? `no usable account: next available in ~${Math.round(wait / 1000)}s (${reason})`
+                : `no usable account: pool reported no wait (${reason})`,
               hint: '账号处于冷却（风控/限流）：单次请求不宜等待，请稍后重试或增补账号',
             })
           }

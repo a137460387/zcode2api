@@ -484,3 +484,39 @@ describe('gateway.complete 等待上限（区分节流与冷却）', () => {
     expect(threw.message).toContain('next available')
   })
 })
+
+describe('gateway 配置缺省与防御性边界', () => {
+  it('config 不含 maxRetries 时仍会换号重试（缺省应为有重试，而非零重试）', async () => {
+    const a1 = acc('a1'), a2 = acc('a2')
+    let i = 0
+    const pool = {
+      pick: () => ({ account: [a1, a2][i++] ?? null, waitMs: 0 }),
+      markSuccess: async () => {},
+      markError: async (a, e) => a.errors.push(e),
+    }
+    const g = createGateway({
+      pool, paramPool: { take: async () => 'P' },
+      senders: { oauth: async ({ account }) => (account.id === 'a1' ? err(405, '{"code":3012}') : ok()), apikey: async () => ok() },
+      config: {}, // 故意不传 maxRetries
+    })
+    const r = await g.complete({ model: 'GLM-5.3' }, {})
+    expect(r.response.status).toBe(200)
+    expect(r.account.id).toBe('a2')
+  })
+
+  it('池返回 waitMs=0 且无号时不空转（防御性：waitMs 不推进会死循环）', async () => {
+    const pool = {
+      pick: () => ({ account: null, waitMs: 0, reason: 'bogus' }),
+      markSuccess: async () => {},
+      markError: async () => {},
+    }
+    const g = createGateway({
+      pool, paramPool: { take: async () => 'P' },
+      senders: { oauth: async () => ok(), apikey: async () => ok() },
+      config: { maxRetries: 2 },
+    })
+    const t0 = Date.now()
+    await expect(g.complete({}, {})).rejects.toMatchObject({ status: 503 })
+    expect(Date.now() - t0).toBeLessThan(1000)
+  })
+})

@@ -36,3 +36,19 @@ describe('fetchBalance', () => {
     await expect(fetchBalance({ jwt: 'J', fetchImpl })).rejects.toThrow('balance query failed')
   })
 })
+
+describe('fetchBalance 错误信息不泄露响应体', () => {
+  it('错误信息只含 status 与 code，不回显可能含凭据的响应体', async () => {
+    const fetchImpl = async () => ({
+      status: 401,
+      json: async () => ({ code: 3001, token: 'LEAKED_JWT_VALUE', nested: { secret: 'LEAKED_SECRET' } }),
+    })
+    let err = null
+    try { await fetchBalance({ jwt: 'J', fetchImpl }) } catch (e) { err = e }
+    expect(err).not.toBeNull()
+    expect(err.message).toContain('HTTP 401')
+    expect(err.message).toContain('code=3001')
+    expect(err.message).not.toContain('LEAKED_JWT_VALUE')
+    expect(err.message).not.toContain('LEAKED_SECRET')
+  })
+})
