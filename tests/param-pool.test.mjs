@@ -46,3 +46,35 @@ describe('ParamPool', () => {
     expect(pool.status().pool).toBe(2)
   })
 })
+
+describe('ParamPool 配置健壮性', () => {
+  // maxSize 为负数曾让 push() 的淘汰循环永不退出（对空数组 shift() 恒返回 undefined），
+  // 同步死循环会阻塞事件循环、挂死整个进程。用超时守卫确保此测试本身不会挂住。
+  it('negative or invalid maxSize is clamped instead of hanging push()', async () => {
+    const enc = () => new Promise((r) => setTimeout(() => r('TIMEOUT'), 1000))
+    const run = async () => {
+      const p = new ParamPool({ maxSize: -1 })
+      p.push('a')
+      p.push('b')
+      return `pool=${p.status().pool}`
+    }
+    const r = await Promise.race([run(), enc()])
+    expect(r).not.toBe('TIMEOUT')
+    expect(r).toBe('pool=0')
+
+    // NaN / undefined / 小数也被规范为合法整数
+    const p2 = new ParamPool({ maxSize: NaN })
+    p2.push('x')
+    expect(p2.status().pool).toBe(0)
+    const p3 = new ParamPool({ maxSize: 2.7 })
+    p3.push('1'); p3.push('2'); p3.push('3')
+    expect(p3.status().pool).toBe(2)
+  })
+
+  it('maxSize 0 means the pool never retains params', () => {
+    const p = new ParamPool({ maxSize: 0 })
+    p.push('x')
+    expect(p.takeSync()).toBeNull()
+    expect(p.status().received).toBe(1)
+  })
+})

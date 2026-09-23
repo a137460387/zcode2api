@@ -10,7 +10,9 @@ const defaultSleep = (ms) => new Promise((r) => setTimeout(r, ms))
 export class ParamPool {
   constructor({ ttlMs = 8 * 60_000, maxSize = 6, now = Date.now, sleep = defaultSleep } = {}) {
     this.ttlMs = ttlMs
-    this.maxSize = maxSize
+    // 钳制为非负整数：maxSize 为负数会让 push() 的淘汰循环永不退出
+    // （对空数组 shift() 返回 undefined 且长度恒为 0），同步死循环会挂死整个进程。
+    this.maxSize = Math.max(0, Math.floor(Number.isFinite(maxSize) ? maxSize : 0))
     this.now = now
     this.sleep = sleep
     this.items = []
@@ -27,7 +29,9 @@ export class ParamPool {
   push(param) {
     this.prune()
     this.items.push({ param, bornAt: this.now() })
-    while (this.items.length > this.maxSize) this.items.shift()
+    if (this.items.length > this.maxSize) {
+      this.items.splice(0, this.items.length - this.maxSize)
+    }
     this.received += 1
     this.lastPushAt = this.now()
   }
