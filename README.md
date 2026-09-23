@@ -15,6 +15,18 @@ npm start
 - 看板：`http://127.0.0.1:8787/`（本机免密）
 - farm 页：`http://127.0.0.1:8789/farm`（启动时已自动打开无头 Chrome；也可手动打开并保持标签页）
 
+## 验证
+
+```bash
+npm test        # 单元/集成测试（198 项，不碰网络与真实上游）
+npm run e2e     # 端到端冒烟：真实 server + 真实 Response 走通双协议四条路径
+```
+
+`npm run e2e` 用本地假上游起真实服务，覆盖「OpenAI/Anthropic × 流式/非流式」四条路径，
+并核对 captcha 参数送达、SSE 透传与 usage 记账。它存在的原因是：单元测试把上游桩成普通对象，
+会掩盖只有真实 `Response` 才暴露的缺陷（例如 `Response.body` 是一次性流）。
+
+
 ## 添加账号
 
 1. 看板 →「+ BigModel 登录」或「+ Z.AI 登录」→ 浏览器完成授权 → 自动入库。
