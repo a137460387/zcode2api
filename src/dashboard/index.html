@@ -104,8 +104,8 @@ function accountCard(a) {
         <b>${esc(a.name || a.email || a.id)}</b>
         ${badges}
         <span style="flex:1"></span>
-        <button onclick="setEnabled('${esc(a.id)}', ${a.enabled})">${a.enabled ? '停用' : '启用'}</button>
-        <button onclick="del('${esc(a.id)}')">删除</button>
+        <button data-action="toggle" data-id="${esc(a.id)}" data-enabled="${a.enabled ? '1' : '0'}">${a.enabled ? '停用' : '启用'}</button>
+        <button data-action="delete" data-id="${esc(a.id)}">删除</button>
       </div>
       ${bars}
       <div style="font-size:12px;color:#888;margin-top:4px">
@@ -198,6 +198,17 @@ async function del(id) {
   await api('/accounts/delete', { id })
   refresh()
 }
+
+// 事件委托：动态值只经 dataset 传递（textContent/dataset 天然无注入面），
+// 绝不拼进 onclick 的 JS 字符串字面量——那条路上 HTML 实体会被还原成引号而逃逸。
+// 账号 id 来自上游 userInfo.user_id（远程可控），是存储型 XSS 的入口。
+$('accounts').addEventListener('click', (ev) => {
+  const btn = ev.target.closest('button[data-action]')
+  if (!btn) return
+  const id = btn.dataset.id
+  if (btn.dataset.action === 'toggle') return setEnabled(id, btn.dataset.enabled === '1')
+  if (btn.dataset.action === 'delete') return del(id)
+})
 
 async function refreshBalance() {
   $('balance-msg').textContent = '刷新中…'
