@@ -53,7 +53,18 @@ npm run e2e     # 端到端冒烟：真实 server + 真实 Response 走通双协
 
 - 上游对模型端点有行为风控（3012 unusual activity）：默认 2s/账号最小间隔 + 30min 冷却；
   高频失败会加重行为分（小时~天级衰减）。请勿压测。
+  **注意**：该风控针对"账号+设备+IP"的行为分，**官方桌面端在同期也会被同样拦截**。
+  实测（2026-09-23）代理与桌面端同时返回 3012，故遇到时先确认桌面端能否发消息，
+  以区分"风控冷却中"与"代理配置问题"。
 - farm 依赖阿里云验证码 SDK 配置（SceneId `11xygtvd` / prefix `no8xfe`），官方更新可能失效。
+- farm 的浏览器 UA 必须覆盖：playwright 在 headless 下默认 UA 含 `HeadlessChrome/<ver>`，
+  SDK 见之即返回 `F001`（verifyResult:false）导致**一个参数都产不出来**。
+  `src/captcha/browser.js` 已自动覆盖为桌面 Chrome UA，两种模式都可用
+  （实测：默认 UA → F001 且 0 产出；覆盖 UA → 30s 内产出 3 个）。
+  注：SDK 不检查 `navigator.webdriver`（实测该标志始终为 true，不影响结果）。
 - HTTPS farm：如 HTTP 下 SDK 异常，把 mkcert 证书放到 `certs/localhost-key.pem`、
   `certs/localhost.pem`（可从 `D:\code\Ai\zcode-proxy\certs\` 复制）并重启，自动切 HTTPS。
+- 测试超时：`vitest.config.mjs` 把 `testTimeout` 设为 30s。并发/落盘类测试在负载高的机器上
+  会明显变慢（实测同一批测试在 1.7s 与 >20s 之间波动），默认 5s 会误报失败。
 - 仅供个人学习研究，遵守上游服务条款。
+
