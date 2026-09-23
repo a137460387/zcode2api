@@ -411,3 +411,49 @@ describe('gateway.complete', () => {
     }
   })
 })
+
+// 池对"节流中"（秒级，正常路径）与"冷却中"（30min~24h，本次请求等下去也不会成功）
+// 返回同样的形态（正 waitMs、无 warn），网关必须靠累计等待上限区分，
+// 否则一次 HTTP 请求会干睡在冷却窗里（实测 waitMs=1799990 → 30 分钟）。
+describe('gateway.complete 等待上限（区分节流与冷却）', () => {
+  const mkConfig = () => ({ maxRetries: 2, maxPickAttempts: 10, maxPickWaitMs: 15_000 })
+
+  it('节流级等待（秒级）照常等待后重试成功', async () => {
+    let picks = 0
+    const pool = {
+      pick: () => (++picks === 1
+        ? { account: null, waitMs: 50, reason: 'all accounts within min interval (throttled)' }
+        : { account: { id: 'a1', type: 'oauth', jwt: 'J', apiKey: null, stats: {} }, waitMs: 0 }),
+      markSuccess: async () => {},
+      markError: async () => {},
+    }
+    const g = createGateway({
+      pool, paramPool: { take: async () => 'P' },
+      senders: { oauth: async () => ok(), apikey: async () => ok() },
+      config: mkConfig(),
+    })
+    const r = await g.complete({ model: 'GLM-5.3' }, {})
+    expect(r.response.status).toBe(200)
+  })
+
+  it('冷却级等待（30min）立即失败，不干睡', async () => {
+    const pool = {
+      pick: () => ({ account: null, waitMs: 1_799_990, reason: 'all accounts cooling down or disabled' }),
+      markSuccess: async () => {},
+      markError: async () => {},
+    }
+    const g = createGateway({
+      pool, paramPool: { take: async () => 'P' },
+      senders: { oauth: async () => ok(), apikey: async () => ok() },
+      config: mkConfig(),
+    })
+    const t0 = Date.now()
+    let threw = null
+    try { await g.complete({ model: 'GLM-5.3' }, {}) } catch (e) { threw = e }
+    const dt = Date.now() - t0
+    expect(threw).not.toBeNull()
+    expect(threw.status).toBe(503)
+    expect(dt).toBeLessThan(1000) // 绝不能真的睡 30 分钟
+    expect(threw.message).toContain('next available')
+  })
+})

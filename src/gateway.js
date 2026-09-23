@@ -19,6 +19,12 @@ export function createGateway({ pool, paramPool, senders, config, log = () => {}
   // 选号总尝试上限：pool 长期处于节流/冷却时 `pick` 会一直返回"暂时无号"，
   // 没有上限就会无限等待（brief 要求）。默认给足余量，单次约等于一个节流窗。
   const maxPickAttempts = config.maxPickAttempts ?? 10
+  /**
+   * 单次请求内为"等号"允许的总时长上限。池对"节流中"（秒级，正常路径）与"冷却中"
+   * （30min~24h，等下去本次请求也不会成功）都返回正数 `waitMs`，网关无法区分二者，
+   * 故用时长阈值兜底：累计等待超过此值即失败并提示原因，而不是让 HTTP 请求干睡在冷却窗里。
+   */
+  const maxPickWaitMs = config.maxPickWaitMs ?? 15_000
 
   async function sendOnce(account, body, sessionId) {
     if (account.type === 'apikey') {
@@ -48,6 +54,7 @@ export function createGateway({ pool, paramPool, senders, config, log = () => {}
      * 客户端应看到"上游风控/凭据失效"（429/401）而非"账号池无号"。
      */
     let lastRetryable = null
+    let waitedMs = 0
     while (true) {
       if (!account) {
         const picked = pool.pick(sessionKey)
@@ -58,8 +65,9 @@ export function createGateway({ pool, paramPool, senders, config, log = () => {}
            * T4 账号池契约（三轮修复后的最终形态）：
            * - `warn === 'human action required'`（`waitMs === null`）：账号全停用/需重登/无套餐，
            *   等下去也不会自愈 —— **必须立即失败**。若按 waitMs 重试会无限循环。
-           * - `waitMs` 是有限正数：暂时无号（在 `minIntervalMs` 节流窗内或冷却中），
-           *   **等它之后重试是正常路径**（冷启动尖峰即如此），不是错误。
+           * - `waitMs` 是有限正数：暂时无号。**节流中（秒级）等它重试是正常路径**；
+           *   但**冷却中（分钟~小时级）等下去本次请求也不会成功**，池对两者返回同样的形态，
+           *   故用累计等待上限区分（见 `maxPickWaitMs`）。
            * - 设总尝试上限，避免池长期无号时无限等待。
            *
            * 例外（本任务实测发现，见下方 `lastRetryable`）：已经因可重试错误换过号、此刻池里
@@ -83,11 +91,22 @@ export function createGateway({ pool, paramPool, senders, config, log = () => {}
               hint: '账号池持续无可用账号：确认账号是否被节流/冷却，或稍后重试',
             })
           }
-          await new Promise((r) => setTimeout(r, waitMs ?? 0))
+          const wait = waitMs ?? 0
+          if (waitedMs + wait > maxPickWaitMs) {
+            throw new GatewayError({
+              status: 503,
+              code: 3012,
+              message: `no usable account: next available in ~${Math.round(wait / 1000)}s (${reason})`,
+              hint: '账号处于冷却（风控/限流）：单次请求不宜等待，请稍后重试或增补账号',
+            })
+          }
+          waitedMs += wait
+          await new Promise((r) => setTimeout(r, wait))
           continue
         }
       }
       pickAttempts = 0
+      waitedMs = 0
       // 注意：`account` 非空时 `waitMs` 是"建议节流间隔"（选中后到它下次可用），
       // 由池自身记账节制后续选号，网关**不等待**它——否则每个请求都白白慢一个节流窗。
       let res
