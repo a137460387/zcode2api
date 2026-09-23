@@ -26,3 +26,9 @@ export function mapToBigModel(name) {
 export function publicModelIds() {
   return ['glm-5.3', 'glm-5.3-flash']
 }
+
+// 别名表的结构契约：查表前会对输入做 toUpperCase()，所以每个 key 必须已经是
+// 大写形式，否则该别名永远无法命中。测试用它与 mapToZcodePlan 做穷举对拍。
+export function zcodePlanAliasKeys() {
+  return Object.keys(ZCODE_PLAN_MAP)
+}

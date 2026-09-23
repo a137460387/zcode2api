@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { mapToZcodePlan, mapToBigModel, publicModelIds } from '../src/models.js'
+import { mapToZcodePlan, mapToBigModel, publicModelIds, zcodePlanAliasKeys } from '../src/models.js'
 
 describe('mapToZcodePlan', () => {
   it('maps known aliases case-insensitively', () => {
@@ -32,6 +32,25 @@ describe('mapToZcodePlan', () => {
     expect(mapToZcodePlan('GLM_5P3-Flash')).toBe('GLM_5P3-Flash')
     expect(mapToZcodePlan('GLM_5P3_plus')).toBe('GLM_5P3_plus')
     expect(mapToZcodePlan('glm_5p3X')).toBe('glm_5p3X')
+  })
+  it('keeps the alias table keys uppercase (structural contract)', () => {
+    // 查表走 toUpperCase()，key 若含小写字母就永远命中不了，别名会静默失效。
+    for (const k of zcodePlanAliasKeys()) {
+      expect(k).toBe(k.toUpperCase())
+    }
+  })
+  it('exhaustively passes through names that fold onto an alias without being one', () => {
+    // 对拍：任何"大小写折叠后等于某个 key、但本身不是该 key 精确形式"的输入，
+    // 只要它不在别名表里，就必须原样透传。这条断言能真正驱动红阶段
+    // —— 若改回 toLowerCase() 查表，下面的探针会被折叠到别名上而失败。
+    const aliasKeys = zcodePlanAliasKeys()
+    for (const key of aliasKeys) {
+      for (const probe of [key + '-EXTRA', key + '_X', key.replace('-', '_'), key + 'X']) {
+        const folded = probe.toUpperCase()
+        if (aliasKeys.includes(folded)) continue // 与某个别名精确同名，属合法别名
+        expect(mapToZcodePlan(probe)).toBe(probe)
+      }
+    }
   })
   it('trims surrounding whitespace before matching', () => {
     expect(mapToZcodePlan('  glm-5.3  ')).toBe('GLM-5.3')
