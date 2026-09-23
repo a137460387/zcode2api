@@ -34,6 +34,8 @@
   <div class="row">
     <button onclick="startLogin('bigmodel')">+ BigModel 登录</button>
     <button onclick="startLogin('zai')">+ Z.AI 登录</button>
+    <button onclick="importLocal()" title="读取本机 ZCode 桌面端已登录的账号，无需重新授权">⤓ 扫描本机 ZCode 登录</button>
+    <span id="import-msg" style="font-size:12px;color:#888"></span>
   </div>
   <div id="accounts"></div>
 </div>
@@ -218,6 +220,27 @@ async function refreshBalance() {
   $('balance-msg').textContent = failed.length
     ? `刷新完成，${failed.length}/${results.length} 失败`
     : (results.length ? `已刷新 ${results.length} 个账号` : '无 oauth 账号可刷新')
+  refresh()
+}
+
+// 读取本机 ZCode 桌面端已登录的账号（免重新授权）。
+// 失败原因（未登录/跨机器凭据解不开）由服务端给出可读提示，直接展示。
+async function importLocal() {
+  $('import-msg').textContent = '扫描中…'
+  let r
+  try {
+    r = await api('/accounts/import/local')
+  } catch (e) {
+    return ($('import-msg').textContent = '无法连接本机服务')
+  }
+  if (r && r.error) {
+    $('import-msg').textContent = r.error.message || '导入失败'
+    return
+  }
+  const ids = (r && r.accounts) || []
+  $('import-msg').textContent = ids.length
+    ? `已导入 ${ids.length} 个账号：${ids.join('、')}`
+    : '未发现可导入的账号'
   refresh()
 }
 

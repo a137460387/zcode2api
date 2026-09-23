@@ -462,3 +462,41 @@ describe('v1 auth 边界补充', () => {
     expect(bad.status).toBe(401)
   })
 })
+
+describe('导入本机 ZCode 登录态', () => {
+  const jwt = 'eyJhbGciOiJIUzI1NiJ9.eyJ1c2VyX2lkIjoiOTkifQ.sig'
+
+  it('成功导入并入库、顺带拉取余额', async () => {
+    let balanceCalls = 0
+    const fetchImpl = async () => {
+      balanceCalls++
+      return { status: 200, json: async () => ({ code: 0, data: { plans: [{ name: 'Start Plan' }], balances: [{ entitlement_id: 'e', show_name: 'GLM-5.3', total_units: 3000000, used_units: 0, available_units: 3000000 }] } }) }
+    }
+    const deps = buildDeps({
+      fetchImpl,
+      // 注入 reader：凭据文件的解析逻辑由 local-import 自己的单测覆盖，这里只测路由行为
+      readLocalCredentials: () => ({
+        ok: true, source: '/fake/credentials.json',
+        accounts: [{ provider: 'bigmodel', jwt, accessToken: 'AT', refreshToken: 'RT', userInfo: { user_id: '99', email: 'x@y.z' } }],
+      }),
+    })
+    const app = createApp(deps)
+    const r = await request(app).post('/accounts/import/local')
+    expect(r.status).toBe(200)
+    expect(r.body.ok).toBe(true)
+    expect(r.body.accounts).toEqual(['bigmodel:99'])
+    expect(balanceCalls).toBe(1)
+    const saved = deps.store.get('bigmodel:99')
+    expect(saved.jwt).toBe(jwt)
+    expect(saved.planCache.balances[0].remaining).toBe(3000000)
+  })
+
+  it('导入失败时返回 400 与可读原因', async () => {
+    // 不注入 localCredOptions → 走真实 readLocalZcodeCredentials，指向不存在的文件
+    const app = createApp(buildDeps({ localCredOptions: { file: path.join(os.tmpdir(), 'definitely-missing-z2a.json') } }))
+    const r = await request(app).post('/accounts/import/local')
+    expect(r.status).toBe(400)
+    expect(r.body.error.reason).toBe('not_found')
+    expect(typeof r.body.error.message).toBe('string')
+  })
+})

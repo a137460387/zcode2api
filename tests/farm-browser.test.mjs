@@ -1,4 +1,5 @@
 import { describe, it, expect, vi, afterEach } from 'vitest'
+import fs from 'node:fs'
 import { launchFarmBrowser } from '../src/captcha/browser.js'
 
 // launchFarmBrowser 的核心契约（brief Interfaces）：playwright 未安装或启动失败时
@@ -71,5 +72,29 @@ describe('launchFarmBrowser（降级契约：绝不抛异常）', () => {
     })
     const { launchFarmBrowser: fresh } = await import('../src/captcha/browser.js')
     await expect(fresh({ url: 'http://127.0.0.1:8080/farm' })).resolves.toBeNull()
+  })
+})
+
+// 【关键回归】headless 下必须覆盖 UA。
+// 默认 UA 含 `HeadlessChrome/<ver>`，阿里验证码 SDK 据此判自动化并返回 F001
+// （verifyResult:false），农场一个参数都产不出来。受控实验（headless=true）：
+//   默认 UA → F001 失败、0 产出；覆盖桌面 UA → 正常产出 3 个。
+// 注：SDK 不检查 navigator.webdriver（实验中该标志始终为 true，不影响结果）。
+//
+// 这里用源码契约断言而非 mock：这是"构造 context 时必须带 userAgent"的静态约定，
+// 不依赖浏览器与进程状态，跑得快且稳定。
+describe('launchFarmBrowser 的 UA 覆盖（契约）', () => {
+  const source = fs.readFileSync(new URL('../src/captcha/browser.js', import.meta.url), 'utf8')
+
+  it('newContext 必须传入 userAgent', () => {
+    expect(source).toMatch(/newContext\(\{\s*userAgent:/)
+  })
+
+  it('UA 常量不含 HeadlessChrome，且为桌面 Chrome 形态', () => {
+    const ua = source.match(/const DESKTOP_UA =\s*\n?\s*'([^']+)'/)?.[1]
+    expect(typeof ua).toBe('string')
+    expect(ua).not.toContain('HeadlessChrome')
+    expect(ua).toContain('Chrome/')
+    expect(ua).toContain('Windows NT')
   })
 })

@@ -19,6 +19,7 @@ import { pipeAnthropicToOpenAISSE, pipeAnthropicSSEWithUsage } from './protocol/
 import { fetchBalance } from './billing.js'
 import { beginBigModelLogin } from './auth/bigmodel.js'
 import { beginZaiLogin } from './auth/zai.js'
+import { readLocalZcodeCredentials } from './auth/local-import.js'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 
@@ -216,6 +217,39 @@ export function createApp(deps) {
       }
     }
     res.json({ results })
+  }))
+
+  /**
+   * 扫描本机 ZCode 客户端登录态并入库（无需重新走 OAuth）。
+   * 只在本机可用（panelAuth 已限制非本机需面板密码），因为读的是本机 HOME 下的凭据文件。
+   */
+  app.post('/accounts/import/local', panelAuth, wrap(async (req, res) => {
+    // 读取函数可注入（deps.readLocalCredentials）：便于测试覆盖各种凭据形态，
+    // 生产走真实的本机凭据文件读取。
+    const read = deps.readLocalCredentials ?? readLocalZcodeCredentials
+    const r = read(deps.localCredOptions ?? {})
+    if (!r.ok) return res.status(400).json({ error: { message: r.message, reason: r.reason } })
+    const imported = []
+    for (const a of r.accounts) {
+      const account = await store.save(newAccountFields({
+        provider: a.provider,
+        type: 'oauth',
+        jwt: a.jwt,
+        accessToken: a.accessToken,
+        refreshToken: a.refreshToken,
+        userInfo: a.userInfo,
+      }))
+      log(`[accounts] imported local ZCode login ${account.id} (${a.provider})`)
+      imported.push(account)
+    }
+    // 顺带把余额取回来，看板导入后立刻能看到套餐余量（失败不影响导入结果）
+    for (const acc of imported) {
+      try {
+        const b = await fetchBalance({ jwt: acc.jwt, fetchImpl: deps.fetchImpl })
+        await store.update(acc.id, { planCache: b })
+      } catch { /* 余额查询失败不阻断导入 */ }
+    }
+    res.json({ ok: true, source: r.source, accounts: imported.map((a) => a.id) })
   }))
 
   app.post('/accounts/login/:provider/start', panelAuth, wrap(async (req, res) => {
