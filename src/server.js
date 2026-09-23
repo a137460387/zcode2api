@@ -74,7 +74,10 @@ export function createApp(deps) {
     // 于是 `?key=` 永远读不到（实测三选一里只有 `?key=` 恒 401）。
     // 用 `||` 链：空串与 undefined 都视为"未提供"，继续往后取。
     const key = req.get('x-api-key') || (req.get('authorization') || '').replace(/^Bearer\s+/i, '') || req.query.key
-    if (key !== config.apiKey) return res.status(401).json({ error: { message: 'invalid api key' } })
+    // `?key=a&key=b` 会让 req.query.key 变成数组，`数组 !== 字符串` 恒真 → 即使正确的 key 在列也 401。
+    // 取第一个（Express 的默认 query 解析保证顺序与出现顺序一致）。
+    const normalized = Array.isArray(key) ? key[0] : key
+    if (normalized !== config.apiKey) return res.status(401).json({ error: { message: 'invalid api key' } })
     return next()
   }
 

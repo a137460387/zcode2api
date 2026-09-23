@@ -26,7 +26,16 @@ export function openaiToAnthropic(oa, mapModel) {
       if (m.content) blocks.push({ type: 'text', text: m.content })
     } else if (Array.isArray(m.content)) {
       for (const c of m.content) {
-        if (c.type === 'text' && c.text) blocks.push({ type: 'text', text: c.text })
+        if (c.type === 'text' && c.text) {
+          blocks.push({ type: 'text', text: c.text })
+        } else if (c.type === 'image_url' || c.type === 'input_audio' || c.type === 'image') {
+          // 静默丢弃图片会让模型基于纯文本"自信作答"，客户端拿到貌似成功的错误结果——
+          // 比直接报错更糟。该通道也不支持视觉输入，故显式拒绝（服务层映射为 400）。
+          const err = new Error(`unsupported content type: ${c.type}（本网关暂不支持图片/音频输入）`)
+          err.status = 400
+          err.code = 'unsupported_content'
+          throw err
+        }
       }
     }
     if (m.role === 'assistant' && Array.isArray(m.tool_calls)) {

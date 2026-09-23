@@ -142,3 +142,26 @@ describe('anthropicToOpenAI', () => {
     expect(out.choices[0].finish_reason).toBe('stop')
   })
 })
+
+// 静默丢弃图片块会让模型基于纯文本"自信作答"，客户端拿到貌似成功的错误结果——比报错更糟。
+// 该通道不支持视觉输入，故显式拒绝（服务层会把 status 映射为 400）。
+describe('openaiToAnthropic 非文本内容块', () => {
+  it('图片块被显式拒绝而非静默丢弃', () => {
+    expect(() => openaiToAnthropic({
+      messages: [{
+        role: 'user',
+        content: [
+          { type: 'text', text: '这张图里是什么？' },
+          { type: 'image_url', image_url: { url: 'https://example.com/cat.jpg' } },
+        ],
+      }],
+    }, (m) => m)).toThrow(/unsupported content type/)
+  })
+
+  it('纯文本内容不受影响', () => {
+    const out = openaiToAnthropic({
+      messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }],
+    }, (m) => m)
+    expect(out.messages[0].content).toEqual([{ type: 'text', text: 'hi' }])
+  })
+})

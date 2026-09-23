@@ -451,3 +451,14 @@ describe('流式中途失败', () => {
     })
   }
 })
+
+describe('v1 auth 边界补充', () => {
+  it('?key 传数组时取第一个（正确的 key 在列即可通过）', async () => {
+    const app = createApp(buildDeps())
+    const body = { model: 'glm-5.3', messages: [{ role: 'user', content: 'hi' }] }
+    const ok = await request(app).post('/v1/chat/completions').query('key=sk-test&key=other').send(body)
+    expect(ok.status).toBe(200)
+    const bad = await request(app).post('/v1/chat/completions').query('key=wrong&key=alsoWrong').send(body)
+    expect(bad.status).toBe(401)
+  })
+})
