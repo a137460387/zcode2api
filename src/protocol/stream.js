@@ -1,8 +1,9 @@
 const uuid = () => globalThis.crypto.randomUUID()
 
-// SSE 帧解析：既支持标准 `data: {...}\n\n` 分帧，也支持块边界直接粘连
-// （上游/测试夹具可能不以换行字节分隔 `data:` 行）。返回解析出的事件数组，
-// 并把未消费的残留写回 state.buf。
+// SSE 帧解析：按换行分帧，只消费**完整行**，未收全的残留留在 state.buf 等下一个 chunk。
+// 真实上游的 Anthropic SSE 每个事件都以换行结尾（`data: {...}\n\n`），故只需按 `\n` 切。
+// 不按 `data:` 边界做启发式切分：那会把"已收到一半的下一个 data: 帧"当成完整帧去解析，
+// 失败后静默丢弃，其剩余字节因失去前缀而永远无法重组（丢事件）。
 function drainEvents(state, out) {
   let idx
   while ((idx = state.buf.indexOf('\n')) !== -1) {
@@ -12,18 +13,6 @@ function drainEvents(state, out) {
     const data = line.slice(5).trim()
     if (!data || data === '[DONE]') continue
     try { out.push(JSON.parse(data)) } catch {}
-  }
-  if (state.buf && !state.buf.includes('\n')) {
-    const parts = state.buf.split(/(?=data:)/).map((s) => s.trim()).filter(Boolean)
-    if (parts.length > 1) {
-      state.buf = ''
-      for (const p of parts) {
-        if (!p.startsWith('data:')) continue
-        const data = p.slice(5).trim()
-        if (!data || data === '[DONE]') continue
-        try { out.push(JSON.parse(data)) } catch {}
-      }
-    }
   }
 }
 
@@ -84,7 +73,11 @@ export async function pipeAnthropicToOpenAISSE(res, write, model) {
       } else if (ev.delta?.type === 'thinking_delta') {
         send({ id, object: 'chat.completion.chunk', created, model, choices: [{ index: 0, delta: { reasoning_content: ev.delta.thinking }, finish_reason: null }] })
       } else if (ev.delta?.type === 'input_json_delta') {
-        const oaIndex = toolIndexByBlock.get(ev.index) ?? 0
+        // 无对应 content_block_start 的孤儿 delta（异常流）直接丢弃：
+        // 归并到 index 0 会与真实的 0 号工具调用拼接参数、静默产出错误的调用，
+        // 比丢帧更隐蔽。未知 index 的参数片段本就没有可归属的工具。
+        const oaIndex = toolIndexByBlock.get(ev.index)
+        if (oaIndex === undefined) continue
         send({
           id, object: 'chat.completion.chunk', created, model,
           choices: [{
