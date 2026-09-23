@@ -22,11 +22,16 @@ describe('ParamPool', () => {
   })
 
   it('take waits until a param arrives', async () => {
-    const { now } = fakeClock()
+    const { now, advance } = fakeClock()
     const pool = new ParamPool({ now, sleep: () => Promise.resolve() })
-    setTimeout(() => pool.push('LATE'), 5)
-    const p = await pool.take({ waitMs: 500 })
-    expect(p).toBe('LATE')
+    // brief 原文用真实 setTimeout + 同步推进的假时钟 + 立即 resolve 的 sleep stub：
+    // 虚拟时间在真实计时器触发前就冲过 deadline，take 永远抛空，且异步循环会阻塞 vitest。
+    // 改为在 take 内部推进假时钟（push 前快进 50ms），语义仍是"参数晚到，take 等到它"。
+    const arriving = pool.take({ waitMs: 500 }).then((p) => p)
+    await Promise.resolve()
+    advance(50)
+    pool.push('LATE')
+    await expect(arriving).resolves.toBe('LATE')
   })
 
   it('take throws ParamPoolEmpty after waitMs', async () => {
