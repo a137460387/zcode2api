@@ -498,3 +498,29 @@ describe('AccountPool error handling', () => {
     expect(s.outputTokens).toBe(50)
   })
 })
+
+describe('earliestWaitMs 非单调缺陷（修复轮 4）', () => {
+  // 单号 C：冷却剩 1000ms，但它的节流窗还剩 1500ms。
+  // 旧实现报 waitMs=1000（冷却解禁时刻），但那时 C 仍在节流窗内 → pick 被门挡住拿不到号，
+  // 调用方按 1000 等待后重试仍拿到 null，白白多一次 round-trip。
+  // 真实可发号时刻应是 max(冷却解禁, lastUsed+minIntervalMs) = t+1500。
+  it('waitMs 必须在冷却解禁后仍存在的节流窗之后才到点', async () => {
+    const ownDir = fs.mkdtempSync(path.join(os.tmpdir(), 'z2a-mono-'))
+    const store = new AccountStore(ownDir)
+    let t = 1_000_000
+    const pool = new AccountPool(store, { minIntervalMs: 2000, cooldown3012Ms: 1800000, now: () => t })
+    const acc = newAccountFields({ provider: 'bigmodel', type: 'oauth', userInfo: { user_id: 'C' } })
+    await store.save(acc)
+    // 该号 500ms 前用过（节流窗还剩 1500ms），且冷却再 1000ms 解禁
+    await store.update(acc.id, { cooldownUntil: t + 1000 })
+    pool.lastPick.set(acc.id, t - 500)
+
+    const w1 = pool.pick(null).waitMs
+    expect(w1).toBeGreaterThanOrEqual(1500) // 旧实现报 1000
+
+    // 按 w1 等待后必须真的能拿到号
+    t += w1
+    const r = pool.pick(null)
+    expect(r.account).not.toBeNull()
+  })
+})

@@ -67,10 +67,11 @@ export class AccountPool {
    *   （T15：直接 503 + 告警，不能按 `waitMs` 空转重试）。
    * - `0` — 此刻就有健康账号可用（全员都不受节流/冷却约束）。
    * - `> 0` — 真实剩余等待：**按 `pick()` 实际会走的顺序算**，而不是逐个账号取最小。
-   *   - 若存在**窗内的健康历史号** → 取它们中最早的过窗时刻（`lastUsed + minIntervalMs - t`）。
+   *   - 若存在**窗内的健康历史号** → 取它们中**最晚**的过窗时刻（`max(lastUsed) + minIntervalMs - t`）。
+   *     `pick()` 的门要求"任何窗内历史号都清空"才发号，故要等最晚那个，不是最早那个。
    *     此时**不得**与更早的冷却解禁时刻取 min（见下）。
    *   - 否则（健康号里已无窗内历史号）→ 若存在从未用过的健康号则为 0（它们会立刻被放行）；
-   *     没有健康号可发时取**可自愈冷却账号**里最早的 `cooldownUntil - t`。
+   *     没有健康号可发时取**可自愈账号**里最早的"既过冷却、又已出节流窗"的时刻。
    *
    * 阈值一律只取"窗内历史号最早过窗"，**不与冷却解禁取 min、也不取 max**：
    * 冷却号既不健康、也就不参与 `pick()` 的 `used`/`fresh` 门（`healthy()` 已把
@@ -98,7 +99,11 @@ export class AccountPool {
      * 与 `pick()` 的节流门**用同一个判定**：`blocking` = 健康（`healthy()` 已含冷却窗口）
      * 且 `lastUsed > 0` 且仍在自己窗内的账号。只要它非空，`pick()` 就一律不发号，
      * 故真实等待是**最后一个窗内历史号过窗**的时刻——`pick()` 要求"任何"窗内历史号都清空。
-     * 冷却号不在此列（它不健康，进不了 `pick()` 的门，也不影响门何时打开）。
+     *
+     * 冷却中的账号此刻不在门里（`healthy()` 排除它），但它**解禁后会立刻成为新的 blocking 号**
+     * （若其 `lastUsed` 仍在窗内）。故它对"何时真的能发号"的贡献不是 `cooldownUntil`，
+     * 而是 `max(cooldownUntil, lastUsed + minIntervalMs)`——两个约束都满足才发得出号。
+     * 只按 `cooldownUntil` 报等待会让调用方按一个拿不到号的时刻重试，白白空转一次 round-trip。
      */
     const healthyAccs = all.filter((a) => this.healthy(a))
     let blockingEnd = 0
@@ -112,14 +117,17 @@ export class AccountPool {
     // 已过窗的历史健康号此刻即可发号（`blockingEnd <= t` 且它不在冷却中）→ 不需等待
     const passedWindow = healthyAccs.some((a) => this.lastUsed(a) > 0)
     if (passedWindow) return 0
-    // 没有任何可发的健康号：等最早的可自愈冷却解禁；没有则须人工干预
-    let earliestCool = Infinity
+    // 没有任何可发的健康号：等最早"既过冷却、又出节流窗"的可自愈账号；没有则须人工干预
+    let earliestUsable = Infinity
     for (const a of selfHealing) {
       const cd = a.cooldownUntil ?? 0
-      if (cd > t) earliestCool = Math.min(earliestCool, cd)
+      if (cd <= t) continue
+      const used = this.lastUsed(a)
+      const throttledTo = used > 0 ? used + this.minIntervalMs : 0
+      earliestUsable = Math.min(earliestUsable, Math.max(cd, throttledTo))
     }
-    if (earliestCool === Infinity) return null
-    return Math.max(0, earliestCool - t)
+    if (earliestUsable === Infinity) return null
+    return Math.max(0, earliestUsable - t)
   }
 
   /**
