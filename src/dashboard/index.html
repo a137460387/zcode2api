@@ -1,0 +1,217 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>zcode2api 看板</title>
+<style>
+ body{font-family:system-ui;max-width:960px;margin:24px auto;padding:0 16px;background:#fafafa;color:#222}
+ .card{background:#fff;border:1px solid #e5e5e5;border-radius:12px;padding:16px;margin-bottom:16px}
+ .row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+ .tag{font-size:12px;padding:2px 8px;border-radius:999px;background:#eef}
+ .bad{color:#dc2626}.warn{color:#d97706}.ok{color:#16a34a}
+ button{padding:6px 12px;border:1px solid #ccc;border-radius:8px;background:#fff;cursor:pointer}
+ table{width:100%;border-collapse:collapse;font-size:13px}
+ td,th{border-bottom:1px solid #eee;padding:6px 4px;text-align:left}
+ .bar{height:6px;background:#eee;border-radius:3px;overflow:hidden;margin:4px 0}
+ .bar>i{display:block;height:100%;background:#16a34a}
+ dialog{border:1px solid #ccc;border-radius:12px;max-width:520px}
+</style>
+</head>
+<body>
+<h2>zcode2api</h2>
+<div class="card">
+  <div class="row">
+    <b>captcha 参数池</b>
+    <span id="pool">-</span>
+    <a id="farm-link" href="#" target="_blank" rel="noopener">打开 farm 页</a>
+    <span style="flex:1"></span>
+    <span id="balance-msg" style="font-size:12px;color:#888"></span>
+    <button onclick="refreshBalance()">刷新余额</button>
+  </div>
+</div>
+<div class="card">
+  <div class="row">
+    <button onclick="startLogin('bigmodel')">+ BigModel 登录</button>
+    <button onclick="startLogin('zai')">+ Z.AI 登录</button>
+  </div>
+  <div id="accounts"></div>
+</div>
+<div class="card"><b>最近请求</b><table id="reqs"></table></div>
+<dialog id="dlg">
+  <h3 id="dlg-title">OAuth 登录</h3>
+  <p>1. 点击下面的链接完成授权；2. 授权完成后本窗口自动检测。</p>
+  <p><a id="dlg-url" href="#" target="_blank" rel="noopener" style="word-break:break-all">授权链接</a></p>
+  <p id="dlg-status">等待授权…</p>
+  <button onclick="cancelLogin()">取消</button>
+</dialog>
+<script>
+let loginId = null, loginProvider = null, pollTimer = null
+const $ = (id) => document.getElementById(id)
+
+// 所有插入 innerHTML 的动态值都必须转义：账号 name/email、上游错误信息、模型名等
+// 都来自外部（上游响应/账号文件），直接拼接等于把看板变成 XSS 注入面。
+const esc = (v) => String(v ?? '').replace(/[&<>"']/g, (c) => (
+  { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]
+))
+
+async function api(path, body) {
+  const r = await fetch(path, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: body ? JSON.stringify(body) : undefined,
+    credentials: 'same-origin',
+  })
+  return r.json()
+}
+
+// stats.lastUsedAt / stats.lastError.at 存的是**池内时钟值**（与节流同轴，注入假时钟时
+// 不是真实纪元），不能 new Date() 渲染。故只显示"多久之前/是否曾发生"，不做绝对时间换算。
+const ago = (ms) => {
+  if (!ms) return ''
+  const s = Math.max(0, Math.round((Date.now() - ms) / 1000))
+  if (s < 60) return s + 's 前'
+  if (s < 3600) return Math.round(s / 60) + 'min 前'
+  return Math.round(s / 3600) + 'h 前'
+}
+
+function accountCard(a) {
+  const stats = a.stats || {}
+  const badges = [
+    a.enabled ? '<span class="ok">启用</span>' : '<span class="bad">停用</span>',
+    a.needsRelogin ? '<span class="bad">需重登</span>' : '',
+    a.noPackage ? '<span class="warn">无资源包</span>' : '',
+    a.cooldownRemainMs > 0 ? `<span class="warn">冷却 ${Math.ceil(a.cooldownRemainMs / 60000)}min</span>` : '',
+    stats.lastError ? '<span class="warn">有错误记录</span>' : '',
+  ].filter(Boolean).join('')
+
+  const balances = (a.planCache && a.planCache.balances) || []
+  const bars = balances.map((b) => {
+    const pct = b.total ? Math.max(0, Math.min(100, (b.remaining / b.total) * 100)) : 0
+    return `
+      <div class="row" style="margin-top:6px;font-size:13px">
+        <span>${esc(b.modelName || b.entitlementId)}</span>
+        <span>${esc(b.remaining)} / ${esc(b.total)}</span>
+        <div class="bar" style="flex:1"><i style="width:${pct}%"></i></div>
+      </div>`
+  }).join('')
+
+  const le = stats.lastError
+  return `
+    <div class="card" style="margin-top:8px">
+      <div class="row">
+        <span class="tag">${esc(a.provider)} · ${esc(a.type)}</span>
+        <b>${esc(a.name || a.email || a.id)}</b>
+        ${badges}
+        <span style="flex:1"></span>
+        <button onclick="setEnabled('${esc(a.id)}', ${a.enabled})">${a.enabled ? '停用' : '启用'}</button>
+        <button onclick="del('${esc(a.id)}')">删除</button>
+      </div>
+      ${bars}
+      <div style="font-size:12px;color:#888;margin-top:4px">
+        请求 ${esc(stats.requests ?? 0)} · 入 ${esc(stats.inputTokens ?? 0)} · 出 ${esc(stats.outputTokens ?? 0)} tokens
+        ${stats.lastUsedAt ? `· 最近使用 ${ago(stats.lastUsedAt)}` : ''}
+        ${le ? `· <span class="bad">最近错误 ${esc(le.status ?? le.code ?? '')}${le.at ? ' ' + ago(le.at) : ''}</span>` : ''}
+      </div>
+    </div>`
+}
+
+async function refresh() {
+  let s
+  try {
+    s = await fetch('/pool/status', { credentials: 'same-origin' }).then((r) => r.json())
+  } catch (e) {
+    return
+  }
+  const pp = s.paramPool || {}
+  $('pool').textContent = `池 ${pp.pool ?? 0} / 收到 ${pp.received ?? 0} / 消费 ${pp.used ?? 0}`
+  // farmUrl 是 farm 页完整地址（形如 http://127.0.0.1:8789/farm）
+  if (s.farmUrl) $('farm-link').href = s.farmUrl
+  $('accounts').innerHTML = (s.accounts || []).map(accountCard).join('')
+    || '<p style="color:#888">暂无账号，先添加一个</p>'
+  $('reqs').innerHTML = '<tr><th>时间</th><th>模型</th><th>账号</th><th>状态</th></tr>'
+    + (s.requests || []).map((r) => `
+      <tr>
+        <td>${esc(new Date(r.at).toLocaleTimeString())}</td>
+        <td>${esc(r.model)}</td>
+        <td>${esc(r.account)}</td>
+        <td class="${r.status === 200 ? 'ok' : 'bad'}">${esc(r.status)}${r.error ? ' ' + esc(String(r.error).slice(0, 60)) : ''}</td>
+      </tr>`).join('')
+}
+
+function finish() {
+  if (pollTimer) clearInterval(pollTimer)
+  pollTimer = null
+  loginId = null
+  loginProvider = null
+  const dlg = $('dlg')
+  if (dlg.open) dlg.close()
+}
+
+async function startLogin(provider) {
+  let r
+  try {
+    r = await api(`/accounts/login/${provider}/start`)
+  } catch (e) {
+    return alert('无法连接本机服务')
+  }
+  if (r.error) return alert(r.error.message || 'start failed')
+  loginId = r.loginId
+  loginProvider = provider
+  $('dlg-title').textContent = (provider === 'zai' ? 'Z.AI' : 'BigModel') + ' OAuth 登录'
+  $('dlg-url').href = r.authorizeUrl
+  $('dlg-status').textContent = '等待授权…'
+  $('dlg').showModal()
+  pollTimer = setInterval(async () => {
+    let p
+    try {
+      p = await api(`/accounts/login/${provider}/poll`, { loginId })
+    } catch (e) {
+      return
+    }
+    if (!p || p.status === 'pending') return
+    if (p.status === 'ready') {
+      $('dlg-status').textContent = '登录成功'
+      finish()
+      refresh()
+    } else if (p.status === 'failed') {
+      $('dlg-status').textContent = '失败：' + (p.error || '未知错误')
+      finish()
+    }
+  }, 1000)
+}
+
+async function cancelLogin() {
+  if (loginId && loginProvider) {
+    try { await api(`/accounts/login/${loginProvider}/cancel`, { loginId }) } catch (e) { /* 关闭弹窗优先 */ }
+  }
+  finish()
+}
+
+async function setEnabled(id, cur) {
+  await api('/accounts/set', { id, enabled: !cur })
+  refresh()
+}
+
+async function del(id) {
+  if (!confirm('删除该账号？')) return
+  await api('/accounts/delete', { id })
+  refresh()
+}
+
+async function refreshBalance() {
+  $('balance-msg').textContent = '刷新中…'
+  const r = await api('/accounts/balance/refresh')
+  const results = (r && r.results) || []
+  const failed = results.filter((x) => !x.ok)
+  $('balance-msg').textContent = failed.length
+    ? `刷新完成，${failed.length}/${results.length} 失败`
+    : (results.length ? `已刷新 ${results.length} 个账号` : '无 oauth 账号可刷新')
+  refresh()
+}
+
+refresh()
+setInterval(refresh, 3000)
+</script>
+</body>
+</html>
