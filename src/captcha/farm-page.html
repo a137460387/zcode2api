@@ -1,0 +1,98 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>zcode2api 参数农场</title>
+<style>
+body{font-family:system-ui;max-width:560px;margin:40px auto;padding:0 16px;background:#fafafa;color:#222}
+.card{background:#fff;border:1px solid #e5e5e5;border-radius:12px;padding:20px;margin-bottom:16px;box-shadow:0 1px 4px rgba(0,0,0,.04)}
+h1{font-size:18px;margin:0 0 8px}
+p{font-size:13px;color:#666;margin:6px 0}
+.status{font-size:14px;font-weight:600}
+.ok{color:#16a34a}.bad{color:#dc2626}.warn{color:#d97706}
+.log{font-family:ui-monospace,monospace;font-size:12px;background:#f5f5f5;border-radius:8px;padding:12px;max-height:220px;overflow-y:auto;margin-top:12px;white-space:pre-wrap}
+.kv{display:flex;justify-content:space-between;font-size:13px;padding:4px 0;border-bottom:1px dashed #eee}
+button{padding:8px 16px;border:1px solid #ccc;border-radius:8px;background:#fff;cursor:pointer;font-size:13px}
+</style></head><body>
+<div class="card">
+  <h1>zcode2api 参数农场</h1>
+  <p>此页面在你的真实浏览器中运行阿里云无感验证，为本地代理持续供给一次性验证 param。<b>请保持此标签页打开</b>（可最小化窗口，不要休眠电脑）。</p>
+  <div class="status" id="st">初始化…</div>
+  <div style="margin-top:12px">
+    <div class="kv"><span>已产出 param</span><b id="c-total">0</b></div>
+    <div class="kv"><span>推送成功</span><b id="c-ok">0</b></div>
+    <div class="kv"><span>池内 param（代理侧）</span><b id="c-pool">-</b></div>
+    <div class="kv"><span>最近产出</span><b id="c-last">-</b></div>
+  </div>
+  <p style="margin-top:12px"><button id="btn-now">立即产出一个</button></p>
+</div>
+<div class="card">
+  <div style="font-size:12px;color:#888;margin-bottom:8px">事件日志</div>
+  <div class="log" id="log"></div>
+</div>
+<div id="cap-host" style="position:fixed;left:-9999px;top:0"></div>
+<button id="cap-btn" style="position:fixed;left:-9999px;top:0">v</button>
+<script src="https://o.alicdn.com/captcha-frontend/aliyunCaptcha/AliyunCaptcha.js"></script>
+<script>
+const logEl = document.getElementById('log');
+const stEl = document.getElementById('st');
+function log(msg, cls) {
+  const t = new Date().toLocaleTimeString();
+  logEl.textContent = '[' + t + '] ' + msg + '\n' + logEl.textContent;
+  if (cls) stEl.textContent = msg, stEl.className = 'status ' + cls;
+}
+let total = 0, pushed = 0;
+let verifying = false;
+
+async function verifyOnce() {
+  if (verifying) return;
+  verifying = true;
+  try {
+    if (typeof window.initAliyunCaptcha !== 'function') { log('SDK 未加载', 'bad'); return; }
+    window.AliyunCaptchaConfig = { region: 'cn', prefix: 'no8xfe' };
+    // 每次全新容器（官方逻辑：每轮验证重新 init）
+    const host = document.getElementById('cap-host');
+    host.innerHTML = '';
+    const box = document.createElement('div'); box.id = 'cap-box-' + Date.now();
+    host.appendChild(box);
+    const instP = new Promise((res, rej) => { window.__ri = res; window.__rej = rej; });
+    const parP = new Promise((res) => { window.__rp = res; });
+    window.initAliyunCaptcha({
+      SceneId: '11xygtvd', mode: 'popup', language: 'cn', showErrorTip: false,
+      element: '#' + box.id, button: '#cap-btn',
+      getInstance: (i) => window.__ri(i),
+      success: (param) => window.__rp({ ok: true, param }),
+      fail: (e) => window.__rp({ ok: false, d: JSON.stringify(e).slice(0, 200) }),
+      onError: (e) => window.__rp({ ok: false, d: String(e && e.message || e).slice(0, 200) }),
+    });
+    const inst = await Promise.race([instP, new Promise((_, r) => setTimeout(() => r(new Error('实例超时')), 15000))]);
+    if (typeof inst.startTracelessVerification !== 'function') { log('无 traceless 能力', 'bad'); return; }
+    inst.startTracelessVerification();
+    const r = await Promise.race([parP, new Promise((res) => setTimeout(() => res({ ok: false, d: 'param 超时' }), 25000))]);
+    if (!r.ok) { log('验证失败: ' + (r.d || ''), 'bad'); return; }
+    total++;
+    document.getElementById('c-total').textContent = total;
+    document.getElementById('c-last').textContent = new Date().toLocaleTimeString();
+    // 推送给代理
+    const res = await fetch('/param', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ param: r.param }) });
+    if (res.ok) { pushed++; document.getElementById('c-ok').textContent = pushed; log('param 产出并推送成功（' + r.param.length + ' 字符）', 'ok'); }
+    else log('推送失败 HTTP ' + res.status, 'warn');
+  } catch (e) {
+    log('异常: ' + (e && e.message || e), 'bad');
+  } finally {
+    verifying = false;
+  }
+}
+
+// 循环：池不满时持续产出（代理通过 /param-status 告知池状态）
+async function loop() {
+  for (;;) {
+    try {
+      const s = await fetch('/param-status').then((r) => r.json()).catch(() => null);
+      const pool = s && s.pool;
+      document.getElementById('c-pool').textContent = pool != null ? pool : '-';
+      if (pool == null || pool < 3) await verifyOnce();
+    } catch {}
+    await new Promise((r) => setTimeout(r, 4000));
+  }
+}
+document.getElementById('btn-now').onclick = verifyOnce;
+window.addEventListener('load', () => { log('农场页就绪，SDK: ' + (typeof window.initAliyunCaptcha === 'function' ? '已加载' : '加载中…'), 'ok'); loop(); });
+</script></body></html>
