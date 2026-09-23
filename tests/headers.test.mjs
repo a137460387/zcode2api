@@ -18,6 +18,32 @@ describe('buildZcodePlanHeaders', () => {
     }
     expect(h['content-type']).toBe('application/json')
   })
+
+  // 上游要求的是"同一 token 双写"，不是"两个头各自等于某个值"。
+  // 用两个不同的入参做构造性证明：authorization 去掉 Bearer 前缀后必须恒等于 x-api-key。
+  it('writes the same token into both authorization and x-api-key', () => {
+    for (const jwt of ['eyJ.aaa.bbb', 'another-token', 'x']) {
+      const h = buildZcodePlanHeaders({ jwt, param: 'P', sessionId: 'S' })
+      expect(h.authorization).toBe(`Bearer ${jwt}`)
+      expect(h['x-api-key']).toBe(jwt)
+      expect(h.authorization.slice('Bearer '.length)).toBe(h['x-api-key'])
+    }
+  })
+
+  // 完整性：captcha 双头缺一不可（缺 param 或 region 都会被上游 3007 拒绝）。
+  it('always carries both captcha headers', () => {
+    const h = buildZcodePlanHeaders({ jwt: 'J', param: 'P', sessionId: 'S' })
+    expect(Object.keys(h)).toContain('x-aliyun-captcha-verify-param')
+    expect(Object.keys(h)).toContain('x-aliyun-captcha-verify-region')
+  })
+
+  it('generates fresh UUIDs on every call', () => {
+    const a = buildZcodePlanHeaders({ jwt: 'J', param: 'P', sessionId: 'S' })
+    const b = buildZcodePlanHeaders({ jwt: 'J', param: 'P', sessionId: 'S' })
+    for (const k of ['x-request-id', 'x-query-id', 'x-zcode-trace-id']) {
+      expect(a[k]).not.toBe(b[k])
+    }
+  })
 })
 
 describe('buildBigModelHeaders', () => {

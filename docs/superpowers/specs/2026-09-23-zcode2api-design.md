@@ -81,7 +81,10 @@ zcode2api/
 │  │  │                    status 端点 URL 实现期从本机 zcode.cjs bundle 提取）
 │  │  └─ store.js          账号文件读写（原子写、明文 JSON、目录 gitignore）
 │  ├─ upstream/
-│  │  ├─ headers.js        官方引擎头复刻 + 版本常量（可配置，随官方更新）
+│  │  ├─ headers.js        官方引擎头复刻 + 版本/平台常量
+│  │  │                    （当前硬编码为 Windows 捕获值：win32-x64 / 10.0.26200 /
+│  │  │                     ZCode/3.11.2。目的就是复刻官方 Electron 引擎，探测本机
+│  │  │                     真实平台反而更不像官方客户端；官方升级后需改源码）
 │  │  ├─ zcode-plan.js     A 通道：头构造 → POST → 3007/3012/401 分级处理 → SSE 透传
 │  │  └─ bigmodel-api.js   B 通道：x-api-key 直转（/api/anthropic），模型名小写
 │  ├─ captcha/
