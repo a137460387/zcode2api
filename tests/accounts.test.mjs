@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach } from 'vitest'
+import { describe, it, expect, beforeEach, vi, afterEach } from 'vitest'
 import os from 'node:os'
 import fs from 'node:fs'
 import path from 'node:path'
@@ -33,6 +33,9 @@ describe('AccountPool.pick', () => {
     const a = await add(), b = await add()
     const first = pool.pick(null).account
     expect([a.id, b.id]).toContain(first.id)
+    // 新语义：第一个号被选中后进入节流窗，池内时钟不推进时第二次 pick 必须返回 null
+    // （否则就是"连拍压同一个号"）。要拿到不同的号，须等时钟推进到下一个 ready。
+    // 这里推进得比 minIntervalMs 更大，且大于两个号之间的 readyAt 差，故必能拿到另一个。
     clock.t += 10_000
     const second = pool.pick(null).account
     expect([a.id, b.id]).toContain(second.id)
@@ -44,6 +47,95 @@ describe('AccountPool.pick', () => {
     const r = pool.pick(null)
     expect(r.account.id).toBe(a.id)
     expect(r.waitMs).toBe(2000)
+  })
+  // ---- 修复轮 1 新增：A. 连拍不坍缩 ----
+  // 风控防线：pool 的时钟不推进（无 sessionKey、调用方不 sleep）时，绝不允许把绝大多数
+  // 请求压在同一条"最早过期"的账号上。旧实现（只挑 readyAt 最小、无"是否已过冷却窗"门槛）
+  // 实测 4 账号 40 次连拍得 37,1,1,1；600 次得 9997,1,1,1。
+  it('does not collapse a burst onto one account (A: throttle gate on pick)', async () => {
+    const accs = [await add(), await add(), await add(), await add()]
+    const counts = new Map(accs.map((a) => [a.id, 0]))
+    let nulls = 0
+    for (let i = 0; i < 40; i++) {
+      const r = pool.pick(null)
+      if (r.account) counts.set(r.account.id, counts.get(r.account.id) + 1)
+      else nulls++
+    }
+    const max = Math.max(...counts.values())
+    // 旧代码：max = 37（时钟不推进，同一个号被连压）。新语义：首次拿到号后全员进节流窗。
+    expect(max).toBeLessThanOrEqual(1)
+    expect(nulls).toBe(39)
+  })
+  // 关键不变量：节流窗内的号**绝不能**被排在一个还没用过（raw readyAt 恰好等于 t+minIntervalMs，
+  // 看起来"更早可用"）的号后面。否则一旦时钟推进很慢（真实网关每请求 ~1ms，远小于 2000ms 窗），
+  // 排序会反复挑中"最旧"的那个号——正是连拍坍缩的形态。这条用例把该门槛钉死。
+  it('never prefers a never-used account over one that is merely inside its throttle window', async () => {
+    const a = await add(), b = await add()
+    // list() 是字典序不是创建序，故断言"哪一个先被选中"不可靠；只断言行为本身：
+    const first = pool.pick(null).account
+    const untouched = [a.id, b.id].find((id) => id !== first.id)
+    const probes = []
+    for (let i = 0; i < 5; i++) probes.push(pool.pick(null))
+    // 那个从未被用过的号也**绝不**该被选中：它在窗内同样受 minIntervalMs 约束
+    expect(probes.every((r) => r.account === null)).toBe(true)
+    expect(pool.lastPick.has(untouched)).toBe(false)
+    expect(probes.every((r) => r.waitMs === 2000)).toBe(true)
+  })
+  // 真实网关节奏：时钟每请求只前进 ~1ms，远小于 2000ms 节流窗。旧实现下同一个"最早"的号
+  // 会被压 37/40 次；新语义下时钟推进本身就"消耗"了等待，故应逐个放行不同账号。
+  it('does not collapse when the clock advances by only 1ms per pick', async () => {
+    const accs = [await add(), await add(), await add(), await add()]
+    const counts = new Map(accs.map((a) => [a.id, 0]))
+    // 40ms 内每个号最多被放行 2 次（40/2000 向上取整），且必须不止一个号拿到过请求。
+    // 只看 40 次里有没有换号是没有意义的（窗内本就该一个号都不放行），故额外推进到
+    // 一个完整窗口再看轮询：推进 2000ms 后必须有**第二个**不同的号被选中。
+    for (let i = 0; i < 40; i++) {
+      clock.t += 1
+      const r = pool.pick(null)
+      if (r.account) counts.set(r.account.id, counts.get(r.account.id) + 1)
+    }
+    expect(Math.max(...counts.values())).toBeLessThanOrEqual(2)
+    const usedIds = [...counts.entries()].filter(([, c]) => c > 0).map(([id]) => id)
+    expect(usedIds.length).toBe(1) // 40ms 内只放行过一个号（节流窗未过）
+    // 窗过后必须轮到**别的**号（轮询）：从未用过的号按"最久未用"优先，故换号而非再压同一个
+    clock.t += 2000
+    const next = pool.pick(null).account
+    expect(next).not.toBeNull()
+    expect(next.id).not.toBe(usedIds[0])
+  })
+  it('returns a readable reason and a meaningful waitMs when every healthy account is throttled', async () => {
+    await add(), await add(), await add(), await add()
+    pool.pick(null) // 只可能有一个号被选中，4 个号全部进入 2000ms 节流窗
+    const r = pool.pick(null)
+    expect(r.account).toBeNull()
+    // reason 必须与"冷却/停用/需重登"区分开：不能复用 'cooling'
+    expect(r.reason).not.toContain('cooling')
+    expect(r.reason).toContain('throttl')
+    // waitMs 必须是"最早的账号还需等多久"，否则调用方无从决定等多久
+    expect(r.waitMs).toBe(2000)
+  })
+  it('unthrottles after clock advances to the next ready account', async () => {
+    const a = await add()
+    const first = pool.pick(null).account
+    expect(first.id).toBe(a.id)
+    expect(pool.pick(null).account).toBeNull() // 仍在 2000ms 节流窗内
+    clock.t += 1999
+    expect(pool.pick(null).account).toBeNull() // 差 1ms 也不行
+    clock.t += 1
+    expect(pool.pick(null).account?.id).toBe(a.id) // 到点即放行
+  })
+  // ---- 修复轮 1 新增：C3. lastPick 清理 ----
+  it('drops lastPick entries for accounts that no longer exist (status() sweep)', async () => {
+    const a = await add(), b = await add()
+    pool.pick(null)
+    clock.t += 2000 // 过一个窗口，才能让第二个号也被记账
+    pool.pick(null)
+    expect(pool.lastPick.size).toBe(2)
+    const [gone, kept] = [a.id, b.id].filter((id) => pool.lastPick.has(id))
+    store.delete(gone)
+    pool.status()
+    expect(pool.lastPick.has(gone)).toBe(false)
+    expect(pool.lastPick.has(kept)).toBe(true) // 只清已消失的 id
   })
   // 会话亲和：同一 sessionKey 反复 pick 必须粘在同一账号上（health 允许时），
   // 且该绑定不会把别的会话也拖到同一个号上。同样不依赖创建顺序。
@@ -57,10 +149,12 @@ describe('AccountPool.pick', () => {
   it('affinity is per-session (different sessions can land on different accounts)', async () => {
     const a = await add(), b = await add()
     const s1 = pool.pick('s1').account.id
+    clock.t += 2000 // 过一节流窗，第二个会话才有号可拿（新语义：窗内不发号）
     const s2 = pool.pick('s2').account.id
     expect([a.id, b.id]).toContain(s1)
     expect([a.id, b.id]).toContain(s2)
     // 两个会话各自粘住自己的号
+    clock.t += 2000
     expect(pool.pick('s1').account.id).toBe(s1)
     expect(pool.pick('s2').account.id).toBe(s2)
   })
@@ -75,6 +169,37 @@ describe('AccountPool.pick', () => {
     expect(pool.pick(null).reason).toContain('cooling')
     await store.update(a.id, { needsRelogin: false, noPackage: true })
     expect(pool.pick(null).reason).toContain('cooling')
+  })
+})
+
+// ---- 修复轮 1 新增：内存账 / 磁盘账分叉（C） ----
+describe('AccountPool memory vs disk accounting', () => {
+  it('takes max(memory, disk) so a newer disk value is never ignored', async () => {
+    const a = await add()
+    // 构造"内存更旧、磁盘更新"：内存账 = 1e6，磁盘 lastUsedAt = 1.01e6（markSuccess 只写磁盘）
+    clock.t = 1_000_000
+    expect(pool.pick(null).account.id).toBe(a.id) // 内存账落在 1e6
+    clock.t = 1_010_000
+    await pool.markSuccess(store.get(a.id)) // 只更新磁盘的 lastUsedAt = 1.01e6
+    expect(store.get(a.id).stats.lastUsedAt).toBe(1_010_000)
+    // 旧实现用 ?? 取内存优先 → lastUsed = 1e6 → readyAt = 1002000（比正确值早 10s 放行，放宽风控）
+    expect(pool.lastUsed(store.get(a.id))).toBe(1_010_000)
+    expect(pool.readyAt(store.get(a.id))).toBe(1_012_000)
+  })
+  it('warns once (with account id and error) when the lastUsedAt write fails', async () => {
+    const a = await add()
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    try {
+      const bad = { list: () => store.list(), update: () => Promise.reject(new Error('disk full')) }
+      const p = new AccountPool(bad, { minIntervalMs: 2000, cooldown3012Ms: 30 * 60_000, now: () => clock.t })
+      p.pick(null)
+      await new Promise((r) => setTimeout(r, 0)) // 让 .catch 落地
+      expect(warn).toHaveBeenCalledTimes(1)
+      expect(String(warn.mock.calls[0][0])).toContain(a.id)
+      expect(String(warn.mock.calls[0][0])).toContain('disk full')
+    } finally {
+      warn.mockRestore()
+    }
   })
 })
 
@@ -131,8 +256,7 @@ describe('AccountPool error handling', () => {
     expect(s.outputTokens).toBe(7)
     expect(s.requests).toBe(2)
   })
-  it('recordUsage is concurrency-safe (no lost updates)', async () => {
-    // 网关并发处理请求时会同时记账；用 AccountStore 的按 id 串行化保证不丢更新。
+  it('recordUsage is concurrency-safe (no lost updates)', async () => {    // 网关并发处理请求时会同时记账；用 AccountStore 的按 id 串行化保证不丢更新。
     const a = await add()
     await Promise.all(Array.from({ length: 50 }, () => pool.recordUsage(a.id, { inputTokens: 1, outputTokens: 1 })))
     const s = store.get(a.id).stats
