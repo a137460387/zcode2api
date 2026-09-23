@@ -480,6 +480,73 @@ describe('AccountPool error handling', () => {
     expect(store.get(a.id).cooldownUntil).toBe(0)
     expect(store.get(a.id).stats.lastUsedAt).toBe(clock.t)
   })
+
+  // ── 普通 HTTP 429 不得计入 strikes（修复轮 5） ─────────────────────────────────
+  // 旧实现把 `status === 429` 与 `code === 3012` 并入同一 strikes：连续 5 次普通 429
+  // （无任何 3012）即 strikes=5 → enabled=false，而 pick 只选 enabled!==false 的号，
+  // 该号再也拿不到请求 → markSuccess 永不触发 → 24h 后仍不恢复，只能人工干预。
+  // 429 只是"上游此刻限流"，30min/24h 风控级联是 3012 专属语义。
+  it('连续 5 次普通 429 不会停用账号、不会把 strikes 推到 5', async () => {
+    const a = await add()
+    for (let i = 0; i < 5; i++) {
+      clock.t += 120_000 // 每次都比上一次冷却走完，模拟"冷却结束又被限流"
+      await pool.markError(store.get(a.id), { status: 429, code: null })
+    }
+    const cur = store.get(a.id)
+    expect(cur.strikes ?? 0).toBe(0) // 429 不加 strikes
+    expect(cur.enabled).toBe(true) // 绝不停用
+    expect(cur.cooldownUntil).toBe(clock.t + 60_000) // 只设 60s 冷却
+  })
+
+  it('429 的 60s 冷却到期后该号重新可发（自愈，不需人工）', async () => {
+    const a = await add()
+    await pool.markError(a, { status: 429, code: null })
+    expect(pool.pick(null).account).toBeNull() // 冷却中
+    clock.t += 60_001
+    const r = pool.pick(null)
+    expect(r.account?.id).toBe(a.id)
+  })
+
+  it('429 不影响已有 3012 累计计数（两种风控互相独立）', async () => {
+    const a = await add()
+    await pool.markError(a, { status: 405, code: 3012 })
+    expect(store.get(a.id).strikes).toBe(1)
+    await pool.markError(store.get(a.id), { status: 429, code: null })
+    expect(store.get(a.id).strikes).toBe(1) // 仍是 1，429 不累加
+  })
+
+  // ── 冷却只能延长、不可缩短（修复轮 5） ────────────────────────────────────────
+  // 旧实现 `patch.cooldownUntil = now + delta` 是**赋值**：先记 3012（30min 冷却），
+  // 30s 后同号上一个并发在途请求返回普通 429，就把冷却改写成 now+60s ——
+  // 该号提前 29 分钟解禁，风控防线被直接削弱。
+  it('3012 后接 429：冷却不被缩短（取 max）', async () => {
+    const a = await add()
+    await pool.markError(a, { status: 405, code: 3012 })
+    expect(store.get(a.id).cooldownUntil).toBe(clock.t + 30 * 60_000)
+    clock.t += 30_000
+    await pool.markError(store.get(a.id), { status: 429, code: null })
+    expect(store.get(a.id).cooldownUntil).toBe(clock.t - 30_000 + 30 * 60_000) // 仍是 3012 那次
+  })
+
+  it('429 后接 3012：冷却被延长到 30min', async () => {
+    const a = await add()
+    await pool.markError(a, { status: 429, code: null })
+    clock.t += 30_000
+    await pool.markError(store.get(a.id), { status: 405, code: 3012 })
+    expect(store.get(a.id).cooldownUntil).toBe(clock.t + 30 * 60_000)
+  })
+
+  it('第 3 次 3012 的 24h 冷却不会被随后的 429 缩回 60s', async () => {
+    const a = await add()
+    for (let i = 0; i < 3; i++) {
+      clock.t += 1
+      await pool.markError(store.get(a.id), { status: 405, code: 3012 })
+    }
+    expect(store.get(a.id).cooldownUntil).toBe(clock.t + 24 * 60 * 60_000)
+    clock.t += 60_000
+    await pool.markError(store.get(a.id), { status: 429, code: null })
+    expect(store.get(a.id).cooldownUntil).toBe(clock.t - 60_000 + 24 * 60 * 60_000)
+  })
   it('recordUsage accumulates token stats', async () => {
     const a = await add()
     await pool.recordUsage(a.id, { inputTokens: 10, outputTokens: 5 })

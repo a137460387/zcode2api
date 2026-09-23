@@ -337,22 +337,38 @@ export class AccountPool {
       const stats = { ...a.stats, lastError: { status, code, at: this.now() } }
       if (status === 401) return { needsRelogin: true, stats }
       if (code === 1113) return { noPackage: true, stats }
-      if (code === 3012 || (status === 429 && code !== 1113)) {
+      /**
+       * 冷却**只能延长，不能缩短**：用 `Math.max(现有值, 本次解禁时刻)` 而非赋值。
+       *
+       * 赋值版实测缺陷：同一账号上并发在途的多个请求（会话亲和/慢请求）会先后 `markError`——
+       * 先记 3012（`now+30min`），30s 后另一个请求返回普通 429，`patch.cooldownUntil = now+60s`
+       * 就把冷却**改写**成 30s 后解禁，该号提前 29 分钟重新发号，风控防线被直接削弱。
+       * 取 max 让"更严的那次"始终占优：短冷却盖不掉长冷却，长冷却可以延长短冷却。
+       */
+      const later = (deltaMs) => Math.max(a.cooldownUntil ?? 0, this.now() + deltaMs)
+      if (code === 3012) {
         /**
          * strikes 是**累计**风控次数（不清零、按 24h 窗口回退），不是"当前窗口内的计数"：
          * 第 3 次起冷却 24h，第 5 次停用。故 24h 跳变只会让第 4、5 次继续累加，
          * 不会让计数重置——`markSuccess` 才是唯一的清零入口。
+         *
+         * 只有 3012 是"账号级风控级联"信号，才累加 strikes；普通 HTTP 429 见下。
          */
         const strikes = (a.strikes ?? 0) + 1
-        const patch = { strikes, stats }
+        const patch = { strikes, stats, cooldownUntil: later(strikes >= 3 ? 24 * 60 * 60_000 : this.cooldown3012Ms) }
         if (strikes >= 5) patch.enabled = false
-        else if (code === 3012) {
-          patch.cooldownUntil = this.now() + (strikes >= 3 ? 24 * 60 * 60_000 : this.cooldown3012Ms)
-        } else {
-          patch.cooldownUntil = this.now() + 60_000
-        }
         return patch
       }
+      /**
+       * 普通 HTTP 429 只设 60s 冷却，**不计入 strikes**。
+       *
+       * 旧实现把 `status === 429` 与 `code === 3012` 并入同一 strikes，实测：连续 5 次普通 429
+       * （无任何 3012）→ strikes=5 → `enabled=false`，而 `pick` 只选 `enabled !== false` 的号，
+       * 该号再也拿不到请求 → `markSuccess` 永不触发 → **24h 后仍不恢复**，只能人工干预。
+       * 429 的语义是"上游此刻限流"（秒级~分钟级自愈），30min/24h 级联与停用是 3012 专属语义。
+       */
+      if (status === 429) return { stats, cooldownUntil: later(60_000) }
+      // 其他状态码（5xx/网络错误等）只记录，不冷却不发号惩罚：网关会换号重试。
       return { stats }
     })
   }
