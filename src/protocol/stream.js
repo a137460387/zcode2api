@@ -50,22 +50,49 @@ async function* sseEvents(res) {
   }
 }
 
-const FINISH = { end_turn: 'stop', stop_sequence: 'stop', max_tokens: 'length' }
+const FINISH = { end_turn: 'stop', stop_sequence: 'stop', max_tokens: 'length', tool_use: 'tool_calls' }
 
 export async function pipeAnthropicToOpenAISSE(res, write, model) {
   const id = 'chatcmpl-' + uuid()
   const created = Math.floor(Date.now() / 1000)
   let usage = { inputTokens: 0, outputTokens: 0 }
+  // 工具调用累积器：content_block index → { openaiIndex, started }
+  const toolIndexByBlock = new Map()
+  let nextToolIndex = 0
   const send = (obj) => write(`data: ${JSON.stringify(obj)}\n\n`)
   send({ id, object: 'chat.completion.chunk', created, model, choices: [{ index: 0, delta: { role: 'assistant', content: '' }, finish_reason: null }] })
   for await (const ev of sseEvents(res)) {
     if (ev.type === 'message_start') {
       usage.inputTokens = ev.message?.usage?.input_tokens ?? usage.inputTokens
+    } else if (ev.type === 'content_block_start') {
+      const cb = ev.content_block
+      if (cb?.type === 'tool_use') {
+        const oaIndex = nextToolIndex++
+        toolIndexByBlock.set(ev.index, oaIndex)
+        send({
+          id, object: 'chat.completion.chunk', created, model,
+          choices: [{
+            index: 0,
+            delta: { tool_calls: [{ index: oaIndex, id: cb.id, type: 'function', function: { name: cb.name, arguments: '' } }] },
+            finish_reason: null,
+          }],
+        })
+      }
     } else if (ev.type === 'content_block_delta') {
       if (ev.delta?.type === 'text_delta') {
         send({ id, object: 'chat.completion.chunk', created, model, choices: [{ index: 0, delta: { content: ev.delta.text }, finish_reason: null }] })
       } else if (ev.delta?.type === 'thinking_delta') {
         send({ id, object: 'chat.completion.chunk', created, model, choices: [{ index: 0, delta: { reasoning_content: ev.delta.thinking }, finish_reason: null }] })
+      } else if (ev.delta?.type === 'input_json_delta') {
+        const oaIndex = toolIndexByBlock.get(ev.index) ?? 0
+        send({
+          id, object: 'chat.completion.chunk', created, model,
+          choices: [{
+            index: 0,
+            delta: { tool_calls: [{ index: oaIndex, function: { arguments: ev.delta.partial_json ?? '' } }] },
+            finish_reason: null,
+          }],
+        })
       }
     } else if (ev.type === 'message_delta') {
       if (ev.usage) usage.outputTokens = ev.usage.output_tokens ?? usage.outputTokens

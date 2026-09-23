@@ -81,4 +81,64 @@ describe('anthropicToOpenAI', () => {
     expect(out.choices[0].finish_reason).toBe('stop')
     expect(out.usage).toEqual({ prompt_tokens: 7, completion_tokens: 3, total_tokens: 10 })
   })
+
+  it('maps a single tool_use block to openai tool_calls', () => {
+    const out = anthropicToOpenAI({
+      id: 'msg_2',
+      stop_reason: 'tool_use',
+      content: [
+        { type: 'tool_use', id: 'tu_1', name: 'get_weather', input: { city: '北京' } },
+      ],
+      usage: { input_tokens: 7, output_tokens: 3 },
+    }, 'glm-5.3')
+    const msg = out.choices[0].message
+    expect(out.choices[0].finish_reason).toBe('tool_calls')
+    expect(msg.content).toBeNull()
+    expect(Array.isArray(msg.tool_calls)).toBe(true)
+    expect(msg.tool_calls).toHaveLength(1)
+    const tc = msg.tool_calls[0]
+    expect(tc.id).toBe('tu_1')
+    expect(tc.type).toBe('function')
+    expect(tc.function.name).toBe('get_weather')
+    expect(typeof tc.function.arguments).toBe('string')
+    expect(JSON.parse(tc.function.arguments)).toEqual({ city: '北京' })
+  })
+
+  it('maps multiple tool_use blocks in order', () => {
+    const out = anthropicToOpenAI({
+      id: 'msg_3',
+      stop_reason: 'tool_use',
+      content: [
+        { type: 'text', text: '先查两个城市' },
+        { type: 'tool_use', id: 'tu_a', name: 'get_weather', input: { city: '北京' } },
+        { type: 'tool_use', id: 'tu_b', name: 'get_weather', input: { city: '上海' } },
+      ],
+      usage: { input_tokens: 1, output_tokens: 2 },
+    }, 'glm-5.3')
+    const msg = out.choices[0].message
+    expect(out.choices[0].finish_reason).toBe('tool_calls')
+    expect(msg.content).toBe('先查两个城市')
+    expect(msg.tool_calls).toHaveLength(2)
+    expect(msg.tool_calls.map((t) => t.id)).toEqual(['tu_a', 'tu_b'])
+    expect(msg.tool_calls.map((t) => t.function.name)).toEqual(['get_weather', 'get_weather'])
+    expect(msg.tool_calls.map((t) => JSON.parse(t.function.arguments))).toEqual([{ city: '北京' }, { city: '上海' }])
+  })
+
+  it('serializes missing tool input as an empty json object string', () => {
+    const out = anthropicToOpenAI({
+      stop_reason: 'tool_use',
+      content: [{ type: 'tool_use', id: 'tu_x', name: 'ping' }],
+    }, 'glm-5.3')
+    expect(out.choices[0].message.tool_calls[0].function.arguments).toBe('{}')
+  })
+
+  it('omits tool_calls for pure text responses', () => {
+    const out = anthropicToOpenAI({
+      stop_reason: 'end_turn',
+      content: [{ type: 'text', text: 'hi' }],
+    }, 'glm-5.3')
+    expect(out.choices[0].message.tool_calls).toBeUndefined()
+    expect(out.choices[0].message.content).toBe('hi')
+    expect(out.choices[0].finish_reason).toBe('stop')
+  })
 })

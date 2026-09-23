@@ -73,13 +73,21 @@ export function openaiToAnthropic(oa, mapModel) {
   return body
 }
 
-const FINISH = { end_turn: 'stop', stop_sequence: 'stop', max_tokens: 'length' }
+const FINISH = { end_turn: 'stop', stop_sequence: 'stop', max_tokens: 'length', tool_use: 'tool_calls' }
 
 export function anthropicToOpenAI(a, model) {
-  const text = (a.content || []).filter((c) => c.type === 'text').map((c) => c.text).join('')
-  const thinking = (a.content || []).filter((c) => c.type === 'thinking').map((c) => c.thinking).join('')
-  const message = { role: 'assistant', content: text }
+  const blocks = a.content || []
+  const text = blocks.filter((c) => c.type === 'text').map((c) => c.text).join('')
+  const thinking = blocks.filter((c) => c.type === 'thinking').map((c) => c.thinking).join('')
+  const toolCalls = blocks.filter((c) => c.type === 'tool_use').map((c) => ({
+    id: c.id,
+    type: 'function',
+    function: { name: c.name, arguments: JSON.stringify(c.input ?? {}) },
+  }))
+  // OpenAI 规范：带工具调用时 content 为 null（而非空串），避免客户端当作空回复
+  const message = { role: 'assistant', content: toolCalls.length && !text ? null : text }
   if (thinking) message.reasoning_content = thinking
+  if (toolCalls.length) message.tool_calls = toolCalls
   const input = a.usage?.input_tokens ?? 0
   const output = a.usage?.output_tokens ?? 0
   return {
