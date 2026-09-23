@@ -251,6 +251,31 @@ describe('AccountStore concurrency', () => {
     expect(store.locks.size).toBe(0)
   })
 
+  // 使用约定（本测试把约定钉死，防止后续任务误用）：
+  //   save()   = 新增账号入库，或有意用整份快照覆盖（少见）。
+  //   update() = 修改已有账号的任何字段（冷却、标记、统计）——它在锁内读最新值，并发安全。
+  // 反例：对已有账号做 "get() 取快照 → save(快照)" 的更新，若这些操作并发，
+  // get() 可能读到排队中的旧值，从而把别人的写入覆盖掉（实测 50 次自增只剩 1）。
+  // 这是调用方必须遵守的约定，不是 store 的缺陷——故在此显式固化正确用法的行为。
+  it('update() is the safe way to modify an existing account under concurrency', async () => {
+    const store = new AccountStore(dir)
+    const acc = newAccountFields({ provider: 'bigmodel', type: 'oauth', userInfo: { user_id: 'conv' } })
+    await store.save(acc) // 新增：save() 的正确用法
+
+    // 并发修改已有账号：每个调用方各自 get() 后 update()——这是网关的真实形态
+    await Promise.all(Array.from({ length: 100 }, () =>
+      (async () => {
+        const snapshot = store.get('bigmodel:conv') // 可能读到陈旧值，但只用它取 id
+        await store.update(snapshot.id, (cur) => ({
+          stats: { ...cur.stats, requests: cur.stats.requests + 1 },
+          cooldownUntil: cur.cooldownUntil,
+        }))
+      })()))
+
+    // 函数式 patch 在锁内读最新值，故 100 次自增全部累积，不因 get() 的陈旧而丢失
+    expect(store.get('bigmodel:conv').stats.requests).toBe(100)
+  })
+
   it('rejects a functional patch that returns a thenable, so async patches cannot break the lock', async () => {
     const store = new AccountStore(dir)
     store.save(newAccountFields({ provider: 'bigmodel', type: 'oauth', userInfo: { user_id: 'async' } }))

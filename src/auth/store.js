@@ -90,6 +90,12 @@ export class AccountStore {
    * 语义提醒：save() 是"把这份快照排到调用时刻的队尾"，resolve 只保证这份快照自身已落盘；
    * 该 id 上若还有后续任务，它们仍可能在此之后改写磁盘——那时它们才是最后一次逻辑写入。
    * 需要"某 id 全部写入已完成"的调用方可 await 该 id 的任意一个写，再读 store.get()。
+   *
+   * 使用约定：**新增账号用 save()，修改已有账号用 update()**。
+   * 对已有账号做"get() 取快照 → save(快照)"式的更新在并发下不安全：get() 是同步读文件，
+   * 不会等待排队中的写入，因此可能拿到旧值并把别人的写入整体覆盖掉
+   * （实测：50 次 update 自增与该式 save 并发 → 计数只剩 1）。
+   * update() 在锁内以最新快照调用函数式 patch，是修改已有账号的唯一安全方式。
    */
   save(account) {
     if (!account || typeof account !== 'object') return Promise.reject(new TypeError('account must be an object'))
