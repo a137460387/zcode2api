@@ -176,12 +176,14 @@ describe('gateway.complete', () => {
     expect(picks.length).toBe(1)
   })
 
-  it('caps total pick attempts when the pool stays throttled (no infinite wait)', async () => {
+  it('caps total wait time when the pool stays throttled (no infinite wait)', async () => {
+    // 用时长上限而非尝试次数设防：池明确说"再等就有号"时，次数上限会把合法等待误判为失败
+    // （并发下 N 个请求各自计数同一节流事件，实测 12 并发只有 6 个成功）。
     let picks = 0
     const pool = {
       pick: () => {
         picks++
-        return { account: null, waitMs: 1, reason: 'all accounts within min interval (throttled)' }
+        return { account: null, waitMs: 100, reason: 'all accounts within min interval (throttled)' }
       },
       markSuccess: async () => {},
       markError: async () => {},
@@ -190,12 +192,37 @@ describe('gateway.complete', () => {
       pool,
       paramPool: { take: async () => 'P' },
       senders: { oauth: async () => ok(), apikey: async () => ok() },
-      config: { maxRetries: 2, maxPickAttempts: 3 },
+      config: { maxRetries: 2, maxPickWaitMs: 300 },
     })
+    const t0 = Date.now()
     await expect(g.complete({}, {})).rejects.toMatchObject({ status: 503 })
-    // 上限语义（照 brief 的 `++pickAttempts > maxPickAttempts`）：第 maxPickAttempts+1 次
-    // 取号时判定越界并抛出，故总取号次数 = maxPickAttempts + 1，而不是无限。
-    expect(picks).toBe(4)
+    const dt = Date.now() - t0
+    // 累计等待超过 maxPickWaitMs 即失败：约 300ms（不是无限，也不是首个等待就放弃）
+    expect(dt).toBeGreaterThanOrEqual(250)
+    expect(dt).toBeLessThan(2000)
+    expect(picks).toBeGreaterThanOrEqual(3)
+  })
+
+  it('keeps waiting for throttled accounts as long as the total wait stays within budget', async () => {
+    // 节流是正常路径：100ms × 数次若在预算内，应等到号并成功。
+    let picks = 0
+    const account = { id: 'a1', type: 'oauth', jwt: 'J', apiKey: null, stats: {} }
+    const pool = {
+      pick: () => (++picks <= 8
+        ? { account: null, waitMs: 10, reason: 'all accounts within min interval (throttled)' }
+        : { account, waitMs: 0 }),
+      markSuccess: async () => {},
+      markError: async () => {},
+    }
+    const g = createGateway({
+      pool,
+      paramPool: { take: async () => 'P' },
+      senders: { oauth: async () => ok(), apikey: async () => ok() },
+      config: { maxRetries: 2, maxPickWaitMs: 5000 },
+    })
+    const r = await g.complete({}, {})
+    expect(r.response.status).toBe(200)
+    expect(picks).toBe(9)
   })
 
   it('passes the real status/code to markError and lets the pool own cooldown (no gateway-side cooling)', async () => {
@@ -416,7 +443,7 @@ describe('gateway.complete', () => {
 // 返回同样的形态（正 waitMs、无 warn），网关必须靠累计等待上限区分，
 // 否则一次 HTTP 请求会干睡在冷却窗里（实测 waitMs=1799990 → 30 分钟）。
 describe('gateway.complete 等待上限（区分节流与冷却）', () => {
-  const mkConfig = () => ({ maxRetries: 2, maxPickAttempts: 10, maxPickWaitMs: 15_000 })
+  const mkConfig = () => ({ maxRetries: 2, maxPickWaitMs: 15_000 })
 
   it('节流级等待（秒级）照常等待后重试成功', async () => {
     let picks = 0

@@ -16,13 +16,15 @@ const parseCode = (text) => {
 }
 
 export function createGateway({ pool, paramPool, senders, config, log = () => {} }) {
-  // 选号总尝试上限：pool 长期处于节流/冷却时 `pick` 会一直返回"暂时无号"，
-  // 没有上限就会无限等待（brief 要求）。默认给足余量，单次约等于一个节流窗。
-  const maxPickAttempts = config.maxPickAttempts ?? 10
+  const maxRetries = config.maxRetries ?? 0
   /**
    * 单次请求内为"等号"允许的总时长上限。池对"节流中"（秒级，正常路径）与"冷却中"
    * （30min~24h，等下去本次请求也不会成功）都返回正数 `waitMs`，网关无法区分二者，
-   * 故用时长阈值兜底：累计等待超过此值即失败并提示原因，而不是让 HTTP 请求干睡在冷却窗里。
+   * 故用累计等待时长兜底：超过此值即失败并提示原因，而不是让 HTTP 请求干睡在冷却窗里。
+   *
+   * 注意**不要**再加一个"选号次数上限"：节流是池明确背书的合法等待（`reason` 含 throttled），
+   * 次数上限会把它误判为失败——并发时 N 个请求各自计数同一节流事件，实测 12 并发只有 6 个成功。
+   * 时长上限才是"避免无限等待"的完整解。
    */
   const maxPickWaitMs = config.maxPickWaitMs ?? 15_000
 
@@ -30,7 +32,14 @@ export function createGateway({ pool, paramPool, senders, config, log = () => {}
     if (account.type === 'apikey') {
       return senders.apikey({ account, body, sessionId })
     }
-    const param = await paramPool.take()
+    // 取参数失败是**本地农场产出不足**，与账号健康完全无关：
+    // 必须与"上游请求失败"区分，否则会把健康账号标记为出错、还白耗一次换号额度。
+    let param
+    try {
+      param = await paramPool.take()
+    } catch (e) {
+      return { __paramError: e }
+    }
     return senders.oauth({ account, body, param, sessionId })
   }
 
@@ -38,7 +47,6 @@ export function createGateway({ pool, paramPool, senders, config, log = () => {}
     const sessionId = sessionKey || crypto.randomUUID().replace(/-/g, '')
     let accountSwitches = 0
     let paramRetries = 0
-    let pickAttempts = 0
     /**
      * 选号与发送**分离**：`account` 只在"需要（重新）取号"时通过 `pool.pick` 拿到，
      * 并在下面置回 `null` 时触发下一次取号。
@@ -84,14 +92,9 @@ export function createGateway({ pool, paramPool, senders, config, log = () => {}
               hint: '需人工处理：登录/启用账号或购买资源包',
             })
           }
-          if (++pickAttempts > maxPickAttempts) {
-            throw new GatewayError({
-              status: 503,
-              message: `no usable account after ${maxPickAttempts} attempts: ${reason}`,
-              hint: '账号池持续无可用账号：确认账号是否被节流/冷却，或稍后重试',
-            })
-          }
           const wait = waitMs ?? 0
+          // 只按**累计时长**设防（见 maxPickWaitMs 注释）：不用尝试次数，否则并发下
+          // N 个请求各自计数同一个节流事件，会把合法等待误判为失败。
           if (waitedMs + wait > maxPickWaitMs) {
             throw new GatewayError({
               status: 503,
@@ -105,7 +108,6 @@ export function createGateway({ pool, paramPool, senders, config, log = () => {}
           continue
         }
       }
-      pickAttempts = 0
       waitedMs = 0
       // 注意：`account` 非空时 `waitMs` 是"建议节流间隔"（选中后到它下次可用），
       // 由池自身记账节制后续选号，网关**不等待**它——否则每个请求都白白慢一个节流窗。
@@ -115,11 +117,18 @@ export function createGateway({ pool, paramPool, senders, config, log = () => {}
       } catch (e) {
         // 网络异常：标记后换号。冷却/停用判定全权交给池（markError 内部实现）。
         await pool.markError(account, { status: 0, code: 'network: ' + e.message })
-        if (++accountSwitches > config.maxRetries) {
+        if (++accountSwitches > maxRetries) {
           throw new GatewayError({ status: 502, message: 'network error: ' + e.message })
         }
         account = null
         continue
+      }
+      if (res && res.__paramError) {
+        throw new GatewayError({
+          status: 503,
+          message: `captcha param unavailable: ${res.__paramError.message}`,
+          hint: '农场未供给验证码参数：请在浏览器打开 farm 页并保持标签页运行',
+        })
       }
       /**
        * 上游可能以 HTTP 200 包业务错误码（本项目多处如此：3001/3007/3012/1113 都在 body 的
@@ -140,10 +149,15 @@ export function createGateway({ pool, paramPool, senders, config, log = () => {}
       await pool.markError(account, { status: res.status, code })
 
       // 3007 = captcha 校验失败的**参数**问题：换参重试，**不换号、不冷却**（同一账号继续发）。
-      if (code === 3007 && paramRetries < config.maxRetries) {
+      if (code === 3007 && paramRetries < maxRetries) {
         paramRetries += 1
         continue
       }
+      /**
+       * 错误摘要不透传上游 body 全文：上游可能回显请求内容（含 jwt / captcha param），
+       * 原样交给客户端会凭空扩大凭据泄露面。只保留 status 与业务码，详情走 `log`。
+       */
+      const brief = `upstream HTTP ${res.status}${code != null ? ` code=${code}` : ''}`
       const riskOrServer = code === 3012 || res.status === 429 || res.status >= 500
       const credDead = res.status === 401 || code === 1113
       if (riskOrServer || credDead) {
@@ -151,7 +165,7 @@ export function createGateway({ pool, paramPool, senders, config, log = () => {}
         const err = new GatewayError({
           status: clientStatus,
           code,
-          message: text.slice(0, 300),
+          message: brief,
           upstreamStatus: res.status,
           hint: code === 3012
             ? '上游行为风控（3012）：已降低节奏并切换账号；若持续请等待风控衰减（分钟~小时级）'
@@ -161,7 +175,7 @@ export function createGateway({ pool, paramPool, senders, config, log = () => {}
                 ? '账号凭据失效：请在看板重新登录'
                 : null,
         })
-        if (++accountSwitches > config.maxRetries) throw err
+        if (++accountSwitches > maxRetries) throw err
         lastRetryable = err
         account = null
         continue
@@ -170,7 +184,7 @@ export function createGateway({ pool, paramPool, senders, config, log = () => {}
       throw new GatewayError({
         status: res.status === 200 ? 502 : res.status,
         code,
-        message: text.slice(0, 1000),
+        message: brief,
         upstreamStatus: res.status,
       })
     }
