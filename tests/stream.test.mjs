@@ -134,6 +134,90 @@ describe('pipeAnthropicToOpenAISSE', () => {
   })
 })
 
+describe('pipeAnthropicToOpenAISSE 收尾健壮性', () => {
+  // 上游中途中断（reader reject）时旧实现直接抛出：既不发 finish_reason 帧也不发 [DONE]。
+  // OpenAI SDK 会把半截流当作不完整响应（客户端一直等 [DONE] 或报"流意外结束"）。
+  // 无论正常还是异常，返回前都必须补上 finish_reason 与 data: [DONE]。
+  const rejectingResponse = (prefixEvents, err = new Error('upstream stream reset')) => {
+    const enc = new TextEncoder()
+    const bytes = enc.encode(prefixEvents.map((e) => `data: ${JSON.stringify(e)}\n\n`).join(''))
+    let sent = false
+    return {
+      body: {
+        getReader: () => ({
+          read: async () => {
+            if (!sent) { sent = true; return { done: false, value: bytes } }
+            throw err
+          },
+        }),
+      },
+    }
+  }
+
+  it('上游 reader 中途 reject：仍以 finish_reason + [DONE] 收尾', async () => {
+    const upstream = rejectingResponse([
+      { type: 'message_start', message: { usage: { input_tokens: 3 } } },
+      { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: '半截' } },
+    ])
+    const written = []
+    // 允许抛（调用方 server.js 已有 finally 兜底 end()），但收尾帧必须已在异常前写出
+    await pipeAnthropicToOpenAISSE(upstream, (s) => written.push(s), 'glm-5.3').catch(() => {})
+    const objs = written
+      .filter((s) => s !== 'data: [DONE]\n\n')
+      .map((s) => JSON.parse(s.replace(/^data: /, '').trim()))
+    const last = objs[objs.length - 1]
+    expect(last.choices[0].finish_reason).toBe('stop')
+    expect(written[written.length - 1]).toBe('data: [DONE]\n\n')
+  })
+
+  it('正常结束但没有 message_delta：仍补 finish_reason 与 [DONE]', async () => {
+    const upstream = sseResponse([
+      { type: 'message_start', message: { usage: { input_tokens: 1 } } },
+      { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'hi' } },
+    ])
+    const written = []
+    await pipeAnthropicToOpenAISSE(upstream, (s) => written.push(s), 'glm-5.3')
+    const objs = written
+      .filter((s) => s !== 'data: [DONE]\n\n')
+      .map((s) => JSON.parse(s.replace(/^data: /, '').trim()))
+    expect(objs[objs.length - 1].choices[0].finish_reason).toBe('stop')
+    expect(written[written.length - 1]).toBe('data: [DONE]\n\n')
+  })
+
+  it('已发过 finish_reason 时不重复补发', async () => {
+    const upstream = sseResponse([
+      { type: 'message_delta', delta: { stop_reason: 'end_turn' }, usage: { output_tokens: 2 } },
+    ])
+    const written = []
+    await pipeAnthropicToOpenAISSE(upstream, (s) => written.push(s), 'glm-5.3')
+    const finishes = written
+      .filter((s) => s !== 'data: [DONE]\n\n')
+      .map((s) => JSON.parse(s.replace(/^data: /, '').trim()))
+      .filter((o) => o.choices?.[0]?.finish_reason)
+    expect(finishes.length).toBe(1)
+    expect(written.filter((s) => s === 'data: [DONE]\n\n').length).toBe(1)
+  })
+
+  it('上游 error 事件不能被静默吞掉', async () => {
+    const upstream = sseResponse([
+      { type: 'message_start', message: { usage: { input_tokens: 3 } } },
+      { type: 'error', error: { type: 'overloaded_error', message: 'Overloaded' } },
+    ])
+    const written = []
+    await pipeAnthropicToOpenAISSE(upstream, (s) => written.push(s), 'glm-5.3').catch(() => {})
+    const joined = written.join('')
+    expect(joined).toContain('Overloaded') // 错误信息必须可见，不能静默丢弃
+    expect(written[written.length - 1]).toBe('data: [DONE]\n\n') // 并且流要正常收尾
+  })
+
+  it('读流前就失败（getReader 抛错）也必须保证 [DONE] 收尾', async () => {
+    const upstream = { body: { getReader() { throw new Error('no body') } } }
+    const written = []
+    await pipeAnthropicToOpenAISSE(upstream, (s) => written.push(s), 'glm-5.3').catch(() => {})
+    expect(written[written.length - 1]).toBe('data: [DONE]\n\n')
+  })
+})
+
 describe('pipeRaw', () => {
   it('forwards bytes untouched', async () => {
     const upstream = sseResponse([{ type: 'message_start' }])
