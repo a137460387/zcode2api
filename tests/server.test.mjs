@@ -250,3 +250,44 @@ describe('看板非本机鉴权', () => {
     expect((await request(app).get('/pool/status').set('x-panel-password', '')).status).toBe(401)
   })
 })
+
+// P1：流式响应头发出后上游中断 —— 必须结束响应且不产生 unhandled rejection。
+// 修复前：客户端挂死到超时，同时 res.json() 抛 "Cannot set headers after they are sent"
+// （unhandled rejection，Node ≥15 可能终止进程）。上游流中断是高频路径（3012/网络重置）。
+describe('流式中途失败', () => {
+  const brokenStream = () => ({
+    status: 200,
+    body: {
+      getReader: () => ({
+        read: async () => { throw new Error('upstream stream reset') },
+      }),
+    },
+    text: async () => '{}',
+    json: async () => ({}),
+  })
+
+  for (const [name, path, payload] of [
+    ['OpenAI', '/v1/chat/completions', { model: 'glm-5.3', stream: true, messages: [{ role: 'user', content: 'hi' }] }],
+    ['Anthropic', '/v1/messages', { model: 'glm-5.3', stream: true, max_tokens: 16, messages: [{ role: 'user', content: 'hi' }] }],
+  ]) {
+    it(`${name} 协议：上游流中断时结束响应且不抛未捕获拒绝`, async () => {
+      const unhandled = []
+      const onUnhandled = (e) => unhandled.push(e)
+      process.on('unhandledRejection', onUnhandled)
+      try {
+        const deps = buildDeps({
+          complete: async () => ({ response: brokenStream(), account: { id: 'acct1' } }),
+        })
+        const app = createApp(deps)
+        // 有 timeout 即为"挂死到超时"的失败信号
+        const r = await request(app).post(path).set('authorization', 'Bearer sk-test').send(payload).timeout({ deadline: 3000 })
+        // 已发出 200 头，故状态码是 200；关键是不能挂死（能返回即通过）
+        expect(r.status).toBe(200)
+        await new Promise((res) => setTimeout(res, 100))
+        expect(unhandled).toEqual([])
+      } finally {
+        process.off('unhandledRejection', onUnhandled)
+      }
+    })
+  }
+})

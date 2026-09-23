@@ -13,7 +13,7 @@ import { sendZcodePlan } from './upstream/zcode-plan.js'
 import { sendBigModel } from './upstream/bigmodel-api.js'
 import { createGateway } from './gateway.js'
 import { createRequestLog } from './usage.js'
-import { mapToZcodePlan, mapToBigModel, publicModelIds } from './models.js'
+import { mapToZcodePlan, publicModelIds } from './models.js'
 import { openaiToAnthropic, anthropicToOpenAI } from './protocol/convert.js'
 import { pipeAnthropicToOpenAISSE, pipeAnthropicSSEWithUsage } from './protocol/stream.js'
 import { fetchBalance } from './billing.js'
@@ -40,7 +40,9 @@ export function createApp(deps) {
     return res.status(401).json({ error: { message: 'panel password required for non-local access' } })
   }
   const v1Auth = (req, res, next) => {
-    if (!config.apiKey) return res.status(500).json({ error: { message: 'API_KEY not configured (.env)' } })
+    // 未配置 apiKey 是服务端配置缺失：用 503（服务不可用）而非 500，
+    // 对外接口回 500 会被客户端当作上游故障并反复重试。
+    if (!config.apiKey) return res.status(503).json({ error: { message: 'API_KEY not configured (.env)' } })
     // 三种凭据来源必须**按优先级显式回退**。`??` 只对 null/undefined 生效，而
     // 未带 x-api-key 时 `req.get('x-api-key')` 返回 `undefined`、未带 authorization 时
     // `(req.get('authorization') || '')` 是**空串**——空串不是 nullish，`??` 会在它处短路，
@@ -61,6 +63,13 @@ export function createApp(deps) {
 
   const fail = (res, err, fmt) => {
     const status = err.status ?? 502
+    // 流式响应头一旦发出就不能再改状态码/写 JSON：此时只能结束响应，
+    // 否则 res.status().json() 会抛 "Cannot set headers after they are sent"，
+    // 既是 unhandled rejection 又让客户端永远等不到流结束（挂死到超时）。
+    if (res.headersSent) {
+      log(`[server] stream aborted mid-flight: ${err?.message ?? err}`)
+      return res.end()
+    }
     const payload = fmt === 'anthropic'
       ? { type: 'error', error: { type: status === 429 ? 'rate_limit_error' : 'api_error', message: err.message + (err.hint ? `（${err.hint}）` : '') } }
       : { error: { message: err.message, ...(err.hint ? { hint: err.hint } : {}), ...(err.code != null ? { upstream_code: err.code } : {}) } }
@@ -81,9 +90,14 @@ export function createApp(deps) {
       logRequest({ model: clientModel, account: account.id, stream: body.stream, status: 200 })
       if (body.stream) {
         res.writeHead(200, { 'content-type': 'text/event-stream; charset=utf-8', 'cache-control': 'no-cache', connection: 'keep-alive' })
-        const usage = await pipeAnthropicToOpenAISSE(response, (s) => res.write(s), clientModel)
-        await recordUsage(account, usage)
-        return res.end()
+        // 流中途失败（上游中断/客户端断开）时 headers 已发出，只能结束响应。
+        try {
+          const usage = await pipeAnthropicToOpenAISSE(response, (s) => res.write(s), clientModel)
+          await recordUsage(account, usage)
+        } finally {
+          if (!res.writableEnded) res.end()
+        }
+        return
       }
       const data = await response.json()
       await recordUsage(account, { inputTokens: data.usage?.input_tokens ?? 0, outputTokens: data.usage?.output_tokens ?? 0 })
@@ -103,15 +117,20 @@ export function createApp(deps) {
       logRequest({ model: clientModel, account: account.id, stream: body.stream, status: 200 })
       if (body.stream) {
         res.writeHead(200, { 'content-type': 'text/event-stream; charset=utf-8', 'cache-control': 'no-cache', connection: 'keep-alive' })
-        const usage = await pipeAnthropicSSEWithUsage(response, (c) => res.write(c))
-        await recordUsage(account, usage)
-        return res.end()
+        try {
+          const usage = await pipeAnthropicSSEWithUsage(response, (c) => res.write(c))
+          await recordUsage(account, usage)
+        } finally {
+          if (!res.writableEnded) res.end()
+        }
+        return
       }
       const data = await response.json()
       await recordUsage(account, { inputTokens: data.usage?.input_tokens ?? 0, outputTokens: data.usage?.output_tokens ?? 0 })
       return res.json(data)
     } catch (e) {
       if (e instanceof ParamPoolEmpty) {
+        if (res.headersSent) return res.end()
         return res.status(503).json({ type: 'error', error: { type: 'api_error', message: `captcha param pool empty — 打开 ${farmUrl} 检查农场` } })
       }
       logRequest({ model: clientModel, stream: false, status: e.status ?? 502, error: e.message })
