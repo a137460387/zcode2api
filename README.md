@@ -53,20 +53,55 @@ npm run e2e     # 端到端冒烟：真实 server + 真实 Response 走通双协
 
 - 上游对模型端点有行为风控（3012 unusual activity）：默认 2s/账号最小间隔 + 30min 冷却；
   高频失败会加重行为分（小时~天级衰减）。请勿压测。
-  **注意**：该风控针对"账号+设备+IP"的行为分，**官方桌面端在同期也会被同样拦截**。
-  实测（2026-09-23）代理与桌面端同时返回 3012，故遇到时先确认桌面端能否发消息，
-  以区分"风控冷却中"与"代理配置问题"。
-- **桌面端升级后存在机制差异（2026-09-24 实测）**：新版桌面端把 captcha 的
-  `sceneId`/`prefix` 改为**服务端下发**（`getCaptchaConfig()`，缓存 60s），并在模型请求前
-  增加了 `send_preflight` 阶段；CLI bundle 里已**不再包含** captcha 配置
-  （旧版可搜到 `11xygtvd`/`no8xfe`，新版 0 命中）。若上游开始对旧 SceneId 产出的参数
-  判低分，需重新从桌面端运行时的 IPC 响应中提取新配置（本项目农场仍用旧配置）。
-- farm 依赖阿里云验证码 SDK 配置（SceneId `11xygtvd` / prefix `no8xfe`），官方更新可能失效。
+  详见下方"3012 的根因"——该风控**判定的是产出 captcha 参数的浏览器环境**，
+  自动化驱动的浏览器产出的参数会被判低分。
+- **新版桌面端把 captcha 配置改为服务端下发（2026-09-24 实测）**：`getCaptchaConfig()` 从
+  `GET /api/v1/client/configs` 的 `data.configs.captcha` 读取（缓存 60s），CLI bundle 里已不再
+  硬编码该配置；模型请求前多一个 `send_preflight` 阶段。配置值与本项目农场一致，故不构成问题。
+- **3012 的根因（2026-09-24 完整实测，证据链闭合）**：不是配置失效、不是参数格式、不是账号。
+  逐项排除如下（全部用真实 JWT 直连 `zcode.z.ai` 实测）：
+
+  | 请求 | 响应 | 含义 |
+  |---|---|---|
+  | 不带 captcha 参数 | `3007` | 校验器正常工作，只是缺参数 |
+  | 乱造参数 | `3007` | 格式无效被识别 |
+  | **农场产出的合法参数（首次使用）** | **`3012`** | **格式正确 → 进入风控评估 → 判环境异常** |
+  | 重复使用同一参数 | `3007` | 已消费，属正常 |
+
+  另外确认：新版服务端下发的 captcha 配置（`GET /api/v1/client/configs` 的
+  `data.configs.captcha`）与农场在用的**完全一致**（`sceneId: 11xygtvd` / `prefix: no8xfe` /
+  `region: cn`），故**不是 sceneId 失效**；官方客户端还会对每个 provider 记录上一轮
+  `certifyId` 以避免重复提交（`Pnn`/`F008`），但实测**新鲜参数的首次使用同样 3012**，
+  故也不是重复提交。
+
+  **结论：3012 判定的是"浏览器环境 + 请求上下文"，而非参数本身**。已排除的假设：
+  配置失效（服务端下发的 captcha 配置与农场一致）、参数格式（合法参数同样被拒）、
+  certifyId 重复（新鲜参数首次使用即 3012）、IP 行为分（换 IP 后仍 3012）、
+  浏览器指纹（**用真实用户 Chrome 产出参数仍 3012**）。
+
+  **最新发现（可能与签名头有关）**：新版引擎的请求头脱敏名单里包含三个"模型请求级"
+  认证头——`x-aliyun-captcha-verify-param`（我们已实现）、**`x-client-sig`**、
+  **`x-client-pow`**。后两者在任何客户端代码里都**不生成**：
+  CLI bundle 中仅出现于脱敏名单（各 1 次），asar（主进程+renderer）中 **0 次**
+  ——说明它们**由服务端随运行时头一起下发**（`requestProviderRuntimeHeaders` 机制）。
+  同版本里旧笔记提到的 `isUnsignedModelRequestPath`（"模型端点永不签名"）**已不存在**，
+  即新版该结论已过时。若上游已对模型端点校验 `x-client-sig`/`x-client-pow`，
+  则**任何未实现该握手的第三方代理都会被 3012**——这与"代理失败、桌面端正常"的
+  现象完全吻合。
+
+  **可行方向**：① 从桌面端运行时抓取 `requestProviderRuntimeHeaders` 的完整返回值
+  （含 `x-client-sig`/`x-client-pow` 的生成规则），这是唯一能补齐的路径；
+  ② 或接受该限制，把本项目当作"桌面端在场时可用"的代理（需桌面端窗口配合）。
+- farm 依赖阿里云验证码 SDK 配置（SceneId `11xygtvd` / prefix `no8xfe`）。该配置来自
+  服务端下发，可用 `GET https://zcode.z.ai/api/v1/client/configs`（带 JWT）读取，
+  便于将来核对是否变更。
+- 手动模式：`FARM_AUTO_BROWSER=0` 时不启动自动浏览器，改用你自己的真实 Chrome 打开
+  farm 页（`http://127.0.0.1:8789/farm`）。注意：**实测真实 Chrome 参数同样会被 3012**，
+  故手动模式并不能解决 3012，仅在调试指纹差异时有价值。
 - farm 的浏览器 UA 必须覆盖且版本要真实：playwright 在 headless 下默认 UA 含
   `HeadlessChrome/<ver>`，SDK 见之即返回 `F001`（verifyResult:false）导致**一个参数都产不出来**。
   `src/captcha/browser.js` 会自动探测本机 Chrome 版本并构造桌面 UA
-  （实测：默认 UA → F001 且 0 产出；覆盖 UA → 30s 内产出 3 个；
-  写死旧版本如 `Chrome/141` 与本机 153 不符，也是风险信号）。
+  （实测：默认 UA → F001 且 0 产出；覆盖 UA → 30s 内产出 3 个）。
   注：SDK 不检查 `navigator.webdriver`（实测该标志始终为 true，不影响结果）。
 - 纯 CLI（headless）**无法**使用官方套餐通道：官方 `account:*` provider 不在 headless 注册表视图内
   （`Model creation failed`），这是新版桌面端的架构决定，非本项目缺陷。官方额度只在桌面端 GUI

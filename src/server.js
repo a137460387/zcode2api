@@ -350,9 +350,17 @@ export async function main() {
   app.listen(config.port, config.host, () => {
     log(`[zcode2api] API      → http://${config.host}:${config.port}/v1`)
     log(`[zcode2api] 看板     → http://${config.host}:${config.port}/`)
-    log(`[zcode2api] farm 页  → ${farm.url}（自动浏览器/手动打开均可，保持页面运行）`)
+    log(`[zcode2api] farm 页  → ${farm.url}`)
   })
-  await launchFarmBrowser({ url: farm.url, headless: config.farmHeadless, chromePath: config.chromePath, log })
+  if (!config.farmAutoBrowser) {
+    log('[farm] 手动模式（FARM_AUTO_BROWSER=0）：未启动自动浏览器。')
+    log(`[farm] 请用你自己的 Chrome 打开 ${farm.url} 并保持标签页——真实浏览器产出的参数才不会被上游判 3012。`)
+  } else {
+    const browser = await launchFarmBrowser({ url: farm.url, headless: config.farmHeadless, chromePath: config.chromePath, log })
+    if (!browser) {
+      log(`[farm] 自动浏览器未启动：请手动打开 ${farm.url} 并保持标签页`)
+    }
+  }
 }
 
 if (process.argv[1] && import.meta.url === new URL(`file://${process.argv[1]}`).href) {

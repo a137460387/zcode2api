@@ -34,6 +34,10 @@ export function loadConfig({ rootDir = process.cwd(), env = process.env } = {}) 
     poolDir: env.POOL_DIR || path.join(rootDir, 'accounts'),
     certDir: env.CERT_DIR || path.join(rootDir, 'certs'),
     farmHeadless: bool(env.FARM_HEADLESS, true),
+    // 手动模式：关闭自动农场浏览器，改用用户自己的真实 Chrome 打开 farm 页。
+    // 必要性：playwright 驱动的浏览器（即便覆盖 UA）仍带自动化特征，产出的 captcha 参数
+    // 会被上游判低风险分并返回 3012；真实 Chrome 环境产出的参数才能通过（详见 README）。
+    farmAutoBrowser: bool(env.FARM_AUTO_BROWSER, true),
     chromePath: env.CHROME_PATH || '',
     poolSize: num(env.POOL_SIZE, 6, 1),
     paramTtlMs: num(env.PARAM_TTL_MS, 8 * 60_000, 0),
