@@ -59,8 +59,11 @@ describe('launchFarmBrowser（降级契约：绝不抛异常）', () => {
     const { launchFarmBrowser: fresh } = await import('../src/captcha/browser.js')
     const log = vi.fn()
     await expect(fresh({ url: 'http://127.0.0.1:1/farm', log })).resolves.toBeNull()
-    expect(log.mock.calls[0][0]).toContain('自动农场启动失败')
-    expect(log.mock.calls[0][0]).toContain('net::ERR_CONNECTION_REFUSED')
+    // 用"存在某条日志包含…"而非取首条：启动器会先打印 UA 版本等技术信息，
+    // 断言首条会把无关的日志顺序变化误报为失败。
+    const messages = log.mock.calls.map((c) => String(c[0])).join('\n')
+    expect(messages).toContain('自动农场启动失败')
+    expect(messages).toContain('net::ERR_CONNECTION_REFUSED')
     // 启动成功后失败必须回收浏览器，否则每次失败都留下一组孤儿 Chrome 进程
     // （审查实测：goto 失败一次泄漏 8 个 chrome.exe 且持续存活）。
     expect(closeFn).toHaveBeenCalledTimes(1)
@@ -90,11 +93,14 @@ describe('launchFarmBrowser 的 UA 覆盖（契约）', () => {
     expect(source).toMatch(/newContext\(\{\s*userAgent:/)
   })
 
-  it('UA 常量不含 HeadlessChrome，且为桌面 Chrome 形态', () => {
-    const ua = source.match(/const DESKTOP_UA =\s*\n?\s*'([^']+)'/)?.[1]
-    expect(typeof ua).toBe('string')
-    expect(ua).not.toContain('HeadlessChrome')
-    expect(ua).toContain('Chrome/')
-    expect(ua).toContain('Windows NT')
+  it('UA 由 desktopUA 构造：桌面 Chrome 形态、版本号真实探测而非写死', () => {
+    // 构造体必须含桌面 Chrome 的三要素（否则 SDK/上游会判为异常环境）
+    expect(source).toMatch(/Chrome\/\$\{[^}]+\}\.0\.0\.0 Safari\/537\.36/)
+    expect(source).toMatch(/Windows NT 10\.0; Win64; x64/)
+    // 版本号必须来自探测（detectChromeVersion），不能写死——写死旧版本会与浏览器实际不符
+    expect(source).toMatch(/function detectChromeVersion/)
+    expect(source).toMatch(/detectChromeVersion\(chromePath\)/)
+    // 任何硬编码的 Chrome 版本号都是回归信号
+    expect(source).not.toMatch(/Chrome\/\d+\.0\.0\.0/)
   })
 })
