@@ -33,9 +33,12 @@ button{padding:8px 16px;border:1px solid #ccc;border-radius:8px;background:#fff;
 <script>
 const logEl = document.getElementById('log');
 const stEl = document.getElementById('st');
+// 日志上限：失败风暴时 DOM 会无限增长（实测曾累积 400+ 条），截断到保留最近 60 行
+const LOG_MAX_LINES = 60;
 function log(msg, cls) {
   const t = new Date().toLocaleTimeString();
-  logEl.textContent = '[' + t + '] ' + msg + '\n' + logEl.textContent;
+  const lines = ('[' + t + '] ' + msg + '\n' + logEl.textContent).split('\n');
+  logEl.textContent = lines.slice(0, LOG_MAX_LINES).join('\n');
   if (cls) stEl.textContent = msg, stEl.className = 'status ' + cls;
 }
 let total = 0, pushed = 0;
@@ -71,9 +74,19 @@ async function verifyOnce() {
     document.getElementById('c-total').textContent = total;
     document.getElementById('c-last').textContent = new Date().toLocaleTimeString();
     // 推送给代理
-    const res = await fetch('/param', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ param: r.param }) });
-    if (res.ok) { pushed++; document.getElementById('c-ok').textContent = pushed; log('param 产出并推送成功（' + r.param.length + ' 字符）', 'ok'); }
-    else log('推送失败 HTTP ' + res.status, 'warn');
+    try {
+      const res = await fetch('/param', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ param: r.param }) });
+      if (res.ok) {
+        pushed++; document.getElementById('c-ok').textContent = pushed;
+        log('param 产出并推送成功（' + r.param.length + ' 字符）', 'ok');
+      } else {
+        // 服务在，但拒绝了这次上报（如参数格式不符）
+        log('推送被拒绝 HTTP ' + res.status + '（param 未入池）', 'warn');
+      }
+    } catch {
+      // 服务不可达：该 param 只能丢弃（一次性凭据，无法重放）
+      log('推送失败：代理服务不可达，本次 param 已丢弃', 'bad');
+    }
   } catch (e) {
     log('异常: ' + (e && e.message || e), 'bad');
   } finally {
@@ -82,15 +95,33 @@ async function verifyOnce() {
 }
 
 // 循环：池不满时持续产出（代理通过 /param-status 告知池状态）
+// 失败退避：服务不可达时不再白跑验证（验证码会白耗），并按指数退避探测，
+// 避免服务未启动时每 4 秒刷一次 Failed to fetch 把日志打爆。
+let backoffMs = 0;
+const BACKOFF_MAX = 60000;
 async function loop() {
   for (;;) {
+    let pool = null;
+    let reachable = false;
     try {
-      const s = await fetch('/param-status').then((r) => r.json()).catch(() => null);
-      const pool = s && s.pool;
-      document.getElementById('c-pool').textContent = pool != null ? pool : '-';
-      if (pool == null || pool < 3) await verifyOnce();
-    } catch {}
-    await new Promise((r) => setTimeout(r, 4000));
+      const res = await fetch('/param-status');
+      if (res.ok) {
+        const s = await res.json();
+        pool = s.pool;
+        reachable = true;
+      }
+    } catch { /* 服务不可达 */ }
+    document.getElementById('c-pool').textContent = reachable ? pool : '服务未连接';
+
+    if (!reachable) {
+      // 明确提示原因，且只在状态变化时记一条日志（不刷屏）
+      if (backoffMs === 0) log('代理服务不可达（' + new URL('/param-status', location.href).origin + '）——等待恢复，期间不产出 param', 'bad');
+      backoffMs = Math.min(backoffMs ? backoffMs * 2 : 4000, BACKOFF_MAX);
+    } else {
+      if (backoffMs > 0) { log('代理服务已恢复连接', 'ok'); backoffMs = 0; }
+      if (pool != null && pool < 3) await verifyOnce();
+    }
+    await new Promise((r) => setTimeout(r, backoffMs || 4000));
   }
 }
 document.getElementById('btn-now').onclick = verifyOnce;
