@@ -56,12 +56,21 @@ npm run e2e     # 端到端冒烟：真实 server + 真实 Response 走通双协
   **注意**：该风控针对"账号+设备+IP"的行为分，**官方桌面端在同期也会被同样拦截**。
   实测（2026-09-23）代理与桌面端同时返回 3012，故遇到时先确认桌面端能否发消息，
   以区分"风控冷却中"与"代理配置问题"。
+- **桌面端升级后存在机制差异（2026-09-24 实测）**：新版桌面端把 captcha 的
+  `sceneId`/`prefix` 改为**服务端下发**（`getCaptchaConfig()`，缓存 60s），并在模型请求前
+  增加了 `send_preflight` 阶段；CLI bundle 里已**不再包含** captcha 配置
+  （旧版可搜到 `11xygtvd`/`no8xfe`，新版 0 命中）。若上游开始对旧 SceneId 产出的参数
+  判低分，需重新从桌面端运行时的 IPC 响应中提取新配置（本项目农场仍用旧配置）。
 - farm 依赖阿里云验证码 SDK 配置（SceneId `11xygtvd` / prefix `no8xfe`），官方更新可能失效。
-- farm 的浏览器 UA 必须覆盖：playwright 在 headless 下默认 UA 含 `HeadlessChrome/<ver>`，
-  SDK 见之即返回 `F001`（verifyResult:false）导致**一个参数都产不出来**。
-  `src/captcha/browser.js` 已自动覆盖为桌面 Chrome UA，两种模式都可用
-  （实测：默认 UA → F001 且 0 产出；覆盖 UA → 30s 内产出 3 个）。
+- farm 的浏览器 UA 必须覆盖且版本要真实：playwright 在 headless 下默认 UA 含
+  `HeadlessChrome/<ver>`，SDK 见之即返回 `F001`（verifyResult:false）导致**一个参数都产不出来**。
+  `src/captcha/browser.js` 会自动探测本机 Chrome 版本并构造桌面 UA
+  （实测：默认 UA → F001 且 0 产出；覆盖 UA → 30s 内产出 3 个；
+  写死旧版本如 `Chrome/141` 与本机 153 不符，也是风险信号）。
   注：SDK 不检查 `navigator.webdriver`（实测该标志始终为 true，不影响结果）。
+- 纯 CLI（headless）**无法**使用官方套餐通道：官方 `account:*` provider 不在 headless 注册表视图内
+  （`Model creation failed`），这是新版桌面端的架构决定，非本项目缺陷。官方额度只在桌面端 GUI
+  或"导入本机登录态 + 本代理"路径下可用。
 - HTTPS farm：如 HTTP 下 SDK 异常，把 mkcert 证书放到 `certs/localhost-key.pem`、
   `certs/localhost.pem`（可从 `D:\code\Ai\zcode-proxy\certs\` 复制）并重启，自动切 HTTPS。
 - 测试超时：`vitest.config.mjs` 把 `testTimeout` 设为 30s。并发/落盘类测试在负载高的机器上
