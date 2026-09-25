@@ -8,6 +8,8 @@ import {
   decryptCredential,
   credentialsPath,
   readLocalZcodeCredentials,
+  candidateCredentialFiles,
+  readInstanceCredentials,
 } from '../src/auth/local-import.js'
 
 let dir

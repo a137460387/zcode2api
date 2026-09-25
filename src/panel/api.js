@@ -8,6 +8,7 @@ import { beginZaiLogin } from '../auth/zai.js'
 import { readLocalZcodeCredentials } from '../auth/local-import.js'
 import { maskSecret } from './settings.js'
 import { modelCatalog } from '../models.js'
+import { sendBigModel } from '../upstream/bigmodel-api.js'
 
 /**
  * 管理面路由（看板用的全部接口）。
@@ -42,6 +43,7 @@ export function enrichAccount(acc, { poolNow, realNow, healthy = null } = {}) {
     enabled: acc.enabled !== false,
     needsRelogin: acc.needsRelogin === true,
     noPackage: acc.noPackage === true,
+    invalidKey: acc.invalidKey === true,
     strikes: acc.strikes ?? 0,
     cooldownRemainMs,
     cooldownUntilIso: cooldownRemainMs > 0 ? new Date(realNow + cooldownRemainMs).toISOString() : null,
@@ -85,6 +87,37 @@ const safeSlug = (s) => {
     .slice(0, 32)
     .replace(/-+$/g, '')
   return cleaned.length >= 3 ? cleaned : crypto.randomBytes(4).toString('hex')
+}
+
+/**
+ * 探测 apikey 账号能不能真的用。
+ *
+ * 为什么必须在导入时探一次：从客户端扫进来的 Coding Plan key 里**有死 key**
+ * （实测 6 个里 5 个不可用：4 个 `1113 无可用资源包`、1 个 `401 身份验证失败`）。
+ * 不探的话它们会以"可用"的样子留在选号池里，直到某个真实用户请求撞上去才暴露——
+ * 那是一次白白失败的请求，还可能连带触发换号重试。
+ *
+ * 探测本身几乎不花钱：只发 1 个 token，而且 401/1113 都发生在**计费之前**（实测余额不变）。
+ */
+async function probeApiKey(account, fetchImpl) {
+  try {
+    const res = await sendBigModel({
+      apiKey: account.apiKey,
+      body: { model: 'glm-5.3-flash', max_tokens: 1, messages: [{ role: 'user', content: 'hi' }] },
+      fetchImpl,
+    })
+    // Body 是一次性流：先 clone 出来判业务码，再决定状态
+    const probe = typeof res.clone === 'function' ? res.clone() : res
+    const text = await probe.text().catch(() => '')
+    let code = null
+    try { code = JSON.parse(text).code ?? null } catch { code = null }
+    if (res.status === 200 && (code === null || code === 0)) return { ok: true }
+    if (res.status === 401) return { invalidKey: true, note: '上游拒绝该 API Key（401）' }
+    if (code === 1113 || /1113/.test(text)) return { noPackage: true, note: '密钥有效，但当前没有可用资源包（1113）' }
+    return { note: `上游返回 HTTP ${res.status}${code != null ? ` code=${code}` : ''}` }
+  } catch (e) {
+    return { note: `探测失败（网络）：${e?.message ?? e}` }
+  }
 }
 
 export function registerPanelRoutes(app, deps) {
@@ -278,24 +311,59 @@ export function registerPanelRoutes(app, deps) {
 
   app.post('/accounts/import/local', panelAuth, wrap(async (req, res) => {
     const r = readLocalCredentials(localCredOptions)
-    if (!r.ok) return res.status(400).json({ error: { message: r.message, reason: r.reason } })
+    if (!r.ok) return res.status(400).json({ error: { message: r.message, reason: r.reason, sources: r.sources } })
     const imported = []
+    const byType = { oauth: 0, apikey: 0 }
     for (const a of r.accounts) {
+      const type = a.type === 'apikey' ? 'apikey' : 'oauth'
+      // 两类凭据混在一个扫描结果里：oauth 走一次性 captcha 的免费通道，
+      // apikey（客户端里绑定的 Coding Plan key）走标准通道、不需要 captcha。
       const account = await store.upsertCredentials(newAccountFields({
-        provider: a.provider, type: 'oauth', jwt: a.jwt,
-        accessToken: a.accessToken, refreshToken: a.refreshToken, userInfo: a.userInfo,
+        provider: a.provider,
+        type,
+        jwt: a.jwt ?? null,
+        apiKey: a.apiKey ?? null,
+        accessToken: a.accessToken ?? null,
+        refreshToken: a.refreshToken ?? null,
+        userInfo: a.userInfo,
       }))
-      log(`[accounts] imported local ZCode login ${account.id} (${a.provider})`)
+      byType[type] += 1
+      log(`[accounts] imported ${account.id} (${a.provider}/${type}, 来自 ${a.source?.label ?? '本机'})`)
       imported.push(account)
     }
-    // 顺带把余额取回来，看板导入后立刻能看到套餐余量（失败不影响导入结果）
-    for (const acc of imported) {
+    // 顺带把余额取回来，看板导入后立刻能看到套餐余量（失败不影响导入结果）。
+    // 只有 oauth 账号能查（余额接口认 JWT）。
+    for (const acc of imported.filter((a) => a.type === 'oauth' && a.jwt)) {
       try {
         const b = await fetchBalance({ jwt: acc.jwt, fetchImpl })
         await store.update(acc.id, { planCache: b })
       } catch { /* 余额查询失败不阻断导入 */ }
     }
-    res.json({ ok: true, source: r.source, accounts: imported.map((a) => a.id) })
+    /**
+     * apikey 账号没有余额接口可查，只能实测一次。
+     * 探到的状态**写回账号**，这样面板一打开就是真话，池子也不会再拿死 key 去发请求。
+     */
+    const probes = []
+    for (const acc of imported.filter((a) => a.type === 'apikey' && a.apiKey)) {
+      const r = await probeApiKey(acc, fetchImpl)
+      const patch = r.ok
+        // 探测通过就清掉可能存在的旧标记：key 可能被重新充值过
+        ? { invalidKey: false, noPackage: false }
+        : { ...(r.invalidKey ? { invalidKey: true } : {}), ...(r.noPackage ? { noPackage: true } : {}) }
+      if (Object.keys(patch).length) await store.update(acc.id, patch)
+      probes.push({ id: acc.id, ...r })
+      if (r.note) log(`[accounts] ${acc.id} 探测：${r.note}`)
+    }
+    res.json({
+      ok: true,
+      source: r.source,
+      accounts: imported.map((a) => a.id),
+      byType,
+      probes,
+      // 逐实例诊断：让面板能说清"默认实例导入了 1 个 oauth + 5 个 Coding Plan key，
+      // 多开实例 2 没登录、多开实例 3 凭据解不开"——而不是只回一句"导入完成"。
+      sources: r.sources,
+    })
   }))
 
   // ─────────────────────────── OAuth 登录 ───────────────────────────

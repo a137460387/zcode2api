@@ -23,6 +23,7 @@ export class AccountPool {
     return acc.enabled !== false
       && acc.needsRelogin !== true
       && acc.noPackage !== true
+      && acc.invalidKey !== true
       && (acc.cooldownUntil ?? 0) <= this.now()
   }
 
@@ -335,7 +336,16 @@ export class AccountPool {
     return this.store.update(account.id, (cur) => {
       const a = cur ?? account
       const stats = { ...a.stats, lastError: { status, code, at: this.now() } }
-      if (status === 401) return { needsRelogin: true, stats }
+      /**
+       * 401 的含义取决于账号类型：
+       * - oauth：凭据（JWT）失效，用户重新登录就能救回来 → `needsRelogin`
+       * - apikey：API Key 被吊销/填错，**没有"重新登录"这回事** → `invalidKey`
+       *
+       * 早先不分类型统一置 `needsRelogin`，于是从客户端扫描进来的一个失效 Coding Plan key
+       * 会在面板上显示"需重登"——那是个点不动的死路，用户会一直找不到该做什么。
+       * 实测这台机器上 5 个 Coding Plan 凭据里就有 1 个是 401。
+       */
+      if (status === 401) return a.type === 'apikey' ? { invalidKey: true, stats } : { needsRelogin: true, stats }
       if (code === 1113) return { noPackage: true, stats }
       /**
        * 冷却**只能延长，不能缩短**：用 `Math.max(现有值, 本次解禁时刻)` 而非赋值。
@@ -418,6 +428,7 @@ export class AccountPool {
       enabled: a.enabled !== false,
       needsRelogin: a.needsRelogin === true,
       noPackage: a.noPackage === true,
+      invalidKey: a.invalidKey === true,
       cooldownRemainMs: Math.max(0, (a.cooldownUntil ?? 0) - t),
       email: a.userInfo?.email ?? null,
       name: a.userInfo?.name ?? null,

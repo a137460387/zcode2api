@@ -507,3 +507,203 @@ describe('/accounts 的用量取自落盘日志', () => {
     expect(a.usage).toEqual({ requests: 0, promptTokens: 0, cacheReadTokens: 0, completionTokens: 0, totalTokens: 0 })
   })
 })
+
+// 扫描导入要能带出逐实例诊断：多开用户最需要知道"我另一个客户端的号到底进来了没"。
+describe('扫描本机登录：多实例与 Coding Plan', () => {
+  it('逐实例诊断随响应返回（含未登录的实例）', async () => {
+    const deps = buildDeps()
+    const read = () => ({
+      ok: true,
+      accounts: [
+        { type: 'oauth', provider: 'bigmodel', jwt: 'J1', userInfo: { user_id: '1' }, source: { label: '默认实例', file: 'a' } },
+        { type: 'apikey', provider: 'bigmodel', apiKey: 'aaaa.bbbb', userInfo: { id: 'coding-plan:9', name: 'plan 9' }, source: { label: '多开实例 1', file: 'b' } },
+      ],
+      sources: [
+        { label: '默认实例', ok: true, oauth: true },
+        { label: '多开实例 1', ok: true, apiKeys: 1 },
+        { label: '多开实例 2', ok: false, reason: 'no_jwt' },
+      ],
+    })
+    const r = await request(createApp({ ...deps, readLocalCredentials: read })).post('/accounts/import/local').send({})
+    expect(r.status).toBe(200)
+    expect(r.body.accounts).toHaveLength(2)
+    expect(r.body.byType).toEqual({ oauth: 1, apikey: 1 })
+    expect(r.body.sources).toHaveLength(3)
+    expect(r.body.sources[2]).toMatchObject({ label: '多开实例 2', ok: false, reason: 'no_jwt' })
+  })
+
+  it('两类账号按各自的类型入库（apikey 不写 jwt，oauth 不写 apiKey）', async () => {
+    const deps = buildDeps()
+    const read = () => ({
+      ok: true,
+      accounts: [
+        { type: 'oauth', provider: 'bigmodel', jwt: 'J1', accessToken: 'AT', userInfo: { user_id: '1' }, source: { label: '默认实例' } },
+        { type: 'apikey', provider: 'bigmodel', apiKey: 'k'.repeat(40) + '.x', userInfo: { id: 'coding-plan:9' }, source: { label: '多开实例 1' } },
+      ],
+      sources: [],
+    })
+    await request(createApp({ ...deps, readLocalCredentials: read })).post('/accounts/import/local').send({})
+    const oauth = deps.store.get('bigmodel:1')
+    expect(oauth.type).toBe('oauth')
+    expect(oauth.jwt).toBe('J1')
+    expect(oauth.apiKey).toBeNull()
+    const key = deps.store.get('bigmodel:coding-plan:9')
+    expect(key.type).toBe('apikey')
+    expect(key.apiKey).toBe('k'.repeat(40) + '.x')
+    expect(key.jwt).toBeNull()
+  })
+
+  it('apikey 账号不调余额接口，改走一次实测探测', async () => {
+    const deps = buildDeps()
+    const read = () => ({
+      ok: true,
+      accounts: [{ type: 'apikey', provider: 'bigmodel', apiKey: 'k'.repeat(40) + '.x', userInfo: { id: 'coding-plan:9' }, source: { label: '默认实例' } }],
+      sources: [],
+    })
+    // 只数**余额接口**的调用：导入 apikey 账号本来就会发一次探测请求（那是另一件事），
+    // 这里要钉的是"余额接口认 JWT，不会为 apikey 账号调用"。
+    const balanceCalls = []
+    const probeCalls = []
+    const fetchImpl = async (url) => {
+      if (String(url).includes('/billing/balance')) balanceCalls.push(url)
+      else probeCalls.push(url)
+      return { status: 200, clone() { return { text: async () => JSON.stringify({ code: 0 }) } }, json: async () => ({ code: 0, data: { balances: [] } }) }
+    }
+    await request(createApp({ ...deps, readLocalCredentials: read, fetchImpl })).post('/accounts/import/local').send({})
+    expect(deps.store.get('bigmodel:coding-plan:9').apiKey).toBeTruthy()
+    expect(balanceCalls).toEqual([])
+    expect(probeCalls).toHaveLength(1)   // 探测走 messages 接口
+  })
+
+  it('完全扫不到时 400 且带上已查找的实例清单', async () => {
+    const deps = buildDeps()
+    const read = () => ({ ok: false, reason: 'not_found', message: '未找到任何 ZCode 凭据文件', sources: [{ label: '默认实例', ok: false, reason: 'not_found' }] })
+    const r = await request(createApp({ ...deps, readLocalCredentials: read })).post('/accounts/import/local').send({})
+    expect(r.status).toBe(400)
+    expect(r.body.error.reason).toBe('not_found')
+    expect(r.body.error.sources).toHaveLength(1)
+  })
+})
+
+// apikey 账号收到 401 时不能显示"需重登"——API Key 没有"重新登录"这回事，
+// 那会变成一个点不动的死路（实测从客户端扫进来的 5 个 Coding Plan key 里有 1 个就是 401）。
+describe('apikey 账号的 401 语义', () => {
+  it('apikey 401 → invalidKey（不是 needsRelogin），且被判为不健康', async () => {
+    const deps = buildDeps()
+    await deps.store.save(newAccountFields({ provider: 'bigmodel', type: 'apikey', apiKey: 'k', userInfo: { id: 'ak1' } }))
+    await deps.pool.markError(deps.store.get('bigmodel:ak1'), { status: 401, code: 1000 })
+    const a = deps.store.get('bigmodel:ak1')
+    expect(a.invalidKey).toBe(true)
+    expect(a.needsRelogin).toBe(false)
+    expect(deps.pool.healthy(a)).toBe(false)
+    const view = (await request(createApp(deps)).get('/accounts')).body.accounts[0]
+    expect(view.invalidKey).toBe(true)
+    expect(view.needsRelogin).toBe(false)
+    expect(view.healthy).toBe(false)
+  })
+
+  it('oauth 401 仍是 needsRelogin（重新登录能救回来）', async () => {
+    const deps = buildDeps()
+    await deps.store.save(newAccountFields({ provider: 'bigmodel', type: 'oauth', jwt: 'j', userInfo: { user_id: 'o1' } }))
+    await deps.pool.markError(deps.store.get('bigmodel:o1'), { status: 401, code: 1000 })
+    const a = deps.store.get('bigmodel:o1')
+    expect(a.needsRelogin).toBe(true)
+    expect(a.invalidKey).toBe(false)
+  })
+
+  it('失效的 apikey 不会阻止其他账号被选用', async () => {
+    const deps = buildDeps()
+    await deps.store.save(newAccountFields({ provider: 'bigmodel', type: 'apikey', apiKey: 'k', userInfo: { id: 'bad' } }))
+    await deps.store.save(newAccountFields({ provider: 'bigmodel', type: 'oauth', jwt: 'j', userInfo: { user_id: 'good' } }))
+    await deps.store.update('bigmodel:bad', { invalidKey: true })
+    const picked = deps.pool.pick(null)
+    expect(picked.account.id).toBe('bigmodel:good')
+  })
+})
+
+// apikey 账号在导入时实测一次。不探的话，从客户端扫进来的死 key 会以"可用"的样子
+// 留在池里，直到某个真实请求撞上去才暴露（实测 6 个 Coding Plan key 里 5 个是死的）。
+describe('apikey 导入时探测', () => {
+  const importDeps = (resp, extra = {}) => {
+    const deps = buildDeps()
+    return {
+      ...deps,
+      readLocalCredentials: () => ({
+        ok: true,
+        accounts: [{ type: 'apikey', provider: 'bigmodel', apiKey: 'k'.repeat(40) + '.x', userInfo: { id: 'coding-plan:9' }, source: { label: '默认实例' } }],
+        sources: [],
+      }),
+      fetchImpl: async () => resp,
+      ...extra,
+    }
+  }
+  const okResp = { status: 200, clone() { return { text: async () => JSON.stringify({ code: 0 }) } } }
+  const r1113 = { status: 429, clone() { return { text: async () => JSON.stringify({ code: 1113 }) } } }
+  const r401 = { status: 401, clone() { return { text: async () => JSON.stringify({ error: { type: '1000' } }) } } }
+
+  it('密钥可用 → 无标记，账号健康', async () => {
+    const deps = importDeps(okResp)
+    const r = await request(createApp(deps)).post('/accounts/import/local').send({})
+    expect(r.body.probes[0].ok).toBe(true)
+    const a = deps.store.get('bigmodel:coding-plan:9')
+    expect(a.invalidKey).toBe(false)
+    expect(a.noPackage).toBe(false)
+    expect(deps.pool.healthy(a)).toBe(true)
+  })
+
+  it('1113（无资源包）→ 标记 noPackage，池子不再选它', async () => {
+    const deps = importDeps(r1113)
+    const r = await request(createApp(deps)).post('/accounts/import/local').send({})
+    expect(r.body.probes[0].noPackage).toBe(true)
+    const a = deps.store.get('bigmodel:coding-plan:9')
+    expect(a.noPackage).toBe(true)
+    expect(deps.pool.healthy(a)).toBe(false)
+  })
+
+  it('401 → 标记 invalidKey（而不是 needsRelogin）', async () => {
+    const deps = importDeps(r401)
+    const r = await request(createApp(deps)).post('/accounts/import/local').send({})
+    expect(r.body.probes[0].invalidKey).toBe(true)
+    const a = deps.store.get('bigmodel:coding-plan:9')
+    expect(a.invalidKey).toBe(true)
+    expect(a.needsRelogin).toBe(false)
+    expect(deps.pool.healthy(a)).toBe(false)
+  })
+
+  it('探测网络失败：不误标为失效，只记一条说明', async () => {
+    const deps = importDeps(null, { fetchImpl: async () => { throw new Error('ECONNRESET') } })
+    const r = await request(createApp(deps)).post('/accounts/import/local').send({})
+    expect(r.body.probes[0].ok).toBeUndefined()
+    expect(r.body.probes[0].note).toContain('ECONNRESET')
+    const a = deps.store.get('bigmodel:coding-plan:9')
+    expect(a.invalidKey).toBe(false)
+    expect(a.noPackage).toBe(false)
+  })
+
+  it('探测通过会清掉旧的失效标记（key 可能已充值恢复）', async () => {
+    const deps = importDeps(okResp)
+    await deps.store.save(newAccountFields({ provider: 'bigmodel', type: 'apikey', apiKey: 'k'.repeat(40) + '.x', userInfo: { id: 'coding-plan:9' } }))
+    await deps.store.update('bigmodel:coding-plan:9', { invalidKey: true, noPackage: true })
+    await request(createApp(deps)).post('/accounts/import/local').send({})
+    const a = deps.store.get('bigmodel:coding-plan:9')
+    expect(a.invalidKey).toBe(false)
+    expect(a.noPackage).toBe(false)
+  })
+
+  it('oauth 账号不做 apikey 探测（走的是余额接口）', async () => {
+    const deps = buildDeps()
+    deps.readLocalCredentials = () => ({
+      ok: true,
+      accounts: [{ type: 'oauth', provider: 'bigmodel', jwt: 'J1', userInfo: { user_id: '1' }, source: { label: '默认实例' } }],
+      sources: [],
+    })
+    let anthropicCalls = 0
+    deps.fetchImpl = async (url) => {
+      if (String(url).includes('open.bigmodel.cn')) anthropicCalls += 1
+      return { status: 200, json: async () => ({ code: 0, data: { balances: [] } }) }
+    }
+    const r = await request(createApp(deps)).post('/accounts/import/local').send({})
+    expect(r.body.probes).toEqual([])
+    expect(anthropicCalls).toBe(0)
+  })
+})

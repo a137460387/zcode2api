@@ -197,12 +197,18 @@ footer{max-width:1320px;margin:0 auto;padding:0 22px 30px;font-size:11px;color:v
         <button class="btn primary" data-act="login" data-provider="bigmodel">+ BigModel 登录</button>
         <button class="btn primary" data-act="login" data-provider="zai">+ Z.AI 登录</button>
         <button class="btn" data-act="addkey">+ API Key 账号</button>
-        <button class="btn" data-act="import">⤓ 扫描本机 ZCode 登录</button>
+        <button class="btn" data-act="import" title="扫描本机所有 ZCode 实例（默认 + 多开）的登录凭据与 Coding Plan key，无需重新授权">⤓ 扫描本机 ZCode 登录</button>
         <button class="btn" data-act="balance">刷新套餐额度</button>
         <button class="btn" data-act="setall" data-enabled="1">全部启用</button>
         <button class="btn" data-act="setall" data-enabled="0">全部停用</button>
       </div>
       <div class="tw" id="accounts"></div>
+      <div id="importMsg" class="hint" style="margin-top:10px"></div>
+      <div class="hint" style="margin-top:8px">
+        「扫描本机 ZCode 登录」会把本机**所有** ZCode 实例（默认实例 + 多开管理器的每个实例）
+        已登录的账号一次性导入，并顺带收进客户端里绑定的 Coding Plan API Key
+        （走标准通道、不需要 captcha）。不用重新授权，也不用手工编辑文件。
+      </div>
     </section>
 
     <section>
@@ -463,7 +469,14 @@ async function postJSON(path, body) {
   let parsed = {}
   try { parsed = text ? JSON.parse(text) : {} } catch (e) { parsed = { raw: text } }
   if (r.status === 401 && path !== '/panel/login') { needLogin(); throw new Error('unauthorized') }
-  if (!r.ok) throw new Error((parsed.error && parsed.error.message) || ('HTTP ' + r.status))
+  if (!r.ok) {
+    const err = new Error((parsed.error && parsed.error.message) || ('HTTP ' + r.status))
+    // 把结构化错误体挂上去：400 响应里常带诊断信息（如导入时的逐实例结果），
+    // 只留一句 message 会让调用方丢掉全部细节。
+    err.body = parsed
+    err.status = r.status
+    throw err
+  }
   return parsed
 }
 
@@ -527,6 +540,7 @@ let ACCOUNTS = []
 function statusBadges(a) {
   const out = []
   if (!a.enabled) out.push('<span class="badge off">已停用</span>')
+  else if (a.invalidKey) out.push('<span class="badge bad" title="API Key 被上游拒绝（401）——apikey 账号没有「重新登录」这回事，需要换一个有效密钥">密钥无效</span>')
   else if (a.needsRelogin) out.push('<span class="badge bad">需重登</span>')
   else if (a.noPackage) out.push('<span class="badge warn">无资源包</span>')
   else if (a.cooldownRemainMs > 0) out.push('<span class="badge warn">冷却 ' + esc(mins(a.cooldownRemainMs)) + '</span>')
@@ -1047,13 +1061,49 @@ async function refreshBalance(id) {
   } catch (e) { toast('刷新失败：' + e.message, 'err') }
 }
 async function importLocal() {
-  toast('正在扫描本机 ZCode 登录态…')
+  toast('正在扫描本机所有 ZCode 实例（默认 + 多开）…')
+  let r
   try {
-    const r = await postJSON('/accounts/import/local', {})
-    const ids = r.accounts || []
-    toast(ids.length ? ('已导入 ' + ids.length + ' 个账号：' + ids.join('、')) : '未发现可导入的账号', ids.length ? 'ok' : '')
-    refresh()
-  } catch (e) { toast('导入失败：' + e.message, 'err') }
+    r = await postJSON('/accounts/import/local', {})
+  } catch (e) {
+    // 400 时服务端会带上逐实例诊断，把原因说清楚比一句"导入失败"有用
+    const body = e.body || {}
+    $('importMsg').innerHTML = '<span class="badge bad">未导入</span> ' + esc(e.message)
+      + renderImportSources(body.sources)
+    return toast('导入失败：' + e.message, 'err')
+  }
+  const ids = r.accounts || []
+  const bt = r.byType || {}
+  const parts = []
+  if (bt.oauth) parts.push(bt.oauth + ' 个 OAuth 账号')
+  if (bt.apikey) parts.push(bt.apikey + ' 个 Coding Plan key')
+  $('importMsg').innerHTML = (ids.length
+    ? '<span class="badge ok">已导入</span> ' + esc(parts.join(' + ')) + '：' + esc(ids.join('、'))
+    : '<span class="badge off">未发现可导入的账号</span>')
+    + renderImportSources(r.sources)
+  toast(ids.length ? ('已导入 ' + parts.join(' + ')) : '未发现可导入的账号', ids.length ? 'ok' : '')
+  await loadModels()
+  refresh()
+}
+
+/**
+ * 逐实例的扫描结果。
+ * 多开用户最需要的就是这个：哪个实例的账号进来了、哪个实例没登录、哪个解不开。
+ * 只回一句"导入完成"的话，他没法知道"我另一个客户端的号到底有没有进来"。
+ */
+function renderImportSources(sources) {
+  if (!sources || !sources.length) return ''
+  return '<div class="hint" style="margin-top:6px;font-size:11px">'
+    + sources.map((s) => {
+      const bits = []
+      if (s.oauth) bits.push('OAuth 账号')
+      if (s.apiKeys) bits.push(s.apiKeys + ' 个 Coding Plan key')
+      const state = s.ok
+        ? '<span class="ok">✓ ' + esc(bits.join(' + ') || '已读取') + '</span>'
+        : (s.reason === 'not_found' ? '<span style="color:var(--dim)">未登录</span>'
+          : '<span class="bad">' + esc(s.reason === 'decrypt_failed' ? '凭据解不开' : (s.message || s.reason)) + '</span>')
+      return '<div>' + esc(s.label) + '：' + state + '</div>'
+    }).join('') + '</div>'
 }
 
 let LOGIN = null

@@ -190,6 +190,9 @@ export function newAccountFields({ provider, type, jwt = null, apiKey = null, ac
     cooldownUntil: 0,
     needsRelogin: false,
     noPackage: false,
+    // apikey 账号专用：密钥被上游拒绝（401）。与 needsRelogin 并列显式声明，
+    // 免得"字段缺席"和"字段为 false"两种状态都要读者去分辨。
+    invalidKey: false,
     strikes: 0,
     planCache: null,
     stats: { requests: 0, inputTokens: 0, outputTokens: 0, lastUsedAt: 0, lastError: null },
