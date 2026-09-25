@@ -5,5 +5,10 @@ certs/*
 .env
 *.log
 
+# 用量账（本机请求记录：含账号 id 与 token 计数）与面板密码哈希，均属本机数据
+usage/
+panel.json
+panel.json.tmp
+
 # 审查/执行过程的临时工作目录（进度账本、探针、报告），不入库
 .superpowers/

@@ -1,10 +1,9 @@
 import express from 'express'
-import crypto from 'node:crypto'
 import fs from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { loadConfig } from './config.js'
-import { AccountStore, newAccountFields } from './auth/store.js'
+import { AccountStore } from './auth/store.js'
 import { AccountPool } from './accounts.js'
 import { ParamPool, ParamPoolEmpty } from './captcha/pool.js'
 import { startFarmServer } from './captcha/farm-server.js'
@@ -12,58 +11,99 @@ import { launchFarmBrowser } from './captcha/browser.js'
 import { sendZcodePlan } from './upstream/zcode-plan.js'
 import { sendBigModel } from './upstream/bigmodel-api.js'
 import { createGateway } from './gateway.js'
-import { createRequestLog } from './usage.js'
+import { UsageStore, createRequestLog } from './usage.js'
 import { mapToZcodePlan, publicModelIds } from './models.js'
 import { openaiToAnthropic, anthropicToOpenAI } from './protocol/convert.js'
 import { pipeAnthropicToOpenAISSE, pipeAnthropicSSEWithUsage } from './protocol/stream.js'
-import { fetchBalance } from './billing.js'
-import { beginBigModelLogin } from './auth/bigmodel.js'
-import { beginZaiLogin } from './auth/zai.js'
-import { readLocalZcodeCredentials } from './auth/local-import.js'
+import { PanelAuth } from './panel/auth.js'
+import { RuntimeSettings } from './panel/settings.js'
+import { registerPanelRoutes } from './panel/api.js'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 
+/**
+ * 上游 usage → 用量记录字段。
+ *
+ * 两个来源形状不同，故统一在这里归一：
+ * - 非流式：`data.usage`（Anthropic 响应体）
+ * - 流式：解析器累积出的 `{inputTokens, outputTokens, cacheReadTokens, cacheCreationTokens}`
+ *
+ * **`total_tokens` 必须把缓存命中的输入算进去**（实测教训）：Anthropic 口径下
+ * `input_tokens` **不含**缓存部分，缓存命中单独记在 `cache_read_input_tokens`。
+ * 实测一次流式请求：`input_tokens=40, cache_read_input_tokens=1664, output_tokens=8`，
+ * 上游计费 +1712 单位 = 40+1664+8。若按 `input+output` 记总账，面板会显示 48——
+ * 比实际少 35 倍。而 agent 类客户端（Claude Code / dsh）每轮都重发一大段系统提示，
+ * 命中缓存是常态，所以这个偏差在实际使用中是**系统性**的，不是边角情况。
+ *
+ * `prompt_tokens` 保持"未命中缓存的输入"这一原始语义（与上游字段一一对应），
+ * 缓存量另列，面板据此展示"输入 / 缓存 / 输出"。
+ */
+function usageToRecord(data, model, accountId, timing, stream, streamUsage = null) {
+  const u = streamUsage ?? data?.usage ?? {}
+  const prompt = u.inputTokens ?? u.input_tokens ?? 0
+  const completion = u.outputTokens ?? u.output_tokens ?? 0
+  const cacheRead = u.cacheReadTokens ?? u.cache_read_input_tokens ?? 0
+  const cacheCreation = u.cacheCreationTokens ?? u.cache_creation_input_tokens ?? 0
+  return {
+    model,
+    account: accountId ?? null,
+    stream,
+    status: 200,
+    prompt_tokens: prompt,
+    completion_tokens: completion,
+    cache_read_tokens: cacheRead,
+    cache_creation_tokens: cacheCreation,
+    total_tokens: prompt + cacheRead + cacheCreation + completion,
+    ...timing,
+  }
+}
+
+/**
+ * 计时器：`elapsed_ms` 从调用上游前开始计（含等参数/等节流，这才是用户真正感知的延迟）；
+ * `ttft_ms` 只在**流式**路径上有意义——非流式没有"首字节"信号，用 `null` 表示"未测"，
+ * 而不是塞一个等于 elapsed 的值冒充（那会把两条路径的均值混成无法解释的数）。
+ */
+function makeTimer(clock = Date.now) {
+  const started = clock()
+  let firstAt = 0
+  return {
+    markFirstByte() { if (!firstAt) firstAt = clock() },
+    finish({ stream, outputTokens = 0 } = {}) {
+      const ended = clock()
+      const elapsed = ended - started
+      const ttft = stream && firstAt ? firstAt - started : null
+      const genMs = stream && firstAt ? ended - firstAt : null
+      // 生成速度按"首字节之后的耗时"算：把首字等待算进去会系统性低估速度。
+      const tps = genMs && genMs > 0 && outputTokens > 0 ? outputTokens / (genMs / 1000) : null
+      return { elapsed_ms: elapsed, ttft_ms: ttft, tokens_per_sec: tps }
+    },
+  }
+}
+
 export function createApp(deps) {
-  const { config, store, pool, paramPool, gateway, requestLog, log = () => {} } = deps
+  const { config, store, pool, paramPool, gateway, requestLog, usage, panelAuth, settings, log = () => {} } = deps
   const app = express()
   app.use(express.json({ limit: '32mb' }))
-  const logins = new Map()
-
-  /**
-   * 废弃登录的回收时限：`/start` 后既不 poll 也不 cancel 的登录（用户关标签页、
-   * 网络断）其回调 server 会持续监听、`logins` 条目永久滞留（实测 30 次废弃 start
-   * → 30/30 端口仍监听）。BigModel 回调服务与 Z.AI 轮询的实际耗时都远短于 10 分钟。
-   * 可经 deps.loginTtlMs 注入更短的值以便测试（生产走默认）。
-   */
-  const LOGIN_TTL_MS = deps.loginTtlMs ?? 10 * 60_000
   const now = deps.now ?? Date.now
-  /**
-   * 惰性回收：在每次 start/poll 时顺带清理超时条目（`cancel()` 让挂起的登录 promise
-   * 落地，`close?.()` 释放回调 server 的监听端口，最后从 Map 删除）。
-   * 不另起定时器：定时器会给 createApp 引入需要显式回收的句柄（测试难以干净退出），
-   * 而 start/poll 本就是这条生命周期唯一的入口，挂在这里足够及时。
-   */
-  const reapExpiredLogins = () => {
-    const t = now()
-    for (const [id, entry] of logins) {
-      if (t - entry.at < LOGIN_TTL_MS) continue
-      try { entry.login.cancel?.() } catch (e) { log(`[accounts] login cancel failed: ${e?.message ?? e}`) }
-      try { entry.login.close?.() } catch (e) { log(`[accounts] login close failed: ${e?.message ?? e}`) }
-      logins.delete(id)
-      log(`[accounts] reaped abandoned login ${id} (${entry.provider})`)
-    }
-  }
+  const clock = deps.clock ?? Date.now
 
   // `isLocal` 可注入（deps.isLocal）：Socket.remoteAddress 是只读的 getter，
   // 测试无法伪造成非本机来源，导致"非本机必须校验面板密码"这条安全边界无从覆盖。
+  // 面板鉴权统一走 PanelAuth（见 src/panel/auth.js）：本机放行 + token 会话 + 旧请求头兼容。
   const isLocal = deps.isLocal ?? ((req) => {
     const addr = req.socket.remoteAddress ?? ''
     return addr === '127.0.0.1' || addr === '::1' || addr === '::ffff:127.0.0.1'
   })
-  const panelAuth = (req, res, next) => {
-    if (isLocal(req)) return next()
-    if (config.panelPassword && req.get('x-panel-password') === config.panelPassword) return next()
-    return res.status(401).json({ error: { message: 'panel password required for non-local access' } })
+  const auth = panelAuth ?? new PanelAuth({
+    file: path.join(config.rootDir ?? process.cwd(), 'panel.json'),
+    bootstrapPassword: config.panelPassword,
+    localBypass: config.panelLocalBypass,
+    now: deps.panelNow ?? Date.now,
+    log,
+  })
+  if (deps.isLocal) {
+    // 注入的 isLocal 优先（测试需要伪造来源），否则用 PanelAuth 自己的判定。
+    auth.isLocal = isLocal
   }
   const v1Auth = (req, res, next) => {
     // 未配置 apiKey 是服务端配置缺失：用 503（服务不可用）而非 500，
@@ -105,24 +145,54 @@ export function createApp(deps) {
     return res.status(status).json(payload)
   }
 
-  const recordUsage = (account, usage) => {
-    if (usage && account) pool.recordUsage(account.id, usage)
+  const recordUsage = (account, usage_) => {
+    if (usage_ && account) pool.recordUsage(account.id, usage_)
   }
   const logRequest = (entry) => requestLog.add(entry)
+  /**
+   * 用量落盘（面板「用量分析」的数据源）。**不 await**：它在响应已经发给客户端之后才写，
+   * 让一个慢盘拖住请求的收尾毫无意义；`UsageStore` 自己保证写入串行且失败不抛。
+   */
+  const recordAnalytics = (entry) => { usage?.record(entry) }
+
+  /**
+   * 失败请求的用量记录。
+   *
+   * 两个"看起来无关紧要、实际会让面板失明"的点（真实上游实测踩到）：
+   * - `stream` 必须取**客户端请求的模式**，不能硬编码 false。流式请求在收到首字节前失败时
+   *   一次 `data:` 都没发，但那仍然是"流式请求失败了"，记成非流式会让面板的流式统计失真。
+   * - `account` 取 `err.accountId`（网关在抛错时带上）。否则失败记录全是 `(unattributed)`，
+   *   而"是哪个号在吃 429/3012"正是面板最该回答的问题。
+   */
+  const recordFailure = (model, err, timer, stream) => {
+    const status = err.status ?? 502
+    logRequest({ model, account: err.accountId ?? undefined, stream, status, error: err.message })
+    recordAnalytics({
+      model,
+      account: err.accountId ?? null,
+      stream: Boolean(stream),
+      status,
+      error: err.message,
+      ...timer.finish({ stream: Boolean(stream) }),
+    })
+  }
 
   app.post('/v1/chat/completions', v1Auth, async (req, res) => {
     const clientModel = req.body.model || 'glm-5.3'
     const sessionKey = req.get('x-session-id') ?? null
+    const timer = makeTimer(clock)
     try {
       const body = openaiToAnthropic(req.body, mapToZcodePlan)
       const { response, account } = await gateway.complete(body, { sessionKey })
       logRequest({ model: clientModel, account: account.id, stream: body.stream, status: 200 })
       if (body.stream) {
         res.writeHead(200, { 'content-type': 'text/event-stream; charset=utf-8', 'cache-control': 'no-cache', connection: 'keep-alive' })
+        const write = (chunk) => { timer.markFirstByte(); return res.write(chunk) }
         // 流中途失败（上游中断/客户端断开）时 headers 已发出，只能结束响应。
         try {
-          const usage = await pipeAnthropicToOpenAISSE(response, (s) => res.write(s), clientModel)
-          await recordUsage(account, usage)
+          const u = await pipeAnthropicToOpenAISSE(response, write, clientModel)
+          await recordUsage(account, u)
+          recordAnalytics({ ...usageToRecord(u, clientModel, account.id, timer.finish({ stream: true, outputTokens: u.outputTokens }), true, u) })
         } finally {
           if (!res.writableEnded) res.end()
         }
@@ -130,9 +200,10 @@ export function createApp(deps) {
       }
       const data = await response.json()
       await recordUsage(account, { inputTokens: data.usage?.input_tokens ?? 0, outputTokens: data.usage?.output_tokens ?? 0 })
+      recordAnalytics(usageToRecord(data, clientModel, account.id, timer.finish({ stream: false }), false))
       return res.json(anthropicToOpenAI(data, clientModel))
     } catch (e) {
-      logRequest({ model: clientModel, stream: false, status: e.status ?? 502, error: e.message })
+      recordFailure(clientModel, e, timer, req.body?.stream)
       return fail(res, e, 'openai')
     }
   })
@@ -140,15 +211,18 @@ export function createApp(deps) {
   app.post('/v1/messages', v1Auth, async (req, res) => {
     const clientModel = req.body.model || 'glm-5.3'
     const sessionKey = req.get('x-session-id') ?? null
+    const timer = makeTimer(clock)
     try {
       const body = { ...req.body, model: mapToZcodePlan(req.body.model) }
       const { response, account } = await gateway.complete(body, { sessionKey })
       logRequest({ model: clientModel, account: account.id, stream: body.stream, status: 200 })
       if (body.stream) {
         res.writeHead(200, { 'content-type': 'text/event-stream; charset=utf-8', 'cache-control': 'no-cache', connection: 'keep-alive' })
+        const write = (chunk) => { timer.markFirstByte(); return res.write(chunk) }
         try {
-          const usage = await pipeAnthropicSSEWithUsage(response, (c) => res.write(c))
-          await recordUsage(account, usage)
+          const u = await pipeAnthropicSSEWithUsage(response, write)
+          await recordUsage(account, u)
+          recordAnalytics({ ...usageToRecord(u, clientModel, account.id, timer.finish({ stream: true, outputTokens: u.outputTokens }), true, u) })
         } finally {
           if (!res.writableEnded) res.end()
         }
@@ -156,157 +230,39 @@ export function createApp(deps) {
       }
       const data = await response.json()
       await recordUsage(account, { inputTokens: data.usage?.input_tokens ?? 0, outputTokens: data.usage?.output_tokens ?? 0 })
+      recordAnalytics(usageToRecord(data, clientModel, account.id, timer.finish({ stream: false }), false))
       return res.json(data)
     } catch (e) {
       if (e instanceof ParamPoolEmpty) {
         if (res.headersSent) return res.end()
+        recordFailure(clientModel, e, timer, req.body?.stream)
         return res.status(503).json({ type: 'error', error: { type: 'api_error', message: `captcha param pool empty — 打开 ${farmUrl} 检查农场` } })
       }
-      logRequest({ model: clientModel, stream: false, status: e.status ?? 502, error: e.message })
+      recordFailure(clientModel, e, timer, req.body?.stream)
       return fail(res, e, 'anthropic')
     }
   })
 
-  app.get('/', panelAuth, (req, res) => {
+  app.get('/', auth.middleware(), (req, res) => {
     // res.sendFile() 对缺失文件**不抛异常**，它异步把 ENOENT 交给 next(err)；故 try/catch 包不住它，
-    // 只会在 Task 18 落地 dashboard/index.html 之前回 500。这里先判存在性：文件就绪后读文件，
-    // 未就绪时返回占位页（brief 的既定行为）。
+    // 只会在 dashboard/index.html 缺失时回 500。这里先判存在性：文件就绪后读文件，
+    // 未就绪时返回占位页（既定行为）。
     const file = path.join(__dirname, 'dashboard', 'index.html')
     if (!fs.existsSync(file)) return res.status(200).send('<h1>zcode2api</h1>')
     return res.sendFile(file)
   })
 
-  app.get('/pool/status', panelAuth, (req, res) => {
-    res.json({ accounts: pool.status(), paramPool: paramPool.status(), farmUrl, requests: requestLog.list(50) })
-  })
-
-  /**
-   * async 路由包装器：Express 4 **不会**捕获 async 处理器返回的 rejected promise。
-   * 未包装时处理器内部 `await store.update(...)` 抛错（磁盘满/权限错）会导致：
-   * 请求**永不响应**（挂死到客户端超时）且产生 unhandled rejection
-   * （Node ≥15 默认模式下可能终止进程）。
-   * 这里统一 catch 并回 500 JSON（已发头则只能结束响应）。
-   * 不引入 express-async-errors 之类的新依赖——包装一层即可。
-   */
-  const wrap = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch((err) => {
-    log(`[server] ${req.method} ${req.originalUrl} failed: ${err?.message ?? err}`)
-    if (res.headersSent) return res.end()
-    return res.status(500).json({ error: { message: err?.message ?? 'internal error' } })
-  })
-
-  app.post('/accounts/set', panelAuth, wrap(async (req, res) => {
-    const { id, enabled } = req.body
-    const updated = await store.update(id, { enabled: Boolean(enabled) })
-    if (!updated) return res.status(404).json({ error: { message: 'account not found' } })
-    res.json({ ok: true })
-  }))
-
-  app.post('/accounts/delete', panelAuth, (req, res) => {
-    res.json({ ok: store.delete(req.body.id) })
-  })
-
-  app.post('/accounts/balance/refresh', panelAuth, wrap(async (req, res) => {
-    const results = []
-    for (const acc of store.list().filter((a) => a.type === 'oauth' && a.jwt)) {
-      try {
-        const b = await fetchBalance({ jwt: acc.jwt, fetchImpl: deps.fetchImpl })
-        await store.update(acc.id, { planCache: b })
-        results.push({ id: acc.id, ok: true, balances: b.balances })
-      } catch (e) {
-        results.push({ id: acc.id, ok: false, error: e.message })
-      }
-    }
-    res.json({ results })
-  }))
-
-  /**
-   * 扫描本机 ZCode 客户端登录态并入库（无需重新走 OAuth）。
-   * 只在本机可用（panelAuth 已限制非本机需面板密码），因为读的是本机 HOME 下的凭据文件。
-   */
-  app.post('/accounts/import/local', panelAuth, wrap(async (req, res) => {
-    // 读取函数可注入（deps.readLocalCredentials）：便于测试覆盖各种凭据形态，
-    // 生产走真实的本机凭据文件读取。
-    const read = deps.readLocalCredentials ?? readLocalZcodeCredentials
-    const r = read(deps.localCredOptions ?? {})
-    if (!r.ok) return res.status(400).json({ error: { message: r.message, reason: r.reason } })
-    const imported = []
-    for (const a of r.accounts) {
-      const account = await store.save(newAccountFields({
-        provider: a.provider,
-        type: 'oauth',
-        jwt: a.jwt,
-        accessToken: a.accessToken,
-        refreshToken: a.refreshToken,
-        userInfo: a.userInfo,
-      }))
-      log(`[accounts] imported local ZCode login ${account.id} (${a.provider})`)
-      imported.push(account)
-    }
-    // 顺带把余额取回来，看板导入后立刻能看到套餐余量（失败不影响导入结果）
-    for (const acc of imported) {
-      try {
-        const b = await fetchBalance({ jwt: acc.jwt, fetchImpl: deps.fetchImpl })
-        await store.update(acc.id, { planCache: b })
-      } catch { /* 余额查询失败不阻断导入 */ }
-    }
-    res.json({ ok: true, source: r.source, accounts: imported.map((a) => a.id) })
-  }))
-
-  app.post('/accounts/login/:provider/start', panelAuth, wrap(async (req, res) => {
-    const { provider } = req.params
-    reapExpiredLogins()
-    try {
-      let login
-      if (provider === 'bigmodel') {
-        login = await beginBigModelLogin({ fetchImpl: deps.fetchImpl })
-      } else if (provider === 'zai') {
-        login = await beginZaiLogin({ fetchImpl: deps.fetchImpl })
-      } else {
-        return res.status(404).json({ error: { message: 'unknown provider' } })
-      }
-      const loginId = crypto.randomUUID()
-      logins.set(loginId, { provider, login, at: now() })
-      res.json({ loginId, authorizeUrl: login.authorizeUrl })
-    } catch (e) {
-      res.status(502).json({ error: { message: e.message } })
-    }
-  }))
-
-  app.post('/accounts/login/:provider/poll', panelAuth, wrap(async (req, res) => {
-    reapExpiredLogins()
-    const { loginId } = req.body
-    const entry = logins.get(loginId)
-    if (!entry) return res.status(404).json({ error: { message: 'login not found' } })
-    const winner = await Promise.race([
-      entry.login.result.then((r) => ({ ok: true, r })).catch((e) => ({ ok: false, e })),
-      new Promise((r) => setTimeout(() => r({ pending: true }), 500)),
-    ])
-    if (winner.pending) return res.json({ status: 'pending' })
-    logins.delete(loginId)
-    if (winner.ok) {
-      const info = winner.r.userInfo ?? {}
-      const account = await store.save(newAccountFields({
-        provider: entry.provider,
-        type: 'oauth',
-        jwt: winner.r.token,
-        accessToken: winner.r.accessToken,
-        refreshToken: winner.r.refreshToken,
-        userInfo: info,
-      }))
-      log(`[accounts] + ${account.id} via ${entry.provider} OAuth`)
-      return res.json({ status: 'ready', account })
-    }
-    return res.json({ status: 'failed', error: winner.e.message })
-  }))
-
-  app.post('/accounts/login/:provider/cancel', panelAuth, (req, res) => {
-    const entry = logins.get(req.body.loginId)
-    if (entry) {
-      entry.login.cancel()
-      entry.login.close?.()
-      logins.delete(req.body.loginId)
-    }
-    res.json({ ok: true })
+  registerPanelRoutes(app, {
+    config, store, pool, paramPool, requestLog, usage, auth, settings,
+    farmUrl, log, now,
+    // 农场页自报状态由 farm server 持有，面板要显示它就得显式接进来
+    farmReport: deps.farmReport ?? (() => null),
+    realNow: deps.realNow ?? Date.now,
+    fetchImpl: deps.fetchImpl,
+    loginTtlMs: deps.loginTtlMs,
+    readLocalCredentials: deps.readLocalCredentials,
+    localCredOptions: deps.localCredOptions,
+    dashboardFile: path.join(__dirname, 'dashboard', 'index.html'),
   })
 
   return app
@@ -334,6 +290,19 @@ export async function main() {
   const pool = new AccountPool(store, { minIntervalMs: config.minIntervalMs, cooldown3012Ms: config.cooldown3012Ms })
   const paramPool = new ParamPool({ ttlMs: config.paramTtlMs, maxSize: config.poolSize })
   const requestLog = createRequestLog({})
+  const usage = new UsageStore({ dir: path.join(config.rootDir, 'usage'), log })
+  const panelAuth = new PanelAuth({
+    file: path.join(config.rootDir, 'panel.json'),
+    bootstrapPassword: config.panelPassword,
+    localBypass: config.panelLocalBypass,
+    log,
+  })
+  const settings = new RuntimeSettings({
+    config, pool, paramPool,
+    envFile: path.join(config.rootDir, '.env'),
+    panelFile: path.join(config.rootDir, 'panel.json'),
+    log,
+  })
   const farm = startFarmServer({ paramPool, port: config.farmPort, host: config.host, certDir: config.certDir })
   const gateway = createGateway({
     pool,
@@ -346,15 +315,18 @@ export async function main() {
       apikey: ({ account, body }) => sendBigModel({ apiKey: account.apiKey, body }),
     },
   })
-  const app = createApp({ config, store, pool, paramPool, gateway, requestLog, log, farmUrl: farm.url })
+  const app = createApp({ config, store, pool, paramPool, gateway, requestLog, usage, panelAuth, settings, log, farmUrl: farm.url, farmReport: () => farm.report })
   app.listen(config.port, config.host, () => {
     log(`[zcode2api] API      → http://${config.host}:${config.port}/v1`)
-    log(`[zcode2api] 看板     → http://${config.host}:${config.port}/`)
+    log(`[zcode2api] 管理面板 → http://${config.host}:${config.port}/`)
     log(`[zcode2api] farm 页  → ${farm.url}`)
+    if (panelAuth.passwordSource() === 'none') {
+      log('[panel] 未设置面板密码：仅本机可访问管理面板。如需从其他机器访问，请在本机面板「设置」页设置密码。')
+    }
   })
   if (!config.farmAutoBrowser) {
     log('[farm] 手动模式（FARM_AUTO_BROWSER=0）：未启动自动浏览器。')
-    log(`[farm] 请用你自己的 Chrome 打开 ${farm.url} 并保持标签页——真实浏览器产出的参数才不会被上游判 3012。`)
+    log(`[farm] 请用你自己的 Chrome 打开 ${farm.url} 并保持标签页。`)
   } else {
     const browser = await launchFarmBrowser({ url: farm.url, headless: config.farmHeadless, chromePath: config.chromePath, log })
     if (!browser) {
@@ -366,3 +338,4 @@ export async function main() {
 if (process.argv[1] && import.meta.url === new URL(`file://${process.argv[1]}`).href) {
   main()
 }
+

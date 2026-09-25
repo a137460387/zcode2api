@@ -14,7 +14,8 @@ import { createApp } from '../src/server.js'
 import { AccountStore, newAccountFields } from '../src/auth/store.js'
 import { AccountPool } from '../src/accounts.js'
 import { ParamPool } from '../src/captcha/pool.js'
-import { createRequestLog } from '../src/usage.js'
+import { createRequestLog, UsageStore } from '../src/usage.js'
+import { RuntimeSettings } from '../src/panel/settings.js'
 import { createGateway } from '../src/gateway.js'
 
 let fails = 0
@@ -69,9 +70,20 @@ const senders = {
   apikey: async () => new Response('{}', { status: 200 }),
 }
 const gateway = createGateway({ pool, paramPool, senders, config: { maxRetries: 2, maxPickWaitMs: 5000 }, log: () => {} })
+// rootDir 指向临时目录：createApp 会在其下建 panel.json（面板密码），不能落到仓库里。
+const e2eConfig = {
+  rootDir: dir, apiKey: 'sk-e2e', panelPassword: '', port: 0, poolDir: dir,
+  maxRetries: 2, panelLocalBypass: true, minIntervalMs: 0, cooldown3012Ms: 1800000,
+  paramTtlMs: 480000, poolSize: 6,
+}
+const usage = new UsageStore({ dir: path.join(dir, 'usage'), log: () => {} })
+const settings = new RuntimeSettings({
+  config: e2eConfig, pool, paramPool,
+  envFile: path.join(dir, '.env'), panelFile: path.join(dir, 'panel.json'), log: () => {},
+})
 const app = createApp({
-  config: { apiKey: 'sk-e2e', panelPassword: '', port: 0 },
-  store, pool, paramPool, gateway, requestLog: createRequestLog({}), log: () => {},
+  config: e2eConfig,
+  store, pool, paramPool, gateway, requestLog: createRequestLog({}), usage, settings, log: () => {},
   farmUrl: 'http://127.0.0.1:28631/farm',
 })
 const server = app.listen(0, '127.0.0.1')
@@ -127,6 +139,56 @@ const H = { authorization: 'Bearer sk-e2e', 'content-type': 'application/json' }
   const st = ps.accounts[0].stats
   ck('usage 已记账', st.requests >= 4 && st.inputTokens > 0, `requests=${st.requests} in=${st.inputTokens} out=${st.outputTokens}`)
   ck('上游被调用 4 次', upstreamCalls === 4, `calls=${upstreamCalls}`)
+}
+
+// ---- 7. 管理面板 API（真实 HTTP，非桩）----
+{
+  const st = await fetch(`${base}/panel/status`).then((r) => r.json())
+  ck('/panel/status 免鉴权可读', st.localBypass === true && st.authenticated === true, JSON.stringify(st))
+
+  const acc = await fetch(`${base}/accounts`).then((r) => r.json())
+  ck('/accounts 返回脱敏账号', acc.accounts?.length === 1 && acc.accounts[0].hasJwt === true && acc.accounts[0].jwt === undefined,
+    `len=${acc.accounts?.length} hasJwt=${acc.accounts?.[0]?.hasJwt}`)
+  ck('/accounts 不含凭据原文', !JSON.stringify(acc).includes('"JWT"'), '响应里不得出现账号 jwt')
+
+  const an = await fetch(`${base}/usage/analytics`).then((r) => r.json())
+  ck('/usage/analytics 已聚合本次请求', an.summary?.all_time?.requests === 4 && an.summary.all_time.prompt_tokens === 28,
+    `requests=${an.summary?.all_time?.requests} prompt=${an.summary?.all_time?.prompt_tokens}`)
+  ck('/usage/analytics 统计到流式与非流式', an.summary?.all_time?.stream_requests === 2, `stream=${an.summary?.all_time?.stream_requests}`)
+  ck('/usage/analytics 有首字延迟与速度', an.summary?.all_time?.ttft_ms_avg !== null && an.summary?.all_time?.speed_avg !== null,
+    `ttft=${an.summary?.all_time?.ttft_ms_avg} speed=${an.summary?.all_time?.speed_avg}`)
+
+  const rec = await fetch(`${base}/usage/recent?limit=10`).then((r) => r.json())
+  ck('/usage/recent 有条目', rec.rows?.length === 4 && rec.total === 4, `rows=${rec.rows?.length} total=${rec.total}`)
+
+  const set = await fetch(`${base}/settings`).then((r) => r.json())
+  ck('/settings 不回密钥原文', set.apiKeySet === true && !JSON.stringify(set).includes('sk-e2e'), `masked=${set.apiKeyMasked}`)
+
+  const build = await fetch(`${base}/build`).then((r) => r.json())
+  ck('/build 返回构建号', typeof build.build === 'string' && build.build.length > 0, build.build)
+
+  const add = await fetch(`${base}/accounts/add-apikey`, {
+    method: 'POST', headers: H, body: JSON.stringify({ name: 'e2e key', apiKey: 'sk-e2e-apikey-123456' }),
+  })
+  const addBody = await add.json()
+  ck('/accounts/add-apikey 建号成功', add.status === 200 && addBody.id?.includes('apikey'), JSON.stringify(addBody))
+  const after = await fetch(`${base}/accounts`).then((r) => r.json())
+  ck('新账号出现在列表且不含 key 原文', after.accounts.length === 2 && !JSON.stringify(after).includes('sk-e2e-apikey-123456'), `len=${after.accounts.length}`)
+
+  const dup = await fetch(`${base}/accounts/add-apikey`, {
+    method: 'POST', headers: H, body: JSON.stringify({ name: 'e2e key', apiKey: 'sk-e2e-apikey-123456' }),
+  })
+  ck('重复添加同 id → 409（不覆盖既有账号）', dup.status === 409, `status=${dup.status}`)
+
+  const badKey = await fetch(`${base}/accounts/add-apikey`, { method: 'POST', headers: H, body: JSON.stringify({ apiKey: 'short' }) })
+  ck('过短 key → 400', badKey.status === 400, `status=${badKey.status}`)
+
+  const allOff = await fetch(`${base}/accounts/set-all`, { method: 'POST', headers: H, body: JSON.stringify({ enabled: false }) }).then((r) => r.json())
+  const offList = await fetch(`${base}/accounts`).then((r) => r.json())
+  ck('/accounts/set-all 批量停用', allOff.changed === 2 && offList.accounts.every((a) => !a.enabled), `changed=${allOff.changed}`)
+
+  const del = await fetch(`${base}/accounts/delete`, { method: 'POST', headers: H, body: JSON.stringify({ id: addBody.id }) }).then((r) => r.json())
+  ck('/accounts/delete 删除成功', del.ok === true, JSON.stringify(del))
 }
 
 server.close()

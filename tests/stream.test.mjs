@@ -48,7 +48,7 @@ describe('pipeAnthropicToOpenAISSE', () => {
     expect(last.choices[0].finish_reason).toBe('stop')
     expect(last.usage.total_tokens).toBe(15)
     expect(written[written.length - 1]).toBe('data: [DONE]\n\n')
-    expect(usage).toEqual({ inputTokens: 10, outputTokens: 5 })
+    expect(usage).toEqual({ inputTokens: 10, outputTokens: 5, cacheReadTokens: 0, cacheCreationTokens: 0 })
   })
 
   it('emits tool_calls deltas for a single tool call', async () => {
@@ -237,7 +237,7 @@ describe('pipeAnthropicSSEWithUsage', () => {
     const written = []
     const usage = await pipeAnthropicSSEWithUsage(upstream, (b) => written.push(Buffer.from(b).toString()))
     expect(written.join('')).toContain('text_delta')
-    expect(usage).toEqual({ inputTokens: 3, outputTokens: 4 })
+    expect(usage).toEqual({ inputTokens: 3, outputTokens: 4, cacheReadTokens: 0, cacheCreationTokens: 0 })
   })
 })
 
@@ -250,7 +250,7 @@ describe('tapAnthropicSSE', () => {
     const seen = []
     const usage = await tapAnthropicSSE(upstream, (ev) => seen.push(ev))
     expect(seen.length).toBe(2)
-    expect(usage).toEqual({ inputTokens: 3, outputTokens: 4 })
+    expect(usage).toEqual({ inputTokens: 3, outputTokens: 4, cacheReadTokens: 0, cacheCreationTokens: 0 })
   })
 })
 
@@ -288,7 +288,7 @@ describe('SSE 分帧健壮性（真实报文 × 不规则切块）', () => {
     }
     // 内容正确性（非仅"两次一致"）
     const { objs, usage } = await parse(3)
-    expect(usage).toEqual({ inputTokens: 11, outputTokens: 7 })
+    expect(usage).toEqual({ inputTokens: 11, outputTokens: 7, cacheReadTokens: 0, cacheCreationTokens: 0 })
     expect(objs.some((o) => o.choices?.[0]?.delta?.reasoning_content === '思考中')).toBe(true)
     expect(objs.some((o) => o.choices?.[0]?.delta?.content === '你好世界')).toBe(true)
     const args = objs.filter((o) => o.choices?.[0]?.delta?.tool_calls)
@@ -310,5 +310,63 @@ describe('SSE 分帧健壮性（真实报文 × 不规则切块）', () => {
     const seen = []
     await tapAnthropicSSE(sseResponse(EVENTS, { chunkSize: 1 }), (ev) => seen.push(ev))
     expect(seen.length).toBe(EVENTS.length)
+  })
+})
+
+/**
+ * 真实上游的流式 usage 形状（抓包实测）：
+ *   message_start: {"input_tokens":0,"output_tokens":0}
+ *   message_delta: {"input_tokens":1703,"output_tokens":3,"cache_read_input_tokens":0,...}
+ *
+ * **输入 token 只在最后那帧 message_delta 里才有**。旧实现只读 message_start，
+ * 于是每个流式请求都被记成 0 输入 token——面板用量少算一大截，且发给 OpenAI 客户端的
+ * usage 块里 prompt_tokens 恒为 0（对外可见的错误数据）。本组用例锁住这个契约。
+ */
+describe('真实上游流式 usage：输入 token 在 message_delta 里', () => {
+  const realFrames = () => [
+    'event: message_start\ndata: {"type":"message_start","message":{"usage":{"input_tokens":0,"output_tokens":0}}}\n\n',
+    'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"好的"}}\n\n',
+    'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input_tokens":1703,"output_tokens":3,"cache_read_input_tokens":120,"cache_creation_input_tokens":7}}\n\n',
+  ]
+
+  it('OpenAI 通道：解析器带回真实的 inputTokens 与缓存字段', async () => {
+    const out = []
+    const usage = await pipeAnthropicToOpenAISSE(sseResponse(realFrames()), (s) => out.push(s), 'glm-5.3')
+    expect(usage).toEqual({ inputTokens: 1703, outputTokens: 3, cacheReadTokens: 120, cacheCreationTokens: 7 })
+  })
+
+  it('OpenAI 通道：发给客户端的 usage 块里 prompt_tokens 不再是 0，且带 cached_tokens', async () => {
+    const out = []
+    await pipeAnthropicToOpenAISSE(sseResponse(realFrames()), (s) => out.push(s), 'glm-5.3')
+    const frames = out.join('').split('\n').filter((l) => l.startsWith('data:') && !l.includes('[DONE]'))
+      .map((l) => JSON.parse(l.slice(5)))
+    const withUsage = frames.find((f) => f.usage)
+    expect(withUsage.usage.prompt_tokens).toBe(1703)
+    expect(withUsage.usage.completion_tokens).toBe(3)
+    expect(withUsage.usage.total_tokens).toBe(1706)
+    expect(withUsage.usage.prompt_tokens_details.cached_tokens).toBe(120)
+  })
+
+  it('Anthropic 通道：透传解析器同样拿到真实 inputTokens', async () => {
+    const usage = await pipeAnthropicSSEWithUsage(sseResponse(realFrames()), () => {})
+    expect(usage.inputTokens).toBe(1703)
+    expect(usage.cacheReadTokens).toBe(120)
+  })
+
+  it('message_start 有值、message_delta 也有值时以后者为准（更晚更准）', async () => {
+    const usage = await pipeAnthropicSSEWithUsage(sseResponse([
+      { type: 'message_start', message: { usage: { input_tokens: 5 } } },
+      { type: 'message_delta', delta: { stop_reason: 'end_turn' }, usage: { input_tokens: 99, output_tokens: 2 } },
+    ]), () => {})
+    expect(usage.inputTokens).toBe(99)
+  })
+
+  it('message_delta 不带 input_tokens 时保留 message_start 的值', async () => {
+    const usage = await pipeAnthropicSSEWithUsage(sseResponse([
+      { type: 'message_start', message: { usage: { input_tokens: 42 } } },
+      { type: 'message_delta', delta: { stop_reason: 'end_turn' }, usage: { output_tokens: 2 } },
+    ]), () => {})
+    expect(usage.inputTokens).toBe(42)
+    expect(usage.outputTokens).toBe(2)
   })
 })

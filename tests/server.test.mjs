@@ -9,7 +9,8 @@ import { GatewayError } from '../src/gateway.js'
 import { AccountStore, newAccountFields } from '../src/auth/store.js'
 import { AccountPool } from '../src/accounts.js'
 import { ParamPool } from '../src/captcha/pool.js'
-import { createRequestLog } from '../src/usage.js'
+import { createRequestLog, UsageStore } from '../src/usage.js'
+import { RuntimeSettings } from '../src/panel/settings.js'
 
 // 把若干 SSE 文本帧包成一个带 body 流的假 fetch Response（网关返回的 200 上游响应形态）
 function sseResponse(frames) {
@@ -28,10 +29,20 @@ function sseResponse(frames) {
 function buildDeps(over = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'z2a-srv-'))
   const store = new AccountStore(dir)
-  const config = { apiKey: 'sk-test', panelPassword: '', port: 0, farmUrl: 'http://127.0.0.1:28631/farm', maxRetries: 2 }
+  // rootDir 必须指向临时目录：createApp 会在它下面建 panel.json（面板密码），
+  // 不给的话会落到 process.cwd()——测试往仓库里写文件是不可接受的副作用。
+  const config = {
+    rootDir: dir, apiKey: 'sk-test', panelPassword: '', port: 0, poolDir: dir,
+    farmUrl: 'http://127.0.0.1:28631/farm', maxRetries: 2, panelLocalBypass: true,
+    minIntervalMs: 2000, cooldown3012Ms: 30 * 60_000, paramTtlMs: 480_000, poolSize: 6,
+  }
   const pool = new AccountPool(store, { now: () => Date.now() })
   const paramPool = new ParamPool({})
   const requestLog = createRequestLog({})
+  const usage = new UsageStore({ dir: path.join(dir, 'usage'), log: () => {} })
+  const settings = new RuntimeSettings({
+    config, pool, paramPool, envFile: path.join(dir, '.env'), panelFile: path.join(dir, 'panel.json'), log: () => {},
+  })
   const defaultResponse = {
     status: 200,
     json: async () => ({
@@ -48,7 +59,7 @@ function buildDeps(over = {}) {
   // 必须透传给 createApp —— 早期只展开 over.appOverrides，导致 buildDeps({loginTtlMs}) 被静默丢弃，
   // 回收测试因此用着 10 分钟的真实 TTL，永远看不到回收。
   const { complete, fetchImpl, appOverrides, ...rest } = over
-  return { config, store, pool, paramPool, requestLog, gateway, fetchImpl, log: () => {}, ...rest, ...appOverrides }
+  return { config, store, pool, paramPool, requestLog, usage, settings, gateway, fetchImpl, log: () => {}, ...rest, ...appOverrides }
 }
 
 describe('auth & misc routes', () => {
@@ -103,7 +114,8 @@ describe('account login & management', () => {
       }
       return { json: async () => ({}) }
     }
-    const app = createApp(buildDeps({ fetchImpl }))
+    const deps = buildDeps({ fetchImpl })
+    const app = createApp(deps)
     const start = await request(app).post('/accounts/login/bigmodel/start')
     expect(start.status).toBe(200)
     expect(start.body.authorizeUrl).toContain('bigmodel.cn/login')
@@ -112,8 +124,13 @@ describe('account login & management', () => {
     await fetch(`${redirect}?state=${url.searchParams.get('state')}&authCode=AC`) // 触发回调
     const poll = await request(app).post('/accounts/login/bigmodel/poll').send({ loginId: start.body.loginId })
     expect(poll.body.status).toBe('ready')
-    expect(poll.body.account.jwt).toBe('ZJWT')
     expect(poll.body.account.id).toMatch(/^bigmodel:/)
+    // 管理面**不回凭据原文**：面板只需要"有没有凭据 + 掩码"。jwt 一旦进过浏览器/日志/截图
+    // 就等于多了一处泄露面。凭据本体仍在服务端账号文件里（下面直接读盘核对）。
+    expect(poll.body.account.jwt).toBeUndefined()
+    expect(poll.body.account.hasJwt).toBe(true)
+    expect(poll.body.account.secretMask).toMatch(/…/)
+    expect(deps.store.get(poll.body.account.id).jwt).toBe('ZJWT')
   })
 
   it('set/delete/pool-status work', async () => {
@@ -498,5 +515,57 @@ describe('导入本机 ZCode 登录态', () => {
     expect(r.status).toBe(400)
     expect(r.body.error.reason).toBe('not_found')
     expect(typeof r.body.error.message).toBe('string')
+  })
+})
+
+// 失败请求的用量记录：面板要能回答"哪个账号在失败""失败的这次是不是流式"。
+// 真实上游实测踩到过两个缺陷：失败全记成 (unattributed)、流式失败被记成非流式。
+describe('失败请求的用量归属', () => {
+  it('上游拒绝时按 accountId 归属账号，并记录真实的 stream 模式', async () => {
+    const deps = buildDeps()
+    await deps.store.save(newAccountFields({ provider: 'bigmodel', type: 'oauth', jwt: 'j', userInfo: { user_id: '7' } }))
+    const gateway = {
+      complete: async () => {
+        const err = new GatewayError({ status: 429, code: 3009, message: 'upstream HTTP 429 code=3009', accountId: 'bigmodel:7' })
+        throw err
+      },
+    }
+    const app = createApp({ ...deps, gateway })
+    const r = await request(app)
+      .post('/v1/messages')
+      .set('authorization', 'Bearer sk-test')
+      .send({ model: 'glm-5.3', stream: true, max_tokens: 8, messages: [{ role: 'user', content: 'hi' }] })
+    expect(r.status).toBe(429)
+    await deps.usage.flush()
+    const rec = deps.usage.recent(1)[0]
+    expect(rec.account).toBe('bigmodel:7')
+    expect(rec.stream).toBe(true)          // 流式请求失败仍是流式，不能记成非流式
+    expect(rec.status).toBe(429)
+    expect(rec.error).toContain('3009')
+  })
+
+  it('非流式失败记为非流式', async () => {
+    const deps = buildDeps()
+    const gateway = { complete: async () => { throw new GatewayError({ status: 502, message: 'boom' }) } }
+    const app = createApp({ ...deps, gateway })
+    await request(app).post('/v1/chat/completions').set('authorization', 'Bearer sk-test')
+      .send({ model: 'glm-5.3', messages: [{ role: 'user', content: 'hi' }] })
+    await deps.usage.flush()
+    const rec = deps.usage.recent(1)[0]
+    expect(rec.stream).toBe(false)
+    expect(rec.account).toBeNull() // 池层错误没有账号可归属
+  })
+
+  it('失败也计入聚合的 errors，成功率为 0', async () => {
+    const deps = buildDeps()
+    const gateway = { complete: async () => { throw new GatewayError({ status: 502, message: 'boom' }) } }
+    const app = createApp({ ...deps, gateway })
+    await request(app).post('/v1/messages').set('authorization', 'Bearer sk-test')
+      .send({ model: 'glm-5.3', max_tokens: 8, messages: [{ role: 'user', content: 'hi' }] })
+    await deps.usage.flush()
+    const a = deps.usage.analytics().summary.all_time
+    expect(a.requests).toBe(1)
+    expect(a.errors).toBe(1)
+    expect(a.success_rate_pct).toBe(0)
   })
 })

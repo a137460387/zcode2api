@@ -332,6 +332,27 @@ describe('gateway.complete', () => {
     expect(e.name).toBe('GatewayError')
     expect(e.status).toBe(503)
     expect(e.hint).toBeTruthy()
+    // 池层错误（无号可用）没有账号可归属
+    expect(e.accountId).toBeNull()
+  })
+
+  // 失败必须能归属到具体账号：面板要回答"是哪个号在吃 429/3012"。
+  // 不带 accountId 时管理面只能把它记成 (unattributed)——真实上游实测踩到过这一点。
+  it('失败带上 accountId（上游拒绝 / 网络异常 / 客户端错误三条路径）', async () => {
+    const a1 = acc('a1')
+    const pool = { pick: () => ({ account: a1, waitMs: 0 }), markSuccess: async () => {}, markError: async () => {} }
+    const errResp = (status, code) => async () => ({ status, clone() { return this }, text: async () => JSON.stringify({ code }) })
+    const gw = (senders) => createGateway({ pool, paramPool: { take: async () => 'P' }, senders, config: { maxRetries: 0 } })
+
+    const e1 = await gw({ oauth: errResp(429, 3009) }).complete({}, {}).catch((x) => x)
+    expect(e1.code).toBe(3009)
+    expect(e1.accountId).toBe('a1')
+
+    const e2 = await gw({ oauth: async () => { throw new Error('ECONNRESET') } }).complete({}, {}).catch((x) => x)
+    expect(e2.accountId).toBe('a1')
+
+    const e3 = await gw({ oauth: errResp(400, 1001) }).complete({}, {}).catch((x) => x)
+    expect(e3.accountId).toBe('a1')
   })
 
   it('uses a fresh random sessionId per call by default', async () => {

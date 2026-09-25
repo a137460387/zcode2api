@@ -51,3 +51,51 @@ describe('farm server', () => {
     expect(JSON.parse(r.text)).toHaveProperty('pool')
   })
 })
+
+// 农场页自报状态：无头模式下用户看不到农场页，卡住时必须让面板能说出原因。
+// 实测触发过：一次无超时的 fetch 挂死 → verifying 永久为 true → 农场静默停摆 4 分钟。
+describe('农场页自报状态（/farm-report）', () => {
+  const getJson = async (path) => JSON.parse((await get(path)).text)
+
+  it('上报后 /param-status 带出 farmReport', async () => {
+    const r = await post('/farm-report', { total: 3, pushed: 3, fails: 1, backoffMs: 8000, stuck: false, lastLine: '[10:00:00] ok' })
+    expect(r.status).toBe(200)
+    const st = await getJson('/param-status')
+    expect(st.farmReport).toMatchObject({ total: 3, pushed: 3, fails: 1, backoffMs: 8000, stuck: false, lastLine: '[10:00:00] ok' })
+    expect(typeof st.farmReport.at).toBe('number')
+  })
+
+  it('坏 JSON 不让接口报错，也不污染既有上报', async () => {
+    await post('/farm-report', { total: 1, lastLine: 'ok' })
+    const bad = await new Promise((resolve, reject) => {
+      const req = http.request(base + '/farm-report', { method: 'POST' }, (res) => { res.resume(); res.on('end', () => resolve(res.statusCode)) })
+      req.on('error', reject)
+      req.end('not json at all')
+    })
+    expect(bad).toBe(200)
+    expect((await getJson('/param-status')).farmReport.total).toBe(1)
+  })
+
+  it('字段类型异常时归零，不写入 NaN；超长日志被截断', async () => {
+    await post('/farm-report', { total: 'abc', pushed: -5, fails: null, backoffMs: 'x', stuck: 'yes', lastLine: 'y'.repeat(1000) })
+    const r = (await getJson('/param-status')).farmReport
+    expect(r.total).toBe(0)
+    expect(r.pushed).toBe(0)
+    expect(r.stuck).toBe(false)
+    expect(r.lastLine.length).toBe(300) // 截断，避免面板被超长串撑爆
+  })
+
+  it('从未上报时 farmReport 为 null（面板据此显示"农场页未上报"）', async () => {
+    // 用独立实例，避免受本文件其他用例已上报的影响
+    const solo = startFarmServer({ paramPool: new ParamPool({}), port: 0, host: '127.0.0.1', certDir: './nonexistent-certs' })
+    const soloBase = await new Promise((resolve) =>
+      solo.server.listening
+        ? resolve(`http://127.0.0.1:${solo.server.address().port}`)
+        : solo.server.once('listening', () => resolve(`http://127.0.0.1:${solo.server.address().port}`)),
+    )
+    const st = await fetch(`${soloBase}/param-status`).then((x) => x.json())
+    expect(st.farmReport).toBeNull()
+    expect(st.pool).toBe(0)
+    await solo.close()
+  })
+})

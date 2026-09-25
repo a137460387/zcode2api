@@ -30,7 +30,14 @@ export function loadConfig({ rootDir = process.cwd(), env = process.env } = {}) 
     host: env.HOST || '127.0.0.1',
     farmPort: num(env.FARM_PORT, 28631, 1, 65535),
     apiKey: env.API_KEY || '',
+    // 引导密码：仅在还没在面板里改过密码（没有 panel.json）时生效。
     panelPassword: env.PANEL_PASSWORD || '',
+    /**
+     * 本机是否免密进管理面板。默认开（本机工具的使用直觉）。
+     * 设 0 后本机也要带面板密码/token——面板挂在反向代理后面时，
+     * 代理回源地址是本机，开着放行等于任何人都能进管理面。
+     */
+    panelLocalBypass: bool(env.PANEL_LOCAL_BYPASS, true),
     poolDir: env.POOL_DIR || path.join(rootDir, 'accounts'),
     certDir: env.CERT_DIR || path.join(rootDir, 'certs'),
     farmHeadless: bool(env.FARM_HEADLESS, true),

@@ -41,10 +41,32 @@ async function* sseEvents(res) {
 
 const FINISH = { end_turn: 'stop', stop_sequence: 'stop', max_tokens: 'length', tool_use: 'tool_calls' }
 
+const newUsage = () => ({ inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheCreationTokens: 0 })
+
+/**
+ * 从一帧事件里吸收 usage。
+ *
+ * **关键（真实上游实测）**：流式响应里 `message_start` 的 `input_tokens` 是 **0**，
+ * 真正的输入 token 数在最后那帧 `message_delta` 里才给出
+ * （实测 `message_start: {"input_tokens":0,"output_tokens":0}` →
+ *  `message_delta: {"input_tokens":1703,"output_tokens":3,"cache_read_input_tokens":0}`）。
+ * 只读 `message_start` 会让每个流式请求都记成 0 输入 token：面板用量少算一大截，
+ * 且发给 OpenAI 客户端的 usage 块里 `prompt_tokens` 恒为 0——那是**对外可见的错误数据**。
+ * 故两处都要读，且以 `message_delta` 的值优先（它更晚、更准）。
+ */
+function absorbUsage(usage, ev) {
+  const u = ev.type === 'message_start' ? ev.message?.usage : ev.type === 'message_delta' ? ev.usage : null
+  if (!u) return
+  if (u.input_tokens != null) usage.inputTokens = u.input_tokens
+  if (u.output_tokens != null) usage.outputTokens = u.output_tokens
+  if (u.cache_read_input_tokens != null) usage.cacheReadTokens = u.cache_read_input_tokens
+  if (u.cache_creation_input_tokens != null) usage.cacheCreationTokens = u.cache_creation_input_tokens
+}
+
 export async function pipeAnthropicToOpenAISSE(res, write, model) {
   const id = 'chatcmpl-' + uuid()
   const created = Math.floor(Date.now() / 1000)
-  let usage = { inputTokens: 0, outputTokens: 0 }
+  const usage = newUsage()
   // 工具调用累积器：content_block index → { openaiIndex, started }
   const toolIndexByBlock = new Map()
   let nextToolIndex = 0
@@ -61,13 +83,24 @@ export async function pipeAnthropicToOpenAISSE(res, write, model) {
     send({
       id, object: 'chat.completion.chunk', created, model,
       choices: [{ index: 0, delta: {}, finish_reason: fr }],
-      usage: { prompt_tokens: usage.inputTokens, completion_tokens: usage.outputTokens, total_tokens: usage.inputTokens + usage.outputTokens },
+      usage: {
+        prompt_tokens: usage.inputTokens,
+        completion_tokens: usage.outputTokens,
+        total_tokens: usage.inputTokens + usage.outputTokens,
+        // OpenAI 用 prompt_tokens_details.cached_tokens 表达"命中缓存的输入"。
+        // 上游给的是 Anthropic 口径的 cache_read_input_tokens，这里翻译过去，
+        // 否则客户端看到的缓存命中永远是 0。
+        prompt_tokens_details: { cached_tokens: usage.cacheReadTokens },
+      },
     })
   }
   try {
     for await (const ev of sseEvents(res)) {
-      if (ev.type === 'message_start') {
-        usage.inputTokens = ev.message?.usage?.input_tokens ?? usage.inputTokens
+      if (ev.type === 'message_start' || ev.type === 'message_delta') {
+        // 先吸收 usage 再收尾：message_delta 里才有真正的 input_tokens，
+        // 顺序反了就会把 0 写进发给客户端的 usage 块。
+        absorbUsage(usage, ev)
+        if (ev.type === 'message_delta') finish(FINISH[ev.delta?.stop_reason] || 'stop')
       } else if (ev.type === 'content_block_start') {
         const cb = ev.content_block
         if (cb?.type === 'tool_use') {
@@ -102,9 +135,6 @@ export async function pipeAnthropicToOpenAISSE(res, write, model) {
             }],
           })
         }
-      } else if (ev.type === 'message_delta') {
-        if (ev.usage) usage.outputTokens = ev.usage.output_tokens ?? usage.outputTokens
-        finish(FINISH[ev.delta?.stop_reason] || 'stop')
       } else if (ev.type === 'error') {
         /**
          * 上游以 `error` 事件告错（如 overloaded_error）而不是断流：旧实现整支静默吞掉，
@@ -140,11 +170,7 @@ export async function pipeRaw(res, write) {
 export async function pipeAnthropicSSEWithUsage(res, write) {
   const reader = res.body.getReader()
   const state = makeDecoderState()
-  let usage = { inputTokens: 0, outputTokens: 0 }
-  const absorb = (ev) => {
-    if (ev.type === 'message_start') usage.inputTokens = ev.message?.usage?.input_tokens ?? usage.inputTokens
-    if (ev.type === 'message_delta') usage.outputTokens = ev.usage?.output_tokens ?? usage.outputTokens
-  }
+  const usage = newUsage()
   while (true) {
     const { done, value } = await reader.read()
     if (done) break
@@ -152,22 +178,21 @@ export async function pipeAnthropicSSEWithUsage(res, write) {
     state.buf += state.decoder.decode(value, { stream: true })
     const out = []
     drainEvents(state, out)
-    for (const ev of out) absorb(ev)
+    for (const ev of out) absorbUsage(usage, ev)
   }
   if (state.buf.trim()) {
     state.buf += '\n'
     const out = []
     drainEvents(state, out)
-    for (const ev of out) absorb(ev)
+    for (const ev of out) absorbUsage(usage, ev)
   }
   return usage
 }
 
 export async function tapAnthropicSSE(res, onEvent) {
-  const usage = { inputTokens: 0, outputTokens: 0 }
+  const usage = newUsage()
   for await (const ev of sseEvents(res)) {
-    if (ev.type === 'message_start') usage.inputTokens = ev.message?.usage?.input_tokens ?? usage.inputTokens
-    if (ev.type === 'message_delta') usage.outputTokens = ev.usage?.output_tokens ?? usage.outputTokens
+    absorbUsage(usage, ev)
     onEvent(ev)
   }
   return usage

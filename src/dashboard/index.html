@@ -1,251 +1,1053 @@
 <!DOCTYPE html>
-<html lang="zh">
+<html lang="zh-CN">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>zcode2api 看板</title>
+<title>zcode2api 网关管理</title>
 <style>
- body{font-family:system-ui;max-width:960px;margin:24px auto;padding:0 16px;background:#fafafa;color:#222}
- .card{background:#fff;border:1px solid #e5e5e5;border-radius:12px;padding:16px;margin-bottom:16px}
- .row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
- .tag{font-size:12px;padding:2px 8px;border-radius:999px;background:#eef}
- .bad{color:#dc2626}.warn{color:#d97706}.ok{color:#16a34a}
- button{padding:6px 12px;border:1px solid #ccc;border-radius:8px;background:#fff;cursor:pointer}
- table{width:100%;border-collapse:collapse;font-size:13px}
- td,th{border-bottom:1px solid #eee;padding:6px 4px;text-align:left}
- .bar{height:6px;background:#eee;border-radius:3px;overflow:hidden;margin:4px 0}
- .bar>i{display:block;height:100%;background:#16a34a}
- dialog{border:1px solid #ccc;border-radius:12px;max-width:520px}
+/* 深色为默认（管理面板多在终端旁长时间开着），浅色由 body.light 覆盖。
+   默认深色还避免了"先渲染浅色再被脚本切深色"的闪白。 */
+:root{
+  --bg:#0f1117; --panel:#171a23; --panel2:#1e222d; --panel3:#262b38;
+  --line:#2a2f3d; --line-hi:#3a4152;
+  --fg:#e6e9f0; --dim:#8b93a7; --dim2:#6b7280;
+  --accent:#4f8cff; --accent-soft:rgba(79,140,255,.14);
+  --ok:#22c55e; --ok-soft:rgba(34,197,94,.12);
+  --warn:#f59e0b; --warn-soft:rgba(245,158,11,.12);
+  --bad:#ef4444; --bad-soft:rgba(239,68,68,.12);
+  --think:#a855f7;
+  --shadow:0 1px 3px 0 rgba(0,0,0,.45),0 1px 2px -1px rgba(0,0,0,.3);
+  --shadow-lg:0 10px 30px rgba(0,0,0,.5);
+  --hdr:rgba(15,17,23,.92);
+}
+body.light{
+  --bg:#f8fafc; --panel:#ffffff; --panel2:#f1f5f9; --panel3:#e2e8f0;
+  --line:#e2e8f0; --line-hi:#cbd5e1;
+  --fg:#0f172a; --dim:#64748b; --dim2:#94a3b8;
+  --accent:#2563eb; --accent-soft:rgba(37,99,235,.08);
+  --ok:#16a34a; --ok-soft:rgba(22,163,74,.1);
+  --warn:#d97706; --warn-soft:rgba(217,119,6,.1);
+  --bad:#dc2626; --bad-soft:rgba(220,38,38,.08);
+  --think:#7c3aed;
+  --shadow:0 1px 3px 0 rgba(15,23,42,.06),0 1px 2px -1px rgba(15,23,42,.04);
+  --shadow-lg:0 10px 30px rgba(15,23,42,.12);
+  --hdr:rgba(255,255,255,.94);
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);
+  font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"PingFang SC","Microsoft YaHei",sans-serif;
+  -webkit-font-smoothing:antialiased}
+.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+a{color:var(--accent)}
+header{position:sticky;top:0;z-index:20;display:flex;align-items:center;justify-content:space-between;
+  gap:16px;flex-wrap:wrap;padding:14px 22px;border-bottom:1px solid var(--line);background:var(--hdr);
+  backdrop-filter:blur(10px)}
+.hd-left{display:flex;align-items:center;gap:20px;flex-wrap:wrap}
+h1{margin:0;font-size:16px;font-weight:700;letter-spacing:-.2px;display:flex;align-items:center}
+h1 em{font-style:normal;color:var(--dim);font-weight:400;font-size:12px;margin-left:8px}
+.dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--ok);margin-right:8px;
+  box-shadow:0 0 0 2px var(--ok-soft);flex:none}
+.dot.err{background:var(--bad);box-shadow:0 0 0 2px var(--bad-soft)}
+nav{display:flex;gap:4px}
+nav button{background:none;border:1px solid transparent;color:var(--dim);padding:6px 12px;border-radius:8px;
+  font:inherit;font-size:13px;cursor:pointer}
+nav button:hover{color:var(--fg);background:var(--panel2)}
+nav button.active{color:var(--fg);background:var(--panel2);border-color:var(--line);font-weight:600}
+.hd-right{display:flex;align-items:center;gap:12px}
+.meta{font-size:12px;color:var(--dim);text-align:right;line-height:1.6}
+.meta b{color:var(--fg)}
+main{max-width:1320px;margin:0 auto;padding:22px 22px 70px}
+section{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:16px 18px;
+  margin-bottom:16px;box-shadow:var(--shadow)}
+section>h2{margin:0 0 12px;font-size:14px;font-weight:600;display:flex;align-items:center;gap:8px}
+section>h2 em{font-style:normal;color:var(--dim);font-weight:400;font-size:12px}
+.hint{font-size:12px;color:var(--dim);line-height:1.7}
+button{font:inherit;cursor:pointer}
+.btn{background:var(--panel2);border:1px solid var(--line);color:var(--fg);padding:6px 12px;
+  border-radius:8px;font-size:13px}
+.btn:hover{border-color:var(--line-hi);background:var(--panel3)}
+.btn:disabled{opacity:.5;cursor:not-allowed}
+.btn.primary{background:var(--accent);border-color:var(--accent);color:#fff}
+.btn.primary:hover{filter:brightness(1.1)}
+.btn.danger{color:var(--bad);border-color:var(--bad-soft)}
+.btn.danger:hover{background:var(--bad-soft);border-color:var(--bad)}
+.btn.mini{padding:3px 8px;font-size:12px;border-radius:6px}
+.toolbar{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:12px}
+.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:12px;margin-bottom:16px}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:13px 16px;box-shadow:var(--shadow)}
+.card .k{font-size:12px;color:var(--dim);margin-bottom:6px}
+.card .v{font-size:22px;font-weight:700;font-variant-numeric:tabular-nums;letter-spacing:-.4px}
+.card .v small{font-size:12px;font-weight:400;color:var(--dim);letter-spacing:0}
+.card .s{font-size:11px;color:var(--dim);margin-top:5px;line-height:1.5}
+.card.accent .v{color:var(--accent)} .card.ok .v{color:var(--ok)}
+.card.warn .v{color:var(--warn)} .card.bad .v{color:var(--bad)}
+table{width:100%;border-collapse:collapse;font-size:13px}
+th,td{text-align:left;padding:8px 8px;border-bottom:1px solid var(--line);vertical-align:middle}
+th{font-size:12px;color:var(--dim);font-weight:600;white-space:nowrap}
+tbody tr:hover{background:var(--panel2)}
+tbody tr:last-child td{border-bottom:none}
+.tw{overflow-x:auto}
+.badge{display:inline-block;font-size:11px;padding:1px 7px;border-radius:999px;border:1px solid transparent;
+  white-space:nowrap}
+.badge.ok{color:var(--ok);background:var(--ok-soft)}
+.badge.warn{color:var(--warn);background:var(--warn-soft)}
+.badge.bad{color:var(--bad);background:var(--bad-soft)}
+.badge.off{color:var(--dim);background:var(--panel2)}
+.badge.info{color:var(--accent);background:var(--accent-soft)}
+.bar{height:5px;border-radius:3px;background:var(--panel3);overflow:hidden;min-width:70px;flex:1}
+.bar>i{display:block;height:100%;background:var(--ok);border-radius:3px}
+.bar>i.warn{background:var(--warn)} .bar>i.bad{background:var(--bad)}
+.qrow{display:flex;align-items:center;gap:8px;font-size:12px;margin:3px 0;min-width:220px}
+.qrow .nm{color:var(--dim);min-width:96px}
+.qrow .vl{font-variant-numeric:tabular-nums;white-space:nowrap}
+.empty{color:var(--dim);font-size:13px;padding:18px 4px;text-align:center}
+.pill{display:inline-block;font-size:11px;padding:2px 7px;border-radius:6px;background:var(--panel2);
+  border:1px solid var(--line);margin:2px 3px 2px 0}
+.pill b{color:var(--accent)}
+#staleBanner{display:none;margin:12px 22px 0;padding:9px 14px;border-radius:8px;font-size:12px;
+  background:var(--warn-soft);border:1px solid var(--warn);color:var(--warn)}
+#toastBox{position:fixed;right:18px;bottom:18px;z-index:200;display:flex;flex-direction:column;gap:8px;
+  align-items:flex-end;pointer-events:none}
+.toast{background:var(--panel);border:1px solid var(--line);border-left:3px solid var(--accent);
+  border-radius:8px;padding:9px 14px;font-size:13px;box-shadow:var(--shadow-lg);max-width:380px;
+  word-break:break-word}
+.toast.err{border-left-color:var(--bad)} .toast.ok{border-left-color:var(--ok)}
+#gate{position:fixed;inset:0;z-index:300;display:none;align-items:center;justify-content:center;padding:20px;
+  background:var(--bg)}
+#gate.show{display:flex}
+.gatebox{width:min(400px,100%);background:var(--panel);border:1px solid var(--line);border-radius:14px;
+  padding:26px 24px;box-shadow:var(--shadow-lg)}
+.gatebox h2{margin:0 0 6px;font-size:16px}
+.gatebox .hint{margin-bottom:18px}
+input,select{background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:8px 11px;
+  color:var(--fg);font:inherit;font-size:13px;width:100%}
+input:focus,select:focus{outline:none;border-color:var(--accent)}
+label.fld{display:block;font-size:12px;color:var(--dim);margin-bottom:4px}
+.grid2{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:12px}
+.row{display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end}
+.row>div{flex:1;min-width:150px}
+dialog{border:1px solid var(--line);border-radius:12px;background:var(--panel);color:var(--fg);
+  padding:0;max-width:560px;width:calc(100% - 32px);box-shadow:var(--shadow-lg)}
+dialog::backdrop{background:rgba(0,0,0,.55)}
+.dlg-hd{padding:14px 18px;border-bottom:1px solid var(--line);font-weight:600;font-size:14px}
+.dlg-bd{padding:16px 18px}
+.dlg-ft{padding:12px 18px;border-top:1px solid var(--line);display:flex;justify-content:flex-end;gap:8px}
+.step{display:flex;gap:10px;margin-bottom:10px;font-size:13px;align-items:flex-start}
+.step .n{flex:none;width:20px;height:20px;border-radius:50%;background:var(--panel2);border:1px solid var(--line);
+  font-size:11px;display:flex;align-items:center;justify-content:center;color:var(--dim)}
+code{background:var(--panel2);padding:1px 5px;border-radius:4px;font-size:12px}
+footer{max-width:1320px;margin:0 auto;padding:0 22px 30px;font-size:11px;color:var(--dim2)}
 </style>
 </head>
 <body>
-<h2>zcode2api</h2>
-<div class="card">
-  <div class="row">
-    <b>captcha 参数池</b>
-    <span id="pool">-</span>
-    <a id="farm-link" href="#" target="_blank" rel="noopener">打开 farm 页</a>
-    <span style="flex:1"></span>
-    <span id="balance-msg" style="font-size:12px;color:#888"></span>
-    <button onclick="refreshBalance()">刷新余额</button>
+<header>
+  <div class="hd-left">
+    <h1><span class="dot" id="statusDot"></span>zcode2api<em>网关管理</em></h1>
+    <nav id="nav">
+      <button class="active" data-tab="gateway">网关与运维</button>
+      <button data-tab="analytics">用量分析</button>
+      <button data-tab="settings">设置</button>
+    </nav>
+  </div>
+  <div class="hd-right">
+    <button class="btn" id="themeToggle" title="切换深色 / 浅色">◐</button>
+    <div class="meta" id="meta"></div>
+  </div>
+</header>
+
+<div id="staleBanner"></div>
+
+<div id="gate">
+  <div class="gatebox">
+    <h2>zcode2api 网关管理</h2>
+    <div class="hint" id="gateHint">请输入面板访问密码</div>
+    <input id="gateInput" type="password" placeholder="面板密码" autocomplete="current-password">
+    <div class="hint" id="gateMsg" style="color:var(--bad);min-height:18px;margin:8px 0 10px"></div>
+    <button class="btn primary" id="gateBtn" style="width:100%;padding:9px">进入面板</button>
   </div>
 </div>
-<div class="card">
-  <div class="row">
-    <button onclick="startLogin('bigmodel')">+ BigModel 登录</button>
-    <button onclick="startLogin('zai')">+ Z.AI 登录</button>
-    <button onclick="importLocal()" title="读取本机 ZCode 桌面端已登录的账号，无需重新授权">⤓ 扫描本机 ZCode 登录</button>
-    <span id="import-msg" style="font-size:12px;color:#888"></span>
+
+<main>
+  <div id="page-gateway">
+    <div class="cards" id="cards"></div>
+
+    <section>
+      <h2>captcha 参数池与农场 <em id="poolNote"></em></h2>
+      <div class="tw">
+        <table>
+          <tbody>
+            <tr><td style="width:150px;color:var(--dim)">池内参数</td><td id="pp-pool">-</td>
+                <td style="width:150px;color:var(--dim)">最新参数年龄</td><td id="pp-age">-</td></tr>
+            <tr><td style="color:var(--dim)">累计产出 / 消费</td><td id="pp-count">-</td>
+                <td style="color:var(--dim)">农场浏览器</td><td id="pp-farm">-</td></tr>
+            <tr><td style="color:var(--dim)">农场页状态</td><td colspan="3" id="farmState">-</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="hint" style="margin-top:10px">
+        每个模型请求都要一个<b>一次性</b>参数。参数变陈会被上游判 <code>3007</code>：农场按新鲜度补货
+        （最新参数超过 20s 就再产一个）。年龄变黄/变红说明农场产出跟不上。
+        后台无头模式下农场页不可见，故由它自报状态（含最近一条日志），卡住时这里会直接标红。
+      </div>
+    </section>
+
+    <section>
+      <h2>账号 <em id="acctCount"></em></h2>
+      <div class="toolbar">
+        <button class="btn primary" data-act="login" data-provider="bigmodel">+ BigModel 登录</button>
+        <button class="btn primary" data-act="login" data-provider="zai">+ Z.AI 登录</button>
+        <button class="btn" data-act="addkey">+ API Key 账号</button>
+        <button class="btn" data-act="import">⤓ 扫描本机 ZCode 登录</button>
+        <button class="btn" data-act="balance">刷新套餐额度</button>
+        <button class="btn" data-act="setall" data-enabled="1">全部启用</button>
+        <button class="btn" data-act="setall" data-enabled="0">全部停用</button>
+      </div>
+      <div class="tw" id="accounts"></div>
+    </section>
+
+    <section>
+      <h2>模型清单 <em>客户端可用的模型 id</em></h2>
+      <div class="tw">
+        <table>
+          <thead><tr><th>模型 id</th><th>映射到上游</th><th>通道</th><th>需要 captcha</th></tr></thead>
+          <tbody id="models"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <section>
+      <h2>最近请求 <em id="recentNote"></em></h2>
+      <div class="tw" id="recent"></div>
+    </section>
   </div>
-  <div id="accounts"></div>
-</div>
-<div class="card"><b>最近请求</b><table id="reqs"></table></div>
-<dialog id="dlg">
-  <h3 id="dlg-title">OAuth 登录</h3>
-  <p>1. 点击下面的链接完成授权；2. 授权完成后本窗口自动检测。</p>
-  <p><a id="dlg-url" href="#" target="_blank" rel="noopener" style="word-break:break-all">授权链接</a></p>
-  <p id="dlg-status">等待授权…</p>
-  <button onclick="cancelLogin()">取消</button>
+
+  <div id="page-analytics" hidden>
+    <div class="toolbar">
+      <button class="btn" data-range="today" id="rngToday">今日</button>
+      <button class="btn" data-range="all" id="rngAll">累计</button>
+      <span style="flex:1"></span>
+      <span class="hint" id="anNote"></span>
+    </div>
+    <div class="cards" id="anCards"></div>
+    <section>
+      <h2>账号透视 <em id="anAcctCount"></em></h2>
+      <div class="tw">
+        <table>
+          <thead><tr><th>账号</th><th>套餐余量</th><th>请求</th><th>总 token</th><th>输入 / 缓存 / 输出</th><th>按模型</th></tr></thead>
+          <tbody id="anAccounts"></tbody>
+        </table>
+      </div>
+    </section>
+    <section>
+      <h2>模型用量与性能</h2>
+      <div class="tw">
+        <table>
+          <thead><tr><th>模型</th><th>请求</th><th>失败</th><th>总 token</th><th>首字延迟</th><th>生成速度</th><th>端到端</th><th>用量占比</th></tr></thead>
+          <tbody id="anModels"></tbody>
+        </table>
+      </div>
+    </section>
+  </div>
+
+  <div id="page-settings" hidden>
+    <section>
+      <h2>面板访问密码 <em id="setPwdState"></em></h2>
+      <div class="hint" style="margin-bottom:12px">
+        用于从<b>非本机</b>打开本面板。本机访问默认免密（可用 <code>PANEL_LOCAL_BYPASS=0</code> 关闭）。
+        密码以 scrypt 哈希存在 <code>panel.json</code>，不存明文；改密会吊销所有已登录会话。
+      </div>
+      <div class="row">
+        <div><label class="fld">当前密码</label><input id="setPwdCur" type="password" autocomplete="current-password"></div>
+        <div><label class="fld">新密码（至少 4 位）</label><input id="setPwdNew" type="password" autocomplete="new-password"></div>
+        <div style="flex:none"><button class="btn primary" data-act="savepwd">修改密码</button></div>
+      </div>
+    </section>
+
+    <section>
+      <h2>对外 API Key <em id="setKeyState"></em></h2>
+      <div class="hint" style="margin-bottom:12px">
+        客户端调用 <code>/v1/*</code> 时携带的密钥。保存后立即生效并写回 <code>.env</code>（重启后仍在）。
+        面板只显示掩码，原文不回显。
+      </div>
+      <div class="row">
+        <div><label class="fld">新的 API Key（留空则不改）</label><input id="setKeyNew" type="password" placeholder="sk-..."></div>
+        <div style="flex:none"><button class="btn primary" data-act="savekey">保存 Key</button></div>
+      </div>
+    </section>
+
+    <section>
+      <h2>运行参数 <em>改动即时生效并写回 .env</em></h2>
+      <div class="grid2">
+        <div><label class="fld">单账号最小请求间隔 (ms)</label><input id="rt-minIntervalMs" type="number" min="1"></div>
+        <div><label class="fld">3012 风控冷却 (分钟)</label><input id="rt-cooldown3012Min" type="number" min="0"></div>
+        <div><label class="fld">captcha 参数 TTL (ms)</label><input id="rt-paramTtlMs" type="number" min="0"></div>
+        <div><label class="fld">参数池上限</label><input id="rt-poolSize" type="number" min="1"></div>
+        <div><label class="fld">换号 / 换参重试上限</label><input id="rt-maxRetries" type="number" min="0"></div>
+      </div>
+      <div class="toolbar" style="margin-top:12px">
+        <button class="btn primary" data-act="saveruntime">保存运行参数</button>
+        <span class="hint" id="rtMsg"></span>
+      </div>
+    </section>
+
+    <section>
+      <h2>运行信息</h2>
+      <div class="tw">
+        <table><tbody id="setInfo"></tbody></table>
+      </div>
+      <div class="toolbar" style="margin-top:12px">
+        <button class="btn" data-act="reloadsettings">刷新</button>
+        <button class="btn" data-act="logout">退出面板登录</button>
+      </div>
+    </section>
+  </div>
+</main>
+
+<footer>每 5 秒自动刷新 · <span id="logfile"></span></footer>
+
+<dialog id="dlgLogin">
+  <div class="dlg-hd" id="dlgLoginTitle">OAuth 登录</div>
+  <div class="dlg-bd">
+    <div class="step"><div class="n">1</div><div>点击下面的链接，在浏览器里完成授权</div></div>
+    <div class="step"><div class="n">2</div><div><a id="dlgLoginUrl" href="#" target="_blank" rel="noopener" style="word-break:break-all">授权链接</a></div></div>
+    <div class="step"><div class="n">3</div><div>授权完成后本窗口会自动检测并入库</div></div>
+    <div class="hint" id="dlgLoginStatus">等待授权…</div>
+  </div>
+  <div class="dlg-ft"><button class="btn" data-act="cancellogin">取消</button></div>
 </dialog>
+
+<dialog id="dlgKey">
+  <div class="dlg-hd">新增 API Key 账号</div>
+  <div class="dlg-bd">
+    <div class="hint" style="margin-bottom:12px">
+      付费 GLM Coding Plan 的 key 走标准通道（<code>open.bigmodel.cn</code>），<b>不需要 captcha</b>，
+      与免费套餐的 oauth 账号互补。
+    </div>
+    <div style="margin-bottom:12px"><label class="fld">备注名（用于区分账号）</label><input id="keyName" placeholder="例如：付费主号"></div>
+    <div><label class="fld">API Key</label><input id="keyValue" type="password" placeholder="sk-..."></div>
+    <div class="hint" id="keyMsg" style="color:var(--bad);min-height:18px;margin-top:8px"></div>
+  </div>
+  <div class="dlg-ft">
+    <button class="btn" data-act="closekey">取消</button>
+    <button class="btn primary" data-act="submitkey">添加</button>
+  </div>
+</dialog>
+
 <script>
-let loginId = null, loginProvider = null, pollTimer = null
+/* ============================ 基础设施 ============================ */
 const $ = (id) => document.getElementById(id)
 
-// 所有插入 innerHTML 的动态值都必须转义：账号 name/email、上游错误信息、模型名等
-// 都来自外部（上游响应/账号文件），直接拼接等于把看板变成 XSS 注入面。
-const esc = (v) => String(v ?? '').replace(/[&<>"']/g, (c) => (
+// 所有插入 innerHTML 的动态值都必须转义：账号名/邮箱、上游错误信息、模型名等来自外部
+// （上游响应 / 账号文件 / 客户端请求），直接拼接等于把面板变成 XSS 注入面。
+// 注意 esc() 只解决 **HTML 上下文**；动态值绝不能进 onclick 这类 **JS 字符串字面量**
+// ——HTML 解析器会把 &#39; 解回 ' 从而逃逸。故本文件一律用 data-* + 事件委托。
+const esc = (v) => String(v === null || v === undefined ? '' : v).replace(/[&<>"']/g, (c) => (
   { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]
 ))
-
-async function api(path, body) {
-  const r = await fetch(path, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: body ? JSON.stringify(body) : undefined,
-    credentials: 'same-origin',
-  })
-  return r.json()
-}
-
-// stats.lastUsedAt / stats.lastError.at 存的是**池内时钟值**（与节流同轴，注入假时钟时
-// 不是真实纪元），不能 new Date() 渲染。故只显示"多久之前/是否曾发生"，不做绝对时间换算。
-const ago = (ms) => {
-  if (!ms) return ''
-  const s = Math.max(0, Math.round((Date.now() - ms) / 1000))
+const fmt = (n) => (n === null || n === undefined || n === '') ? '-' : Number(n).toLocaleString('en-US')
+const ms = (v) => v === null || v === undefined ? '-' : (v < 1000 ? Math.round(v) + ' ms' : (v / 1000).toFixed(2) + ' s')
+const pct = (v) => v === null || v === undefined ? '-' : Number(v).toFixed(1) + '%'
+const ago = (iso) => {
+  if (!iso) return '-'
+  const s = Math.max(0, Math.round((Date.now() - new Date(iso).getTime()) / 1000))
   if (s < 60) return s + 's 前'
   if (s < 3600) return Math.round(s / 60) + 'min 前'
-  return Math.round(s / 3600) + 'h 前'
+  if (s < 86400) return Math.round(s / 3600) + 'h 前'
+  return Math.round(s / 86400) + 'd 前'
+}
+const localTime = (iso) => iso ? new Date(iso).toLocaleString('zh-CN', { hour12: false }) : '-'
+const mins = (msv) => msv >= 60000 ? Math.ceil(msv / 60000) + 'min' : Math.ceil(msv / 1000) + 's'
+
+let TOKEN = ''
+try { TOKEN = sessionStorage.getItem('z2a-panel-token') || '' } catch (e) { TOKEN = '' }
+
+function toast(msg, kind) {
+  const box = $('toastBox')
+  if (!box) return
+  const el = document.createElement('div')
+  el.className = 'toast' + (kind ? ' ' + kind : '')
+  // textContent 而非 innerHTML：toast 常用来回显上游错误，那条路上有远程可控字符串。
+  el.textContent = msg
+  box.appendChild(el)
+  setTimeout(() => el.remove(), 4200)
 }
 
-function accountCard(a) {
-  const stats = a.stats || {}
-  const badges = [
-    a.enabled ? '<span class="ok">启用</span>' : '<span class="bad">停用</span>',
-    a.needsRelogin ? '<span class="bad">需重登</span>' : '',
-    a.noPackage ? '<span class="warn">无资源包</span>' : '',
-    a.cooldownRemainMs > 0 ? `<span class="warn">冷却 ${Math.ceil(a.cooldownRemainMs / 60000)}min</span>` : '',
-    stats.lastError ? '<span class="warn">有错误记录</span>' : '',
-  ].filter(Boolean).join('')
+/* ---- 数据新鲜度：某个源刷新失败就明说，不继续装作最新 ---- */
+const STALE = {}
+function markFresh(key) {
+  if (STALE[key] === undefined) return
+  delete STALE[key]
+  renderStale()
+}
+function markStale(key, err) {
+  const msg = (err && err.message) ? err.message : String(err || 'unknown')
+  if (STALE[key] === msg) return
+  STALE[key] = msg
+  renderStale()
+}
+function renderStale() {
+  const box = $('staleBanner')
+  if (!box) return
+  const keys = Object.keys(STALE)
+  if (!keys.length) { box.style.display = 'none'; box.innerHTML = ''; return }
+  box.style.display = 'block'
+  box.innerHTML = '<b>数据已过期</b>：' + esc(keys.join('、'))
+    + ' 最近一次刷新失败（' + esc(STALE[keys[0]]) + '）。下面显示的是上一次成功的数据。'
+}
 
-  const balances = (a.planCache && a.planCache.balances) || []
-  const bars = balances.map((b) => {
-    const pct = b.total ? Math.max(0, Math.min(100, (b.remaining / b.total) * 100)) : 0
-    return `
-      <div class="row" style="margin-top:6px;font-size:13px">
-        <span>${esc(b.modelName || b.entitlementId)}</span>
-        <span>${esc(b.remaining)} / ${esc(b.total)}</span>
-        <div class="bar" style="flex:1"><i style="width:${pct}%"></i></div>
-      </div>`
+async function getJSON(path) {
+  const r = await fetch(path, { cache: 'no-store', headers: TOKEN ? { 'x-panel-token': TOKEN } : {} })
+  if (r.status === 401) { needLogin(); throw new Error('unauthorized') }
+  if (!r.ok) {
+    const body = await r.json().catch(() => ({}))
+    throw new Error((body.error && body.error.message) || ('HTTP ' + r.status))
+  }
+  return r.json()
+}
+async function postJSON(path, body) {
+  const headers = { 'content-type': 'application/json' }
+  if (TOKEN) headers['x-panel-token'] = TOKEN
+  const r = await fetch(path, { method: 'POST', headers, body: JSON.stringify(body || {}) })
+  const text = await r.text()
+  let parsed = {}
+  try { parsed = text ? JSON.parse(text) : {} } catch (e) { parsed = { raw: text } }
+  if (r.status === 401 && path !== '/panel/login') { needLogin(); throw new Error('unauthorized') }
+  if (!r.ok) throw new Error((parsed.error && parsed.error.message) || ('HTTP ' + r.status))
+  return parsed
+}
+
+/* ============================ 主题 / 页签 ============================ */
+function applyTheme(light) {
+  document.body.classList.toggle('light', light)
+  $('themeToggle').textContent = light ? '☾' : '☀'
+}
+function toggleTheme() {
+  const light = !document.body.classList.contains('light')
+  applyTheme(light)
+  try { localStorage.setItem('z2a-theme', light ? 'light' : 'dark') } catch (e) { /* 隐私模式忽略 */ }
+}
+let currentTab = 'gateway'
+function switchTab(tab) {
+  currentTab = tab
+  const pages = { gateway: 'page-gateway', analytics: 'page-analytics', settings: 'page-settings' }
+  Object.keys(pages).forEach((k) => { $(pages[k]).hidden = (k !== tab) })
+  const btns = document.querySelectorAll('#nav button')
+  for (let i = 0; i < btns.length; i += 1) btns[i].classList.toggle('active', btns[i].dataset.tab === tab)
+  if (tab === 'analytics') loadAnalytics()
+  if (tab === 'settings') loadSettings()
+}
+
+/* ============================ 面板登录门 ============================ */
+let PANEL = { authenticated: false }
+function needLogin() {
+  PANEL.authenticated = false
+  const gate = $('gate')
+  if (gate) gate.classList.add('show')
+}
+async function submitLogin() {
+  const pw = $('gateInput').value
+  $('gateMsg').textContent = ''
+  if (!pw) { $('gateMsg').textContent = '请输入密码'; return }
+  $('gateBtn').disabled = true
+  try {
+    const r = await postJSON('/panel/login', { password: pw })
+    TOKEN = r.token || ''
+    try { sessionStorage.setItem('z2a-panel-token', TOKEN) } catch (e) { /* 忽略 */ }
+    $('gateInput').value = ''
+    $('gate').classList.remove('show')
+    toast('已进入面板', 'ok')
+    startDashboard()
+  } catch (e) {
+    $('gateMsg').textContent = e.message === 'unauthorized' ? '密码错误' : e.message
+  } finally {
+    $('gateBtn').disabled = false
+  }
+}
+async function logout() {
+  try { await postJSON('/panel/logout', {}) } catch (e) { /* 无论如何都清本地态 */ }
+  TOKEN = ''
+  try { sessionStorage.removeItem('z2a-panel-token') } catch (e) { /* 忽略 */ }
+  needLogin()
+}
+
+/* ============================ 账号表 ============================ */
+let ACCOUNTS = []
+
+function statusBadges(a) {
+  const out = []
+  if (!a.enabled) out.push('<span class="badge off">已停用</span>')
+  else if (a.needsRelogin) out.push('<span class="badge bad">需重登</span>')
+  else if (a.noPackage) out.push('<span class="badge warn">无资源包</span>')
+  else if (a.cooldownRemainMs > 0) out.push('<span class="badge warn">冷却 ' + esc(mins(a.cooldownRemainMs)) + '</span>')
+  else out.push('<span class="badge ok">可用</span>')
+  if (a.strikes > 0) out.push('<span class="badge warn" title="累计风控次数，5 次自动停用">风控 ' + esc(a.strikes) + '</span>')
+  if (a.stats && a.stats.lastError) {
+    const le = a.stats.lastError
+    // 同时显示 HTTP 状态与上游业务码：只有 400/429 这类状态码时无法区分
+    // "参数过期(3007)""风控(3012)""限流(3009)"，而处置方式完全不同。
+    const label = [le.status, le.code].filter((v) => v !== null && v !== undefined && v !== '').join('/')
+    out.push('<span class="badge bad" title="' + esc(localTime(le.atIso)) + '">最近错误 ' + esc(label || '-') + '</span>')
+  }
+  return out.join(' ')
+}
+
+function quotaCell(a) {
+  const bs = (a.planCache && a.planCache.balances) || []
+  if (!bs.length) return '<span class="hint">未查询</span>'
+  return bs.map((b) => {
+    const p = b.total > 0 ? Math.max(0, Math.min(100, (b.remaining / b.total) * 100)) : 0
+    const cls = p < 10 ? 'bad' : p < 30 ? 'warn' : ''
+    return '<div class="qrow">'
+      + '<span class="nm">' + esc(b.modelName || b.entitlementId) + '</span>'
+      + '<span class="bar"><i class="' + cls + '" style="width:' + p.toFixed(1) + '%"></i></span>'
+      + '<span class="vl">' + esc(fmt(b.remaining)) + ' / ' + esc(fmt(b.total)) + '</span>'
+      + '</div>'
   }).join('')
+}
 
-  const le = stats.lastError
-  return `
-    <div class="card" style="margin-top:8px">
-      <div class="row">
-        <span class="tag">${esc(a.provider)} · ${esc(a.type)}</span>
-        <b>${esc(a.name || a.email || a.id)}</b>
-        ${badges}
-        <span style="flex:1"></span>
-        <button data-action="toggle" data-id="${esc(a.id)}" data-enabled="${a.enabled ? '1' : '0'}">${a.enabled ? '停用' : '启用'}</button>
-        <button data-action="delete" data-id="${esc(a.id)}">删除</button>
-      </div>
-      ${bars}
-      <div style="font-size:12px;color:#888;margin-top:4px">
-        请求 ${esc(stats.requests ?? 0)} · 入 ${esc(stats.inputTokens ?? 0)} · 出 ${esc(stats.outputTokens ?? 0)} tokens
-        ${stats.lastUsedAt ? `· 最近使用 ${ago(stats.lastUsedAt)}` : ''}
-        ${le ? `· <span class="bad">最近错误 ${esc(le.status ?? le.code ?? '')}${le.at ? ' ' + ago(le.at) : ''}</span>` : ''}
-      </div>
-    </div>`
+function accountRow(a) {
+  // 名字缺省时（oauth 账号常常没有 name/email）只显示 id 一行，避免同一串 id 上下重复两遍。
+  const name = a.name || a.email || null
+  return '<tr>'
+    + '<td>'
+    +   (name
+      ? '<div><b>' + esc(name) + '</b></div><div class="hint mono" style="font-size:11px">' + esc(a.id) + '</div>'
+      : '<div><b class="mono">' + esc(a.id) + '</b></div>')
+    +   (name && a.email && a.email !== name ? '<div class="hint" style="font-size:11px">' + esc(a.email) + '</div>' : '')
+    +   '<div class="hint" style="font-size:11px">凭据 ' + esc(a.secretMask || '-') + '</div>'
+    + '</td>'
+    + '<td><span class="badge info">' + esc(a.provider) + ' · ' + esc(a.type) + '</span></td>'
+    + '<td>' + statusBadges(a) + '</td>'
+    + '<td>' + quotaCell(a) + '</td>'
+    + '<td class="mono">' + esc(fmt(a.stats.requests)) + '</td>'
+    + '<td class="mono">' + esc(fmt(a.stats.inputTokens)) + ' / ' + esc(fmt(a.stats.outputTokens)) + '</td>'
+    + '<td class="hint">' + esc(ago(a.stats.lastUsedAtIso)) + '<br>' + esc(a.createdAtIso ? '建于 ' + localTime(a.createdAtIso).slice(0, 10) : '') + '</td>'
+    + '<td style="white-space:nowrap">'
+    +   '<button class="btn mini" data-act="toggle" data-id="' + esc(a.id) + '" data-enabled="' + (a.enabled ? '1' : '0') + '">' + (a.enabled ? '停用' : '启用') + '</button> '
+    +   '<button class="btn mini" data-act="refresh1" data-id="' + esc(a.id) + '">刷新额度</button> '
+    +   '<button class="btn mini danger" data-act="del" data-id="' + esc(a.id) + '">删除</button>'
+    + '</td>'
+    + '</tr>'
+}
+
+function renderAccounts() {
+  const box = $('accounts')
+  if (!box) return
+  $('acctCount').textContent = ACCOUNTS.length
+    ? '共 ' + ACCOUNTS.length + ' 个 · 健康 ' + ACCOUNTS.filter((a) => a.healthy).length + ' 个'
+    : ''
+  if (!ACCOUNTS.length) {
+    box.innerHTML = '<div class="empty">还没有账号。用上面的「BigModel 登录」添加，'
+      + '或点「扫描本机 ZCode 登录」直接导入本机客户端已登录的账号。</div>'
+    return
+  }
+  box.innerHTML = '<table><thead><tr>'
+    + '<th>账号</th><th>类型</th><th>状态</th><th>套餐余量</th><th>请求</th><th>输入 / 输出</th><th>最近使用</th><th>操作</th>'
+    + '</tr></thead><tbody>' + ACCOUNTS.map(accountRow).join('') + '</tbody></table>'
+}
+
+/* ============================ 网关页渲染 ============================ */
+let POOL = null
+let SETTINGS = null
+
+function renderCards() {
+  const box = $('cards')
+  if (!box) return
+  const total = ACCOUNTS.length
+  const healthy = ACCOUNTS.filter((a) => a.healthy).length
+  const bal = ACCOUNTS.reduce((s, a) => s + ((a.quota && a.quota.remaining) || 0), 0)
+  const balTotal = ACCOUNTS.reduce((s, a) => s + ((a.quota && a.quota.total) || 0), 0)
+  const pool = POOL || {}
+  const age = pool.newestAgeMs
+  const ageCls = age === null || age === undefined ? 'bad' : age < 20000 ? 'ok' : age < 60000 ? 'warn' : 'bad'
+  const card = (k, v, s, cls) => '<div class="card ' + (cls || '') + '"><div class="k">' + k + '</div>'
+    + '<div class="v">' + v + '</div><div class="s">' + s + '</div></div>'
+  box.innerHTML =
+    card('可用账号', healthy + ' <small>/ ' + total + '</small>',
+      total - healthy > 0 ? (total - healthy) + ' 个不可用（停用/冷却/需重登）' : '全部健康', healthy ? 'ok' : 'bad')
+    + card('套餐剩余', bal ? fmt(bal) + ' <small>单位</small>' : '-',
+      balTotal ? '总量 ' + fmt(balTotal) + ' · 剩余 ' + ((bal / balTotal) * 100).toFixed(1) + '%' : '未查询额度', 'accent')
+    + card('captcha 参数池', (pool.pool === undefined ? '-' : pool.pool) + ' <small>个</small>',
+      age === null || age === undefined ? '池是空的：农场没在产出' : '最新参数 ' + Math.round(age / 1000) + 's 前', ageCls)
+    + card('累计产出参数', fmt(pool.received || 0) + ' <small>/ 消费 ' + fmt(pool.used || 0) + '</small>', '来自农场浏览器', '')
+}
+
+function renderPool() {
+  const p = POOL || {}
+  $('pp-pool').innerHTML = '<b>' + esc(p.pool === undefined ? '-' : p.pool) + '</b> 个'
+  const age = p.newestAgeMs
+  const cls = age === null || age === undefined ? 'bad' : age < 20000 ? 'ok' : age < 60000 ? 'warn' : 'bad'
+  $('pp-age').innerHTML = (age === null || age === undefined)
+    ? '<span class="badge bad">无参数</span>'
+    : '<span class="badge ' + cls + '">' + Math.round(age / 1000) + 's 前</span>'
+  $('pp-count').innerHTML = esc(fmt(p.received || 0)) + ' / ' + esc(fmt(p.used || 0))
+  const rt = (SETTINGS && SETTINGS.runtime) || {}
+  const url = (SETTINGS && SETTINGS.farmUrl) || ''
+  const mode = rt.farmAutoBrowser === false
+    ? '<span class="badge warn">手动模式</span>'
+    : (rt.farmHeadless ? '<span class="badge ok">后台无头</span>' : '<span class="badge info">有头窗口</span>')
+  $('pp-farm').innerHTML = mode + (url ? ' <a href="' + esc(url) + '" target="_blank" rel="noopener">打开 farm 页</a>' : '')
+  $('poolNote').textContent = p.lastPushAt ? ('最近产出 ' + ago(p.lastPushAt)) : ''
+  renderFarmReport(p.farmReport)
+}
+
+/**
+ * 农场页自报的健康状态。
+ * 后台无头模式下用户看不到农场页的日志，卡住时只能靠这里说清原因——否则面板只能显示
+ * "池是空的"，用户无从判断是网络、SDK 还是页面卡死（实测踩到过页面静默停摆 4 分钟）。
+ *
+ * 徽标颜色只看**当前**状态（卡死 / 失联 / 退避中），不看累计失败次数：
+ * 累计失败在每次服务重启后都会 +1，用它决定颜色会让一个正常运行的农场长期显示警告色，
+ * 久而久之用户就学会忽略这个徽标——那时它真的坏掉也没人看。累计值只作为文本信息给出。
+ */
+function renderFarmReport(r) {
+  const box = $('farmState')
+  if (!box) return
+  if (!r) { box.innerHTML = '<span class="badge off">农场页未上报</span>'; return }
+  const stale = Date.now() - r.at > 45000
+  const backingOff = r.backoffMs > 8000
+  const cls = r.stuck ? 'bad' : (stale || backingOff) ? 'warn' : 'ok'
+  const label = r.stuck ? '农场页卡死' : stale ? '农场页失联' : backingOff ? '农场页退避中' : '农场页正常'
+  box.innerHTML = '<span class="badge ' + cls + '">' + esc(label) + '</span>'
+    // 口径写在标签里：上面的"累计产出"是**服务端**计数（跨页面重载累加），这里的是
+    // **本页**计数（每次服务重启页面重载即归零）。不写清会让人以为两处数字对不上是 bug。
+    + '<div class="hint" style="margin-top:6px">本页产出 ' + esc(fmt(r.total)) + ' · 推送成功 ' + esc(fmt(r.pushed))
+    + (r.fails ? ' · 累计失败 ' + esc(fmt(r.fails)) : '')
+    + (r.backoffMs > 2000 ? ' · 退避 ' + Math.round(r.backoffMs / 1000) + 's' : '')
+    + ' · 上报于 ' + esc(Math.round((Date.now() - r.at) / 1000)) + 's 前</div>'
+    + (r.lastLine ? '<div class="hint mono" style="font-size:11px;margin-top:4px">' + esc(r.lastLine) + '</div>' : '')
+}
+
+const MODELS = [
+  { id: 'glm-5.3', up: 'GLM-5.3', ch: 'oauth（免费套餐）', cap: '需要' },
+  { id: 'glm-5.3-flash', up: 'GLM-5.3-Flash', ch: 'oauth（免费套餐）', cap: '需要' },
+  { id: 'claude-*', up: 'GLM-5.3-Flash', ch: '自动映射', cap: '需要' },
+]
+function renderModels() {
+  const body = $('models')
+  if (!body) return
+  body.innerHTML = MODELS.map((m) => '<tr>'
+    + '<td class="mono"><b>' + esc(m.id) + '</b></td>'
+    + '<td class="mono">' + esc(m.up) + '</td>'
+    + '<td>' + esc(m.ch) + '</td>'
+    + '<td><span class="badge warn">' + esc(m.cap) + '</span></td>'
+    + '</tr>').join('')
+}
+
+function renderRecent(rows, total) {
+  const box = $('recent')
+  if (!box) return
+  $('recentNote').textContent = total ? ('共 ' + total + ' 条记录') : ''
+  if (!rows || !rows.length) { box.innerHTML = '<div class="empty">还没有请求记录</div>'; return }
+  box.innerHTML = '<table><thead><tr>'
+    + '<th>时间</th><th>模型</th><th>账号</th><th>模式</th><th>状态</th><th>耗时</th><th>首字</th><th>速度</th>'
+    + '<th>输入 / 缓存 / 输出</th><th>总 token</th>'
+    + '</tr></thead><tbody>'
+    + rows.map((r) => '<tr>'
+      + '<td class="hint mono">' + esc((r.iso || '').slice(5)) + '</td>'
+      + '<td class="mono">' + esc(r.model || '-') + '</td>'
+      + '<td class="mono hint">' + esc(r.account || '—') + '</td>'
+      + '<td><span class="badge ' + (r.stream ? 'info' : 'off') + '">' + (r.stream ? '流式' : '非流式') + '</span></td>'
+      + '<td>' + (r.error
+        ? '<span class="badge bad" title="' + esc(r.error) + '">' + esc(r.status || '失败') + '</span>'
+        : '<span class="badge ok">' + esc(r.status || 200) + '</span>') + '</td>'
+      + '<td class="mono">' + esc(ms(r.elapsed_ms)) + '</td>'
+      + '<td class="mono">' + esc(ms(r.ttft_ms)) + '</td>'
+      + '<td class="mono">' + esc(r.tokens_per_sec === null || r.tokens_per_sec === undefined ? '-' : r.tokens_per_sec.toFixed(1)) + '</td>'
+      + '<td class="mono">' + esc(fmt(r.prompt_tokens)) + ' / '
+      + (r.cache_read_tokens ? '<span title="命中缓存的输入">' + esc(fmt(r.cache_read_tokens)) + '</span>' : '0') + ' / '
+      + esc(fmt(r.completion_tokens)) + '</td>'
+      + '<td class="mono"><b>' + esc(fmt(r.total_tokens)) + '</b></td>'
+      + '</tr>').join('')
+    + '</tbody></table>'
 }
 
 async function refresh() {
-  let s
   try {
-    s = await fetch('/pool/status', { credentials: 'same-origin' }).then((r) => r.json())
+    const [acc, recent] = await Promise.all([
+      getJSON('/accounts'),
+      getJSON('/usage/recent?limit=60'),
+    ])
+    markFresh('账号')
+    markFresh('最近请求')
+    ACCOUNTS = acc.accounts || []
+    POOL = acc.pool || null
+    renderAccounts()
+    renderCards()
+    renderPool()
+    renderRecent(recent.rows, recent.total)
+    if ($('statusDot')) $('statusDot').className = 'dot'
+    const usable = acc.usable
+    $('meta').innerHTML = '账号 <b>' + acc.usable + '/' + acc.total + '</b> 可用'
+      + '<br>参数池 <b>' + ((POOL && POOL.pool) === undefined ? '-' : POOL.pool) + '</b> 个'
+    void usable
   } catch (e) {
-    return
+    if ($('statusDot')) $('statusDot').className = 'dot err'
+    if (String(e.message) === 'unauthorized') return
+    markStale('账号', e)
+    $('meta').innerHTML = '<b>无法连接本机服务</b>'
   }
-  const pp = s.paramPool || {}
-  $('pool').textContent = `池 ${pp.pool ?? 0} / 收到 ${pp.received ?? 0} / 消费 ${pp.used ?? 0}`
-  // farmUrl 是 farm 页完整地址（形如 http://127.0.0.1:28631/farm）
-  if (s.farmUrl) $('farm-link').href = s.farmUrl
-  $('accounts').innerHTML = (s.accounts || []).map(accountCard).join('')
-    || '<p style="color:#888">暂无账号，先添加一个</p>'
-  $('reqs').innerHTML = '<tr><th>时间</th><th>模型</th><th>账号</th><th>状态</th></tr>'
-    + (s.requests || []).map((r) => `
-      <tr>
-        <td>${esc(new Date(r.at).toLocaleTimeString())}</td>
-        <td>${esc(r.model)}</td>
-        <td>${esc(r.account)}</td>
-        <td class="${r.status === 200 ? 'ok' : 'bad'}">${esc(r.status)}${r.error ? ' ' + esc(String(r.error).slice(0, 60)) : ''}</td>
-      </tr>`).join('')
 }
 
-function finish() {
-  if (pollTimer) clearInterval(pollTimer)
-  pollTimer = null
-  loginId = null
-  loginProvider = null
-  const dlg = $('dlg')
-  if (dlg.open) dlg.close()
+/* ============================ 用量分析 ============================ */
+let ANALYTICS = null
+let RANGE = 'today'
+
+function loadAnalytics() {
+  return getJSON('/usage/analytics').then((data) => {
+    ANALYTICS = data
+    markFresh('用量分析')
+    renderAnalytics()
+  }).catch((e) => { if (String(e.message) !== 'unauthorized') markStale('用量分析', e) })
 }
 
-async function startLogin(provider) {
-  let r
+function renderAnalytics() {
+  if (!ANALYTICS) return
+  const d = ANALYTICS
+  const today = d.summary.today || {}
+  const all = d.summary.all_time || {}
+  const s = RANGE === 'today' ? today : all
+  $('rngToday').className = 'btn' + (RANGE === 'today' ? ' primary' : '')
+  $('rngAll').className = 'btn' + (RANGE === 'all' ? ' primary' : '')
+  $('anNote').textContent = (d.total_records || 0) + ' 条记录'
+    + (d.bad_lines ? ' · ' + d.bad_lines + ' 行损坏（已跳过）' : '')
+    + (d.since ? ' · 始于 ' + d.since : '')
+  const card = (k, v, sub, cls) => '<div class="card ' + (cls || '') + '"><div class="k">' + k + '</div>'
+    + '<div class="v">' + v + '</div><div class="s">' + sub + '</div></div>'
+  $('anCards').innerHTML =
+    card('今日 token', fmt(today.total_tokens || 0),
+      '输入 ' + fmt(today.prompt_tokens || 0) + ' · 缓存 ' + fmt(today.cache_read_tokens || 0) + ' · 输出 ' + fmt(today.completion_tokens || 0), 'accent')
+    + card('累计 token', fmt(all.total_tokens || 0),
+      '输入 ' + fmt(all.prompt_tokens || 0) + ' · 缓存 ' + fmt(all.cache_read_tokens || 0) + ' · 输出 ' + fmt(all.completion_tokens || 0), '')
+    + card('平均生成速度', (s.speed_avg === null || s.speed_avg === undefined ? '-' : s.speed_avg.toFixed(1)) + ' <small>tok/s</small>',
+      '首字 ' + ms(s.ttft_ms_avg) + ' (P50 ' + ms(s.ttft_ms_p50) + ') · 端到端 ' + ms(s.elapsed_ms_avg), 'ok')
+    + card('请求成功率', s.success_rate_pct === null || s.success_rate_pct === undefined ? '-' : pct(s.success_rate_pct),
+      fmt(s.requests || 0) + ' 次请求 · ' + fmt(s.errors || 0) + ' 次失败', (s.errors ? 'warn' : 'ok'))
+    + card('缓存命中率', pct(s.cache_hit_pct), '命中 ' + fmt(s.cache_read_tokens || 0) + ' tokens', '')
+    + card('流式请求', fmt(s.stream_requests || 0) + ' <small>次</small>', '占 ' + (s.requests ? ((s.stream_requests / s.requests) * 100).toFixed(0) : 0) + '%', '')
+
+  const key = RANGE === 'today' ? 'today' : 'all_time'
+  const bag = RANGE === 'today' ? 'today_models' : 'all_models'
+  const accts = (d.accounts || []).filter((a) => (a[key] || {}).requests > 0)
+  $('anAcctCount').textContent = accts.length ? '(' + accts.length + ' 个)' : ''
+  const byId = {}
+  ACCOUNTS.forEach((a) => { byId[a.id] = a })
+  $('anAccounts').innerHTML = accts.length ? accts.map((a) => {
+    const st = a[key] || {}
+    const models = Object.entries(a[bag] || {}).sort((x, y) => (y[1].total_tokens || 0) - (x[1].total_tokens || 0))
+    const info = byId[a.account]
+    // 没有 name/email 时不要回落到 id 再单独显示一次 id——那会让同一串 id 上下重复两行。
+    const name = info ? (info.name || info.email || null) : null
+    return '<tr>'
+      + '<td>'
+      + (name
+        ? '<b>' + esc(name) + '</b><div class="hint mono" style="font-size:11px">' + esc(a.account) + '</div>'
+        : '<b class="mono" style="font-size:12px">' + esc(a.account) + '</b>')
+      + '</td>'
+      + '<td>' + (info ? quotaCell(info) : '<span class="hint">—</span>') + '</td>'
+      + '<td class="mono">' + esc(fmt(st.requests || 0)) + '</td>'
+      + '<td class="mono"><b>' + esc(fmt(st.total_tokens || 0)) + '</b></td>'
+      + '<td class="mono">' + esc(fmt(st.prompt_tokens || 0)) + ' / '
+      + (st.cache_read_tokens ? '<span title="命中缓存的输入">' + esc(fmt(st.cache_read_tokens)) + '</span>' : '0') + ' / '
+      + esc(fmt(st.completion_tokens || 0)) + '</td>'
+      + '<td>' + (models.length ? models.map(([id, m]) =>
+        '<span class="pill">' + esc(id) + ' <b>' + esc(fmt(m.total_tokens)) + '</b> tok</span>').join('')
+        : '<span class="hint">无调用</span>') + '</td>'
+      + '</tr>'
+  }).join('') : '<tr><td colspan="6" class="empty">该时间范围内还没有请求</td></tr>'
+
+  const models = (d.models || []).filter((m) => (m[key] || {}).requests > 0)
+    .sort((x, y) => (y[key].total_tokens || 0) - (x[key].total_tokens || 0))
+  // 占比按**全部模型合计**算，而不是"相对最大的那个"：后者在两个模型用量接近时
+  // 会同时显示 100%，看起来像两条都占满，读者无法据此判断谁多谁少。
+  const sumTok = models.reduce((s, m) => s + ((m[key] || {}).total_tokens || 0), 0) || 1
+  $('anModels').innerHTML = models.length ? models.map((m) => {
+    const st = m[key] || {}
+    const share = Math.round(((st.total_tokens || 0) / sumTok) * 100)
+    return '<tr>'
+      + '<td class="mono"><b>' + esc(m.id) + '</b></td>'
+      + '<td class="mono">' + esc(fmt(st.requests || 0)) + '</td>'
+      + '<td>' + (st.errors ? '<span class="badge bad">' + esc(st.errors) + '</span>' : '<span class="hint">0</span>') + '</td>'
+      + '<td class="mono"><b>' + esc(fmt(st.total_tokens || 0)) + '</b></td>'
+      + '<td class="mono">' + esc(ms(st.ttft_ms_avg)) + '</td>'
+      + '<td class="mono">' + esc(st.speed_avg === null || st.speed_avg === undefined ? '-' : st.speed_avg.toFixed(1) + ' tok/s') + '</td>'
+      + '<td class="mono">' + esc(ms(st.elapsed_ms_avg)) + '</td>'
+      + '<td><div class="qrow"><span class="bar"><i style="width:' + Math.max(3, share) + '%"></i></span>'
+      + '<span class="vl">' + share + '%</span></div></td>'
+      + '</tr>'
+  }).join('') : '<tr><td colspan="8" class="empty">该时间范围内还没有模型调用</td></tr>'
+}
+
+/* ============================ 设置页 ============================ */
+async function loadSettings() {
   try {
-    r = await api(`/accounts/login/${provider}/start`)
+    const s = await getJSON('/settings')
+    SETTINGS = s
+    markFresh('设置')
+    $('setPwdState').textContent = s.passwordSource === 'file' ? '(已在面板改过)'
+      : s.passwordSource === 'env' ? '(.env 引导密码，建议改掉)' : '(未设置：仅本机可访问)'
+    $('setKeyState').textContent = s.apiKeySet ? ('(已配置 ' + s.apiKeyMasked + ')') : '(未配置，/v1 不校验)'
+    const rt = s.runtime || {}
+    $('rt-minIntervalMs').value = rt.minIntervalMs
+    $('rt-cooldown3012Min').value = rt.cooldown3012Min
+    $('rt-paramTtlMs').value = rt.paramTtlMs
+    $('rt-poolSize').value = rt.poolSize
+    $('rt-maxRetries').value = rt.maxRetries
+    const rows = [
+      ['版本', s.version],
+      ['监听', s.listen ? (s.listen.host + ':' + s.listen.port) : '-'],
+      ['farm 端口', s.listen ? s.listen.farmPort : '-'],
+      ['farm 页', s.farmUrl],
+      ['账号目录', s.accountsDir],
+      ['用量目录', s.usageDir],
+      ['.env 文件', s.envFile],
+      ['面板密码文件', s.panelFile],
+      ['农场浏览器', rt.farmAutoBrowser === false ? '手动模式（未自动启动）' : (rt.farmHeadless ? '后台无头（无可见窗口）' : '有头窗口')],
+    ]
+    $('setInfo').innerHTML = rows.map(([k, v]) =>
+      '<tr><td style="width:170px;color:var(--dim)">' + esc(k) + '</td><td class="mono">' + esc(v || '-') + '</td></tr>').join('')
+    $('logfile').textContent = s.usageDir ? ('用量日志 ' + s.usageDir) : ''
+    renderPool()
   } catch (e) {
-    return alert('无法连接本机服务')
+    if (String(e.message) !== 'unauthorized') markStale('设置', e)
   }
-  if (r.error) return alert(r.error.message || 'start failed')
-  loginId = r.loginId
-  loginProvider = provider
-  $('dlg-title').textContent = (provider === 'zai' ? 'Z.AI' : 'BigModel') + ' OAuth 登录'
-  $('dlg-url').href = r.authorizeUrl
-  $('dlg-status').textContent = '等待授权…'
-  $('dlg').showModal()
-  pollTimer = setInterval(async () => {
-    let p
-    try {
-      p = await api(`/accounts/login/${provider}/poll`, { loginId })
-    } catch (e) {
-      return
-    }
-    if (!p || p.status === 'pending') return
-    if (p.status === 'ready') {
-      $('dlg-status').textContent = '登录成功'
-      finish()
-      refresh()
-    } else if (p.status === 'failed') {
-      $('dlg-status').textContent = '失败：' + (p.error || '未知错误')
-      finish()
-    }
-  }, 1000)
 }
 
-async function cancelLogin() {
-  if (loginId && loginProvider) {
-    try { await api(`/accounts/login/${loginProvider}/cancel`, { loginId }) } catch (e) { /* 关闭弹窗优先 */ }
+async function savePassword() {
+  const cur = $('setPwdCur').value
+  const next = $('setPwdNew').value
+  if (!cur || !next) return toast('请填写当前密码与新密码', 'err')
+  try {
+    const r = await postJSON('/panel/password', { current: cur, next })
+    if (r.token) {
+      TOKEN = r.token
+      try { sessionStorage.setItem('z2a-panel-token', TOKEN) } catch (e) { /* 忽略 */ }
+    }
+    $('setPwdCur').value = ''
+    $('setPwdNew').value = ''
+    toast('面板密码已更新，其他已登录会话已被吊销', 'ok')
+    loadSettings()
+  } catch (e) { toast('修改失败：' + e.message, 'err') }
+}
+
+async function saveApiKey() {
+  const key = $('setKeyNew').value
+  if (!key) return toast('请填写新的 API Key', 'err')
+  try {
+    const r = await postJSON('/settings/save', { apiKey: key })
+    if (r.errors && r.errors.apiKey) return toast('保存失败：' + r.errors.apiKey, 'err')
+    $('setKeyNew').value = ''
+    toast('API Key 已更新并写入 .env', 'ok')
+    loadSettings()
+  } catch (e) { toast('保存失败：' + e.message, 'err') }
+}
+
+async function saveRuntime() {
+  const patch = {
+    minIntervalMs: $('rt-minIntervalMs').value,
+    cooldown3012Min: $('rt-cooldown3012Min').value,
+    paramTtlMs: $('rt-paramTtlMs').value,
+    poolSize: $('rt-poolSize').value,
+    maxRetries: $('rt-maxRetries').value,
   }
-  finish()
+  try {
+    const r = await postJSON('/settings/save', patch)
+    const errs = Object.keys(r.errors || {})
+    if (errs.length) {
+      const text = errs.map((k) => k + '：' + r.errors[k]).join('；')
+      $('rtMsg').textContent = text
+      toast('部分参数未生效：' + text, 'err')
+    } else {
+      $('rtMsg').textContent = ''
+      toast('运行参数已生效并写入 .env', 'ok')
+    }
+    if (r.settings) SETTINGS = r.settings
+    loadSettings()
+  } catch (e) { toast('保存失败：' + e.message, 'err') }
 }
 
-async function setEnabled(id, cur) {
-  await api('/accounts/set', { id, enabled: !cur })
-  refresh()
+/* ============================ 账号操作 ============================ */
+async function toggleAccount(id, enabled) {
+  try {
+    await postJSON('/accounts/set', { id, enabled })
+    toast(enabled ? '已启用' : '已停用', 'ok')
+    refresh()
+  } catch (e) { toast('操作失败：' + e.message, 'err') }
 }
-
-async function del(id) {
-  if (!confirm('删除该账号？')) return
-  await api('/accounts/delete', { id })
-  refresh()
+async function deleteAccount(id) {
+  if (!window.confirm('删除账号 ' + id + '？凭据会一并从磁盘删除。')) return
+  try {
+    await postJSON('/accounts/delete', { id })
+    toast('已删除', 'ok')
+    refresh()
+  } catch (e) { toast('删除失败：' + e.message, 'err') }
 }
-
-// 事件委托：动态值只经 dataset 传递（textContent/dataset 天然无注入面），
-// 绝不拼进 onclick 的 JS 字符串字面量——那条路上 HTML 实体会被还原成引号而逃逸。
-// 账号 id 来自上游 userInfo.user_id（远程可控），是存储型 XSS 的入口。
-$('accounts').addEventListener('click', (ev) => {
-  const btn = ev.target.closest('button[data-action]')
-  if (!btn) return
-  const id = btn.dataset.id
-  if (btn.dataset.action === 'toggle') return setEnabled(id, btn.dataset.enabled === '1')
-  if (btn.dataset.action === 'delete') return del(id)
-})
-
-async function refreshBalance() {
-  $('balance-msg').textContent = '刷新中…'
-  const r = await api('/accounts/balance/refresh')
-  const results = (r && r.results) || []
-  const failed = results.filter((x) => !x.ok)
-  $('balance-msg').textContent = failed.length
-    ? `刷新完成，${failed.length}/${results.length} 失败`
-    : (results.length ? `已刷新 ${results.length} 个账号` : '无 oauth 账号可刷新')
-  refresh()
+async function setAll(enabled) {
+  try {
+    const r = await postJSON('/accounts/set-all', { enabled })
+    toast('已' + (enabled ? '启用' : '停用') + ' ' + r.changed + ' 个账号', 'ok')
+    refresh()
+  } catch (e) { toast('批量操作失败：' + e.message, 'err') }
 }
-
-// 读取本机 ZCode 桌面端已登录的账号（免重新授权）。
-// 失败原因（未登录/跨机器凭据解不开）由服务端给出可读提示，直接展示。
+async function refreshBalance(id) {
+  const label = id ? '该账号' : '全部 oauth 账号'
+  toast('正在刷新' + label + '的套餐额度…')
+  try {
+    const r = await postJSON('/accounts/balance/refresh', id ? { id } : {})
+    const results = r.results || []
+    const failed = results.filter((x) => !x.ok)
+    if (!results.length) toast('没有可刷新的 oauth 账号（API Key 账号无需查询额度）')
+    else if (failed.length) toast('刷新完成：' + failed.length + '/' + results.length + ' 失败（' + failed[0].error + '）', 'err')
+    else toast('已刷新 ' + results.length + ' 个账号的额度', 'ok')
+    refresh()
+  } catch (e) { toast('刷新失败：' + e.message, 'err') }
+}
 async function importLocal() {
-  $('import-msg').textContent = '扫描中…'
-  let r
+  toast('正在扫描本机 ZCode 登录态…')
   try {
-    r = await api('/accounts/import/local')
-  } catch (e) {
-    return ($('import-msg').textContent = '无法连接本机服务')
-  }
-  if (r && r.error) {
-    $('import-msg').textContent = r.error.message || '导入失败'
-    return
-  }
-  const ids = (r && r.accounts) || []
-  $('import-msg').textContent = ids.length
-    ? `已导入 ${ids.length} 个账号：${ids.join('、')}`
-    : '未发现可导入的账号'
-  refresh()
+    const r = await postJSON('/accounts/import/local', {})
+    const ids = r.accounts || []
+    toast(ids.length ? ('已导入 ' + ids.length + ' 个账号：' + ids.join('、')) : '未发现可导入的账号', ids.length ? 'ok' : '')
+    refresh()
+  } catch (e) { toast('导入失败：' + e.message, 'err') }
 }
 
-refresh()
-setInterval(refresh, 3000)
+let LOGIN = null
+async function startLogin(provider) {
+  try {
+    const r = await postJSON('/accounts/login/' + provider + '/start', {})
+    LOGIN = { id: r.loginId, provider, timer: null }
+    $('dlgLoginTitle').textContent = (provider === 'zai' ? 'Z.AI' : 'BigModel') + ' OAuth 登录'
+    $('dlgLoginUrl').href = r.authorizeUrl
+    $('dlgLoginStatus').textContent = '等待授权…'
+    $('dlgLogin').showModal()
+    LOGIN.timer = setInterval(async () => {
+      if (!LOGIN) return
+      try {
+        const p = await postJSON('/accounts/login/' + provider + '/poll', { loginId: LOGIN.id })
+        if (p.status === 'pending') return
+        stopLoginPoll()
+        if (p.status === 'ready') {
+          toast('登录成功，账号已入库', 'ok')
+          $('dlgLogin').close()
+          refresh()
+        } else {
+          $('dlgLoginStatus').textContent = '失败：' + (p.error || '未知错误')
+        }
+      } catch (e) { /* 轮询失败不中断，下一轮再试 */ }
+    }, 1200)
+  } catch (e) { toast('发起登录失败：' + e.message, 'err') }
+}
+function stopLoginPoll() {
+  if (LOGIN && LOGIN.timer) clearInterval(LOGIN.timer)
+  LOGIN = null
+}
+async function cancelLogin() {
+  if (LOGIN) {
+    const { id, provider } = LOGIN
+    stopLoginPoll()
+    try { await postJSON('/accounts/login/' + provider + '/cancel', { loginId: id }) } catch (e) { /* 关窗优先 */ }
+  }
+  $('dlgLogin').close()
+}
+async function submitKey() {
+  const name = $('keyName').value.trim()
+  const apiKey = $('keyValue').value.trim()
+  $('keyMsg').textContent = ''
+  if (!apiKey) { $('keyMsg').textContent = '请填写 API Key'; return }
+  try {
+    const r = await postJSON('/accounts/add-apikey', { name, apiKey })
+    $('keyName').value = ''
+    $('keyValue').value = ''
+    $('dlgKey').close()
+    toast('已添加账号 ' + r.id, 'ok')
+    refresh()
+  } catch (e) { $('keyMsg').textContent = e.message }
+}
+
+/* ============================ 事件绑定 ============================ */
+// 全部走事件委托 + data-*：动态值（账号 id 等，来自上游 userInfo）不进 JS 字符串字面量。
+function bindEvents() {
+  $('themeToggle').addEventListener('click', toggleTheme)
+  $('nav').addEventListener('click', (ev) => {
+    const btn = ev.target.closest('button[data-tab]')
+    if (btn) switchTab(btn.dataset.tab)
+  })
+  $('gateBtn').addEventListener('click', submitLogin)
+  $('gateInput').addEventListener('keydown', (ev) => { if (ev.key === 'Enter') submitLogin() })
+  document.querySelector('main').addEventListener('click', (ev) => {
+    const btn = ev.target.closest('button[data-act]')
+    if (!btn) return
+    const act = btn.dataset.act
+    const id = btn.dataset.id
+    if (act === 'toggle') return toggleAccount(id, btn.dataset.enabled !== '1')
+    if (act === 'del') return deleteAccount(id)
+    if (act === 'refresh1') return refreshBalance(id)
+    if (act === 'balance') return refreshBalance()
+    if (act === 'setall') return setAll(btn.dataset.enabled === '1')
+    if (act === 'import') return importLocal()
+    if (act === 'login') return startLogin(btn.dataset.provider)
+    if (act === 'cancellogin') return cancelLogin()
+    if (act === 'addkey') return $('dlgKey').showModal()
+    if (act === 'closekey') return $('dlgKey').close()
+    if (act === 'submitkey') return submitKey()
+    if (act === 'savepwd') return savePassword()
+    if (act === 'savekey') return saveApiKey()
+    if (act === 'saveruntime') return saveRuntime()
+    if (act === 'reloadsettings') return loadSettings()
+    if (act === 'logout') return logout()
+    return undefined
+  })
+  $('rngToday').addEventListener('click', () => { RANGE = 'today'; renderAnalytics() })
+  $('rngAll').addEventListener('click', () => { RANGE = 'all'; renderAnalytics() })
+}
+
+/* ============================ 启动 ============================ */
+let TIMERS = []
+let STARTED = false
+async function startDashboard() {
+  if (STARTED) return
+  STARTED = true
+  bindEvents()
+  renderModels()
+  await refresh()
+  await loadSettings()
+  await loadAnalytics()
+  // 面板解锁后才开始轮询：锁定状态不该反复打 401。
+  TIMERS.forEach((t) => clearInterval(t))
+  TIMERS = [
+    setInterval(refresh, 5000),
+    setInterval(() => { if (currentTab === 'analytics') loadAnalytics() }, 5000),
+  ]
+}
+async function boot() {
+  let theme = 'dark'
+  try { theme = localStorage.getItem('z2a-theme') || 'dark' } catch (e) { theme = 'dark' }
+  applyTheme(theme === 'light')
+  let status = null
+  try { status = await getJSON('/panel/status') } catch (e) { status = null }
+  PANEL = status || {}
+  if (!status || !status.authenticated) {
+    needLogin()
+    $('gateHint').textContent = status && status.hasPassword
+      ? '请输入面板访问密码'
+      : '面板密码未设置：请在本机打开本页，在「设置」页设置密码后即可从非本机访问'
+    return
+  }
+  startDashboard()
+}
+// 等 load 事件再启动：脚本在 body 末尾，此时 DOM 已就绪；用 load 还能让首屏
+// 先画出骨架再发请求（也让测试可以只注入 stub 而不触发真实轮询）。
+window.addEventListener('load', () => { boot() })
+
+// 页面自愈：服务重启或 dashboard 更新后构建号变化 → 整页重载，避免旧标签页跑旧 JS。
+setInterval(async () => {
+  try {
+    const r = await fetch('/build', { cache: 'no-store' })
+    const j = await r.json()
+    if (window.SERVER_BUILD && j.build && j.build !== window.SERVER_BUILD) window.location.reload()
+  } catch (e) { /* 服务暂时不可达：下次再试 */ }
+}, 15000)
 </script>
 </body>
 </html>

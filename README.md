@@ -1,14 +1,18 @@
 # zcode2api
 
-把 ZCode（zcode.z.ai GLM 套餐）反代为本地 OpenAI / Anthropic 双协议 API。
-设计文档：`docs/superpowers/specs/2026-09-23-zcode2api-design.md`。
+把 ZCode（zcode.z.ai GLM 套餐）反代为本地 OpenAI / Anthropic 双协议 API，带管理面板。
+设计文档：`docs/superpowers/specs/2026-09-23-zcode2api-design.md`（主体）、
+`docs/superpowers/specs/2026-09-25-admin-panel-design.md`（管理面板）。
 
 > **✅ 状态：已跑通，正在消费官方额度（2026-09-25 实测）**
 >
 > - ✅ **双协议可用**：`/v1/messages`（Anthropic）与 `/v1/chat/completions`（OpenAI），
 >   含流式 SSE、工具调用、思考块（`reasoning_content`）。
-> - ✅ **真实用上官方额度**：实测请求后余额消耗（`GLM-5.3: used 129333`、`Flash: used 1730`）。
-> - ✅ 227 个单元测试 + 端到端冒烟全通过。
+> - ✅ **真实用上官方额度**：实测请求后余额消耗；面板记账与上游计费**逐单位一致**
+>   （一轮非流式 + 一轮流式 = 3,418 = 3,418）。
+> - ✅ **管理面板**：账号增删启停、套餐余量、参数池与农场状态、用量分析（含首字延迟 /
+>   生成速度 / 缓存命中率）、运行参数热更新与 `.env` 回写、面板密码。
+> - ✅ 366 个单元/集成测试 + 端到端冒烟全通过。
 >
 > **关键突破（曾经 3012 的根因）**：上游网关对请求做**内容检查**——`system` 字段里
 > 必须含 ZCode 身份块，否则直接返回 `3012 "method not allowed"`（对外文案为
@@ -27,7 +31,7 @@ npm start
 ```
 
 - API：`http://127.0.0.1:28630/v1`（OpenAI `/v1/chat/completions`、Anthropic `/v1/messages`）
-- 看板：`http://127.0.0.1:28630/`（本机免密）
+- **管理面板**：`http://127.0.0.1:28630/`（本机免密，见 [管理面板](#管理面板)）
 - farm 页：`http://127.0.0.1:28631/farm`
   - **默认后台模式**（`FARM_AUTO_BROWSER=1` + `FARM_HEADLESS=1`）：playwright 启动无头浏览器
     自动产参数，**无任何可见窗口**，无需人工干预。
@@ -36,28 +40,72 @@ npm start
   - 两种模式的参数**实测均可被上游接受**（headless 3/3 成功；手动模式同样可用）。
     无头模式必须覆盖 UA（启动器已自动处理，见 `src/captcha/browser.js`）。
   - 农场按**新鲜度**补充参数：池内最新参数超过 20s 即产新的（避免陈参数被上游判 `3007`）。
+  - 后台模式下农场页不可见，故页面会把自身状态（最近一条日志、失败次数、退避时长）上报给
+    服务端，面板「captcha 参数池与农场」里直接显示——卡住时会标红，不必去猜。
 
 > **改端口后**：手动模式需用新地址重开 farm 页（旧标签页会持续 `Failed to fetch`，参数推不进池）；
 > 后台模式无需处理（服务启动时自动指向新端口）。
 
 
+## 管理面板
+
+三个页签：**网关与运维** / **用量分析** / **设置**。深色主题，5 秒自动刷新，锁定状态下不轮询。
+
+**网关与运维**
+
+- KPI 卡片：可用账号池、套餐剩余、captcha 参数池（含最新参数年龄）、累计产出参数。
+- 参数池与农场：池内数量、最新参数年龄、累计产出/消费、农场浏览器模式、**农场页自报状态**。
+- 账号表：账号（凭据只显示掩码）、类型、状态徽标（可用 / 已停用 / 冷却 / 需重登 / 无资源包 /
+  风控次数 / 最近错误 `状态码/业务码`）、**套餐余量进度条**（按模型）、请求数、输入/缓存/输出
+  tokens、最近使用时间。
+- 工具栏：BigModel / Z.AI OAuth 登录、**新增 API Key 账号**、扫描本机 ZCode 登录、
+  刷新套餐额度、全部启用 / 停用。
+- 模型清单与最近请求（含耗时、首字延迟、生成速度、缓存量）。
+
+**用量分析**：今日↔累计切换；KPI（token、平均速度、首字延迟 P50、成功率、缓存命中率、流式占比）；
+账号透视（含每账号的模型细分）；模型用量与性能表。数据来自 `usage/usage.jsonl`（重启不丢）。
+
+**设置**：面板密码、对外 API Key、运行参数（节流间隔 / 3012 冷却 / 参数 TTL / 池上限 / 重试上限）、
+运行信息。改动**即时生效并写回 `.env`**（重启后仍在）。
+
+### 面板访问密码
+
+- 本机访问默认免密（`PANEL_LOCAL_BYPASS=1`）。要在其他机器上打开，先在**本机**面板「设置」里设密码。
+- 密码以 **scrypt** 哈希存在 `panel.json`（只存盐与哈希，不存明文）；改密会**吊销全部已登录会话**。
+- 未设置任何密码时，非本机请求一律 401——不提供默认口令（弱口令比没有口令更危险：
+  它让"没配密码"看起来像"配了密码"）。
+- 设 `PANEL_LOCAL_BYPASS=0` 可让本机也必须带密码（面板挂在反向代理后面时应当这么设）。
+
+### 面板不显示凭据原文
+
+`jwt` / `apiKey` / `accessToken` / `refreshToken` **从不回给前端**，只回 `hasJwt` / `hasApiKey`
+与掩码（如 `eyJhbG…hoY4`）。凭据一旦进过浏览器、日志或截图就等于多了一处泄露面。
+
+
 ## 验证
 
 ```bash
-npm test        # 单元/集成测试（230 项，不碰网络与真实上游）
-npm run e2e     # 端到端冒烟：真实 server + 真实 Response 走通双协议四条路径
+npm test        # 单元/集成测试（366 项，不碰网络与真实上游）
+npm run e2e     # 端到端冒烟：真实 server + 真实 Response 走通双协议四条路径 + 管理面 API
 ```
 
 `npm run e2e` 用本地假上游起真实服务，覆盖「OpenAI/Anthropic × 流式/非流式」四条路径，
-并核对 captcha 参数送达、SSE 透传与 usage 记账。它存在的原因是：单元测试把上游桩成普通对象，
-会掩盖只有真实 `Response` 才暴露的缺陷（例如 `Response.body` 是一次性流）。
+并核对 captcha 参数送达、SSE 透传、usage 记账与管理面接口。它存在的原因是：单元测试把上游桩成
+普通对象，会掩盖只有真实 `Response` 才暴露的缺陷（例如 `Response.body` 是一次性流）。
+
+真实上游实测（2026-09-25）：面板记录的 `total_tokens` 与上游 `used_units` 增量**完全一致**
+（一轮非流式 + 一轮流式 = 3,418 = 3,418），这是"面板数字不是自说自话"的最终裁判。
 
 
 ## 添加账号
 
-1. 看板 →「+ BigModel 登录」或「+ Z.AI 登录」→ 浏览器完成授权 → 自动入库。
-2. （可选）从 ZCode 桌面端迁移：账号凭据在 `~/.zcode/v2/credentials.json`（enc:v1 加密），
-   解密方案见 `D:\code\Ai\zcode-proxy\NOTES.md`，本工具不做自动迁移，看板重新登录即可。
+1. 面板 →「+ BigModel 登录」或「+ Z.AI 登录」→ 浏览器完成授权 → 自动入库。
+2. 面板 →「+ API Key 账号」→ 填备注名与 key → 入库（付费 GLM Coding Plan 通道，不需要 captcha）。
+3. 面板 →「⤓ 扫描本机 ZCode 登录」→ 直接导入本机 ZCode 客户端已登录的账号，**无需重新授权**
+   （读的是 `~/.zcode/v2/credentials.json`，enc:v1 加密；跨机器复制的凭据解不开）。
+
+手工放置（等价于第 2 条，便于脚本化）：把 `accounts/<id>.json` 放入目录，
+`{"id":"bigmodel:manual-1","provider":"bigmodel","type":"apikey","apiKey":"<key>", ...}`（其余字段同 oauth 账号默认值），重启生效。
 
 ## 两种账号通道
 
@@ -66,14 +114,29 @@ npm run e2e     # 端到端冒烟：真实 server + 真实 Response 走通双协
 | oauth | `zcode.z.ai/api/v1/zcode-plan/anthropic` | 每请求一个一次性参数（farm 供给） | Start Plan / Global Build 免费额度 |
 | apikey | `open.bigmodel.cn/api/anthropic` | 否 | 付费 GLM Coding Plan key |
 
-添加 apikey 账号：把 `accounts/<id>.json` 手工放入目录，
-`{"id":"bigmodel:manual-1","provider":"bigmodel","type":"apikey","apiKey":"<key>", ...}`（其余字段同 oauth 账号默认值），重启生效。
-
 ## 客户端接入
 
 - Claude Code：`ANTHROPIC_BASE_URL=http://127.0.0.1:28630` + `ANTHROPIC_AUTH_TOKEN=<API_KEY>`
 - OpenAI SDK：`base_url=http://127.0.0.1:28630/v1`，`api_key=<API_KEY>`
 - 模型：`glm-5.3`、`glm-5.3-flash`（`claude-*` 自动映射 GLM-5.3-Flash）
+
+## 用量账的口径（对账时看这里）
+
+`usage/usage.jsonl` 每行一次请求。字段口径按 Anthropic 语义，**不是**简单的"输入+输出"：
+
+- `prompt_tokens` = **未命中缓存**的输入（对应上游 `input_tokens`）
+- `cache_read_tokens` = 命中缓存复用的输入；`cache_creation_tokens` = 本次写入缓存的输入
+- `completion_tokens` = 输出
+- `total_tokens` = **上面四项之和**
+
+最后一条容易踩坑：上游的 `input_tokens` **不含**缓存部分。实测一次流式请求
+`input=40 / cache_read=1664 / output=8`，上游计费 +1712；若按 `input+output` 记总账，面板会显示
+48（少 35 倍）。agent 类客户端（Claude Code、dsh）每轮重发一大段系统提示，命中缓存是常态，
+所以这个偏差是**系统性**的——面板的「缓存命中率」也正是为此而设。
+
+另一处实测坑：流式响应里 `message_start` 的 `input_tokens` 是 **0**，真正的值在最后那帧
+`message_delta` 里。只读 `message_start` 会让每个流式请求都记成 0 输入 token，
+并让发给 OpenAI 客户端的 `prompt_tokens` 恒为 0（对外可见的错误数据）。
 
 ## 3012 的根因与修复
 

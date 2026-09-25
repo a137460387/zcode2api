@@ -1,13 +1,20 @@
 import crypto from 'node:crypto'
 
 export class GatewayError extends Error {
-  constructor({ status = 502, code = null, message, hint = null, upstreamStatus = null }) {
+  /**
+   * `accountId` 是**这次失败落在哪个账号上**。管理面板要回答"是哪个号在吃 429/3012"，
+   * 而错误是在这里抛出、在 server 层记录的——不带上账号 id，面板就只能把它记成
+   * `(unattributed)`，恰恰在最需要定位的时候失明（实测：两次真实失败在面板里都无法归属账号）。
+   * 池层错误（无号可用）没有账号，保持 null。
+   */
+  constructor({ status = 502, code = null, message, hint = null, upstreamStatus = null, accountId = null }) {
     super(message)
     this.name = 'GatewayError'
     this.status = status
     this.code = code
     this.hint = hint
     this.upstreamStatus = upstreamStatus
+    this.accountId = accountId
   }
 }
 
@@ -124,7 +131,7 @@ export function createGateway({ pool, paramPool, senders, config, log = () => {}
         // 网络异常：标记后换号。冷却/停用判定全权交给池（markError 内部实现）。
         await pool.markError(account, { status: 0, code: 'network: ' + e.message })
         if (++accountSwitches > maxRetries) {
-          throw new GatewayError({ status: 502, message: 'network error: ' + e.message })
+          throw new GatewayError({ status: 502, message: 'network error: ' + e.message, accountId: account.id })
         }
         account = null
         continue
@@ -179,6 +186,7 @@ export function createGateway({ pool, paramPool, senders, config, log = () => {}
           code,
           message: brief,
           upstreamStatus: res.status,
+          accountId: account.id,
           hint: code === 3012
             ? '上游行为风控（3012）：已降低节奏并切换账号；若持续请等待风控衰减（分钟~小时级）'
             : code === 1113
@@ -198,6 +206,7 @@ export function createGateway({ pool, paramPool, senders, config, log = () => {}
         code,
         message: brief,
         upstreamStatus: res.status,
+        accountId: account.id,
       })
     }
   }
