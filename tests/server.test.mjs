@@ -28,7 +28,7 @@ function sseResponse(frames) {
 function buildDeps(over = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'z2a-srv-'))
   const store = new AccountStore(dir)
-  const config = { apiKey: 'sk-test', panelPassword: '', port: 0, farmUrl: 'http://127.0.0.1:8789/farm', maxRetries: 2 }
+  const config = { apiKey: 'sk-test', panelPassword: '', port: 0, farmUrl: 'http://127.0.0.1:28631/farm', maxRetries: 2 }
   const pool = new AccountPool(store, { now: () => Date.now() })
   const paramPool = new ParamPool({})
   const requestLog = createRequestLog({})

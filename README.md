@@ -26,9 +26,17 @@ cp .env.example .env   # 至少配置 API_KEY
 npm start
 ```
 
-- API：`http://127.0.0.1:8787/v1`（OpenAI `/v1/chat/completions`、Anthropic `/v1/messages`）
-- 看板：`http://127.0.0.1:8787/`（本机免密）
-- farm 页：`http://127.0.0.1:8789/farm`（启动时已自动打开无头 Chrome；也可手动打开并保持标签页）
+- API：`http://127.0.0.1:28630/v1`（OpenAI `/v1/chat/completions`、Anthropic `/v1/messages`）
+- 看板：`http://127.0.0.1:28630/`（本机免密）
+- farm 页：`http://127.0.0.1:28631/farm`
+  - 默认 `FARM_AUTO_BROWSER=0`（**手动模式**）：需用你自己的 Chrome 打开该地址并保持标签页。
+    产出成功的标志是页面顶部出现绿色 `param 产出并推送成功`，且"池内 param"不为 `-`。
+  - 若改为 `FARM_AUTO_BROWSER=1` 则由 playwright 自动开浏览器产参数，
+    但自动化浏览器的参数实测会被上游判 `3007`，**不推荐**。
+
+> **改端口后必须重新打开 farm 页**：farm 页与 API 服务同源配套，换端口后旧标签页会持续报
+> `Failed to fetch`（参数推不进池）。请关闭旧标签页、用新地址重开。
+
 
 ## 验证
 
@@ -60,8 +68,8 @@ npm run e2e     # 端到端冒烟：真实 server + 真实 Response 走通双协
 
 ## 客户端接入
 
-- Claude Code：`ANTHROPIC_BASE_URL=http://127.0.0.1:8787` + `ANTHROPIC_AUTH_TOKEN=<API_KEY>`
-- OpenAI SDK：`base_url=http://127.0.0.1:8787/v1`，`api_key=<API_KEY>`
+- Claude Code：`ANTHROPIC_BASE_URL=http://127.0.0.1:28630` + `ANTHROPIC_AUTH_TOKEN=<API_KEY>`
+- OpenAI SDK：`base_url=http://127.0.0.1:28630/v1`，`api_key=<API_KEY>`
 - 模型：`glm-5.3`、`glm-5.3-flash`（`claude-*` 自动映射 GLM-5.3-Flash）
 
 ## 3012 的根因与修复
@@ -125,7 +133,7 @@ GLM-5.3-Flash       → 200（含 thinking 块）
   `src/captcha/browser.js` 会自动探测本机 Chrome 版本并构造桌面 UA。
   注：SDK 不检查 `navigator.webdriver`（实测该标志始终为 true，不影响结果）。
 - 手动模式：`FARM_AUTO_BROWSER=0` 时不启动自动浏览器，改用你自己的真实 Chrome 打开
-  farm 页（`http://127.0.0.1:8789/farm`）。
+  farm 页（`http://127.0.0.1:28631/farm`）。
 - 纯 CLI 无法直接使用官方套餐（官方 `account:*` provider 不在 headless 注册表内）——
   这正是本项目存在的意义：让官方额度可被程序调用。
 - 测试超时：`vitest.config.mjs` 把 `testTimeout` 设为 30s（并发/落盘类测试在慢机器上波动较大）。

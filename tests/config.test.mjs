@@ -20,9 +20,9 @@ afterEach(() => {
 describe('loadConfig', () => {
   it('returns defaults without env', () => {
     const c = loadConfig({ rootDir: '/tmp/x', env: {} })
-    expect(c.port).toBe(8787)
+    expect(c.port).toBe(28630)
     expect(c.host).toBe('127.0.0.1')
-    expect(c.farmPort).toBe(8789)
+    expect(c.farmPort).toBe(28631)
     expect(c.apiKey).toBe('')
     expect(c.panelPassword).toBe('')
     expect(c.chromePath).toBe('')
@@ -58,14 +58,14 @@ describe('loadConfig', () => {
 
   it('treats a whitespace-only numeric value as absent', () => {
     const c = loadConfig({ rootDir: '/tmp/x', env: { PORT: '   ', POOL_SIZE: '\t' } })
-    expect(c.port).toBe(8787)
+    expect(c.port).toBe(28630)
     expect(c.poolSize).toBe(6)
   })
 
   it('falls back to defaults for out-of-range numbers', () => {
-    expect(loadConfig({ rootDir: '/tmp/x', env: { PORT: '-1' } }).port).toBe(8787)
-    expect(loadConfig({ rootDir: '/tmp/x', env: { PORT: '70000' } }).port).toBe(8787)
-    expect(loadConfig({ rootDir: '/tmp/x', env: { FARM_PORT: '0' } }).farmPort).toBe(8789)
+    expect(loadConfig({ rootDir: '/tmp/x', env: { PORT: '-1' } }).port).toBe(28630)
+    expect(loadConfig({ rootDir: '/tmp/x', env: { PORT: '70000' } }).port).toBe(28630)
+    expect(loadConfig({ rootDir: '/tmp/x', env: { FARM_PORT: '0' } }).farmPort).toBe(28631)
     expect(loadConfig({ rootDir: '/tmp/x', env: { POOL_SIZE: '0' } }).poolSize).toBe(6)
     expect(loadConfig({ rootDir: '/tmp/x', env: { MAX_RETRIES: '-3' } }).maxRetries).toBe(2)
     expect(loadConfig({ rootDir: '/tmp/x', env: { PARAM_TTL_MS: '-1' } }).paramTtlMs).toBe(8 * 60_000)
@@ -78,8 +78,8 @@ describe('loadConfig', () => {
   })
 
   it('falls back to defaults for non-finite numbers', () => {
-    expect(loadConfig({ rootDir: '/tmp/x', env: { PORT: 'abc' } }).port).toBe(8787)
-    expect(loadConfig({ rootDir: '/tmp/x', env: { PORT: 'Infinity' } }).port).toBe(8787)
+    expect(loadConfig({ rootDir: '/tmp/x', env: { PORT: 'abc' } }).port).toBe(28630)
+    expect(loadConfig({ rootDir: '/tmp/x', env: { PORT: 'Infinity' } }).port).toBe(28630)
   })
 
   it('accepts boundary values', () => {
@@ -102,7 +102,7 @@ describe('loadConfig', () => {
     expect(env.PORT).toBe('9001')
 
     const later = loadConfig({ rootDir: '/tmp/x', env: {} })
-    expect(later.port).toBe(8787)
+    expect(later.port).toBe(28630)
     expect(later.apiKey).toBe('')
   })
 

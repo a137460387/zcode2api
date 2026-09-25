@@ -26,9 +26,9 @@ export function loadConfig({ rootDir = process.cwd(), env = process.env } = {}) 
   const bool = (v, d) => (v === undefined || v === '' ? d : v === '1' || v === 'true')
   return {
     rootDir,
-    port: num(env.PORT, 8787, 1, 65535),
+    port: num(env.PORT, 28630, 1, 65535),
     host: env.HOST || '127.0.0.1',
-    farmPort: num(env.FARM_PORT, 8789, 1, 65535),
+    farmPort: num(env.FARM_PORT, 28631, 1, 65535),
     apiKey: env.API_KEY || '',
     panelPassword: env.PANEL_PASSWORD || '',
     poolDir: env.POOL_DIR || path.join(rootDir, 'accounts'),

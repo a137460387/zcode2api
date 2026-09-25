@@ -72,7 +72,7 @@ const gateway = createGateway({ pool, paramPool, senders, config: { maxRetries: 
 const app = createApp({
   config: { apiKey: 'sk-e2e', panelPassword: '', port: 0 },
   store, pool, paramPool, gateway, requestLog: createRequestLog({}), log: () => {},
-  farmUrl: 'http://127.0.0.1:8789/farm',
+  farmUrl: 'http://127.0.0.1:28631/farm',
 })
 const server = app.listen(0, '127.0.0.1')
 await new Promise((r) => server.once('listening', r))

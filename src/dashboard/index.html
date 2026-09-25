@@ -127,7 +127,7 @@ async function refresh() {
   }
   const pp = s.paramPool || {}
   $('pool').textContent = `池 ${pp.pool ?? 0} / 收到 ${pp.received ?? 0} / 消费 ${pp.used ?? 0}`
-  // farmUrl 是 farm 页完整地址（形如 http://127.0.0.1:8789/farm）
+  // farmUrl 是 farm 页完整地址（形如 http://127.0.0.1:28631/farm）
   if (s.farmUrl) $('farm-link').href = s.farmUrl
   $('accounts').innerHTML = (s.accounts || []).map(accountCard).join('')
     || '<p style="color:#888">暂无账号，先添加一个</p>'
