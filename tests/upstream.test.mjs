@@ -15,10 +15,13 @@ describe('sendZcodePlan', () => {
     expect(calls[0].init.method).toBe('POST')
     expect(calls[0].init.headers['x-aliyun-captcha-verify-param']).toBe('P')
     // sessionId 是账号池的会话亲和键（TTL 2h）：若这里漏传，亲和会静默失效。
-    expect(calls[0].init.headers['x-session-id']).toBe('S')
+    // 官方形态不带 x-session-id
     expect(calls[0].init.headers.authorization).toBe('Bearer J')
     expect(calls[0].init.headers['x-api-key']).toBe('J')
-    expect(JSON.parse(calls[0].init.body)).toEqual({ model: 'GLM-5.3' })
+    const sent = JSON.parse(calls[0].init.body)
+    expect(sent.model).toBe('glm-5.3')          // 官方形态：小写模型名
+    expect(sent.system).toHaveLength(3)         // 官方身份块已注入
+    expect(sent.system[0].text).toContain('You are ZCode')
   })
 })
 

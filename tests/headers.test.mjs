@@ -11,9 +11,13 @@ describe('buildZcodePlanHeaders', () => {
     expect(h['x-aliyun-captcha-verify-region']).toBe('cn')
     expect(h['user-agent']).toContain('ZCode/')
     expect(h['http-referer']).toBe('https://zcode.z.ai')
+    expect(h['x-query-id']).toBeUndefined()
+    expect(h['x-zcode-app-version']).toBeTruthy()
+    expect(h['accept-encoding']).toBe('gzip')
     expect(h['x-zcode-agent']).toBe('glm')
-    expect(h['x-session-id']).toBe('SESS')
-    for (const k of ['x-request-id', 'x-query-id', 'x-zcode-trace-id']) {
+    // 官方形态（start-plan 路径）不带 x-session-id —— 见 headers.js 注释
+    // 官方形态只带 x-request-id 与 x-zcode-trace-id（无 x-query-id）
+    for (const k of ['x-request-id', 'x-zcode-trace-id']) {
       expect(h[k]).toMatch(/[0-9a-f-]{36}/)
     }
     expect(h['content-type']).toBe('application/json')
@@ -40,7 +44,7 @@ describe('buildZcodePlanHeaders', () => {
   it('generates fresh UUIDs on every call', () => {
     const a = buildZcodePlanHeaders({ jwt: 'J', param: 'P', sessionId: 'S' })
     const b = buildZcodePlanHeaders({ jwt: 'J', param: 'P', sessionId: 'S' })
-    for (const k of ['x-request-id', 'x-query-id', 'x-zcode-trace-id']) {
+    for (const k of ['x-request-id', 'x-zcode-trace-id']) {
       expect(a[k]).not.toBe(b[k])
     }
   })
