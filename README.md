@@ -29,19 +29,22 @@ npm start
 - API：`http://127.0.0.1:28630/v1`（OpenAI `/v1/chat/completions`、Anthropic `/v1/messages`）
 - 看板：`http://127.0.0.1:28630/`（本机免密）
 - farm 页：`http://127.0.0.1:28631/farm`
-  - 默认 `FARM_AUTO_BROWSER=0`（**手动模式**）：需用你自己的 Chrome 打开该地址并保持标签页。
+  - **默认后台模式**（`FARM_AUTO_BROWSER=1` + `FARM_HEADLESS=1`）：playwright 启动无头浏览器
+    自动产参数，**无任何可见窗口**，无需人工干预。
+  - 手动模式（`FARM_AUTO_BROWSER=0`）：用你自己的 Chrome 打开上述地址并保持标签页。
     产出成功的标志是页面顶部出现绿色 `param 产出并推送成功`，且"池内 param"不为 `-`。
-  - 若改为 `FARM_AUTO_BROWSER=1` 则由 playwright 自动开浏览器产参数，
-    但自动化浏览器的参数实测会被上游判 `3007`，**不推荐**。
+  - 两种模式的参数**实测均可被上游接受**（headless 3/3 成功；手动模式同样可用）。
+    无头模式必须覆盖 UA（启动器已自动处理，见 `src/captcha/browser.js`）。
+  - 农场按**新鲜度**补充参数：池内最新参数超过 20s 即产新的（避免陈参数被上游判 `3007`）。
 
-> **改端口后必须重新打开 farm 页**：farm 页与 API 服务同源配套，换端口后旧标签页会持续报
-> `Failed to fetch`（参数推不进池）。请关闭旧标签页、用新地址重开。
+> **改端口后**：手动模式需用新地址重开 farm 页（旧标签页会持续 `Failed to fetch`，参数推不进池）；
+> 后台模式无需处理（服务启动时自动指向新端口）。
 
 
 ## 验证
 
 ```bash
-npm test        # 单元/集成测试（198 项，不碰网络与真实上游）
+npm test        # 单元/集成测试（230 项，不碰网络与真实上游）
 npm run e2e     # 端到端冒烟：真实 server + 真实 Response 走通双协议四条路径
 ```
 
