@@ -99,3 +99,26 @@ describe('农场页自报状态（/farm-report）', () => {
     await solo.close()
   })
 })
+
+// 绑 0.0.0.0 时必须回报一个**能打开**的地址。
+// 实测：把 HOST 改成 0.0.0.0 后 farm.url 变成 http://0.0.0.0:28631/farm，
+// playwright 导航直接失败（net::ERR_HTTP_RESPONSE_CODE_FAILURE），农场浏览器起不来。
+describe('farm url 不把通配地址当访问地址', () => {
+  it('监听 0.0.0.0 时 url 用 127.0.0.1', async () => {
+    const solo = startFarmServer({ paramPool: new ParamPool({}), port: 0, host: '0.0.0.0', certDir: './nonexistent-certs' })
+    await new Promise((resolve) => (solo.server.listening ? resolve() : solo.server.once('listening', resolve)))
+    expect(solo.url).toMatch(/^http:\/\/127\.0\.0\.1:\d+\/farm$/)
+    // 该地址必须真的能打开
+    const r = await fetch(solo.url)
+    expect(r.status).toBe(200)
+    expect(await r.text()).toContain('AliyunCaptcha')
+    await solo.close()
+  })
+
+  it('监听 127.0.0.1 时 url 也用 127.0.0.1', async () => {
+    const solo = startFarmServer({ paramPool: new ParamPool({}), port: 0, host: '127.0.0.1', certDir: './nonexistent-certs' })
+    await new Promise((resolve) => (solo.server.listening ? resolve() : solo.server.once('listening', resolve)))
+    expect(solo.url).toMatch(/^http:\/\/127\.0\.0\.1:\d+\/farm$/)
+    await solo.close()
+  })
+})

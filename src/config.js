@@ -38,6 +38,12 @@ export function loadConfig({ rootDir = process.cwd(), env = process.env } = {}) 
      * 代理回源地址是本机，开着放行等于任何人都能进管理面。
      */
     panelLocalBypass: bool(env.PANEL_LOCAL_BYPASS, true),
+    /**
+     * 完全免密（含非本机）。默认关。
+     * 管理面板能改 API Key、删账号，默认敞开等于把凭据管理交出去；
+     * 只有明确设置才开，且面板里会持续显示红色警示。
+     */
+    panelDisableAuth: bool(env.PANEL_DISABLE_AUTH, false),
     poolDir: env.POOL_DIR || path.join(rootDir, 'accounts'),
     certDir: env.CERT_DIR || path.join(rootDir, 'certs'),
     farmHeadless: bool(env.FARM_HEADLESS, true),

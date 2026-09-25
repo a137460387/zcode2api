@@ -98,6 +98,7 @@ export function createApp(deps) {
     file: path.join(config.rootDir ?? process.cwd(), 'panel.json'),
     bootstrapPassword: config.panelPassword,
     localBypass: config.panelLocalBypass,
+    disableAuth: config.panelDisableAuth,
     now: deps.panelNow ?? Date.now,
     log,
   })
@@ -295,10 +296,11 @@ export async function main() {
     file: path.join(config.rootDir, 'panel.json'),
     bootstrapPassword: config.panelPassword,
     localBypass: config.panelLocalBypass,
+    disableAuth: config.panelDisableAuth,
     log,
   })
   const settings = new RuntimeSettings({
-    config, pool, paramPool,
+    config, pool, paramPool, auth: panelAuth,
     envFile: path.join(config.rootDir, '.env'),
     panelFile: path.join(config.rootDir, 'panel.json'),
     log,
@@ -317,11 +319,21 @@ export async function main() {
   })
   const app = createApp({ config, store, pool, paramPool, gateway, requestLog, usage, panelAuth, settings, log, farmUrl: farm.url, farmReport: () => farm.report })
   app.listen(config.port, config.host, () => {
-    log(`[zcode2api] API      → http://${config.host}:${config.port}/v1`)
-    log(`[zcode2api] 管理面板 → http://${config.host}:${config.port}/`)
+    // 打印的入口地址必须**能点开**：绑 0.0.0.0 时 0.0.0.0 不是可访问地址，
+    // 照抄进日志只会让人复制一个连不上的 URL。本机一律显示 127.0.0.1。
+    log(`[zcode2api] API      → http://127.0.0.1:${config.port}/v1`)
+    log(`[zcode2api] 管理面板 → ${settings.entryUrls().join('   ')}`)
     log(`[zcode2api] farm 页  → ${farm.url}`)
-    if (panelAuth.passwordSource() === 'none') {
-      log('[panel] 未设置面板密码：仅本机可访问管理面板。如需从其他机器访问，请在本机面板「设置」页设置密码。')
+    // 启动时把"怎么进"和"当前是什么门槛"一次说清：面板的入口地址与鉴权状态
+    // 是用户最先要问的两件事，让它出现在日志里，省掉翻文档。
+    if (panelAuth.disableAuth) {
+      log('[panel] ⚠️ 已开启完全免密（PANEL_DISABLE_AUTH=1）：任何能连到这个端口的人都能管理账号与 API Key。')
+    } else if (panelAuth.passwordSource() === 'none') {
+      log('[panel] 未设置面板密码：仅本机可访问。要从其他设备访问，二选一：')
+      log('[panel]   a) 面板「设置」页设置密码；b) 面板「设置」页勾选「完全免密」（仅限可信局域网）')
+    }
+    if (config.host === '127.0.0.1' || config.host === 'localhost') {
+      log('[panel] 当前只监听本机，其他设备连不上。需要从其他设备访问时，把 HOST 改为 0.0.0.0 并重启。')
     }
   })
   if (!config.farmAutoBrowser) {

@@ -4,6 +4,7 @@ import os from 'node:os'
 import path from 'node:path'
 import { RuntimeSettings, updateEnvFile, maskSecret, readEnvLines } from '../src/panel/settings.js'
 import { ParamPool } from '../src/captcha/pool.js'
+import { PanelAuth } from '../src/panel/auth.js'
 
 let dir, envFile
 beforeEach(() => {
@@ -225,7 +226,131 @@ describe('RuntimeSettings.save：热更新 + 写回 .env', () => {
     const { settings, config } = make()
     const before = { ...config }
     const r = settings.save({})
-    expect(r).toEqual({ applied: {}, errors: {}, env: null })
+    expect(r).toEqual({ applied: {}, errors: {}, env: null, restartRequired: [] })
     expect(config).toEqual(before)
+  })
+})
+
+/**
+ * 「完全免密」开关与监听地址。
+ * 存在这两项是因为：本机访问本来就免密，用户说"设置免密"时唯一没被覆盖的场景就是
+ * **从其他设备访问**——而那被两道门挡着（只监听 127.0.0.1 + 非本机要求密码）。
+ */
+describe('完全免密开关', () => {
+  const makeWithAuth = (disableAuth = false) => {
+    const config = baseConfig()
+    const pool = { minIntervalMs: config.minIntervalMs, cooldown3012Ms: config.cooldown3012Ms }
+    const paramPool = new ParamPool({ ttlMs: config.paramTtlMs, maxSize: config.poolSize })
+    const auth = new PanelAuth({ file: path.join(dir, 'panel.json'), disableAuth, log: () => {} })
+    config.panelDisableAuth = disableAuth
+    const settings = new RuntimeSettings({ config, pool, paramPool, auth, envFile, panelFile: path.join(dir, 'panel.json'), log: () => {} })
+    return { config, settings, auth }
+  }
+
+  it('打开后即时作用于 PanelAuth（不需要重启），并写回 .env', () => {
+    const { settings, auth } = makeWithAuth(false)
+    expect(auth.allow({ socket: { remoteAddress: '203.0.113.9' }, query: {}, get: () => undefined })).toBe(false)
+    const r = settings.save({ panelDisableAuth: true })
+    expect(r.errors).toEqual({})
+    expect(r.applied.panelDisableAuth).toBe(true)
+    expect(auth.disableAuth).toBe(true)
+    expect(auth.allow({ socket: { remoteAddress: '203.0.113.9' }, query: {}, get: () => undefined })).toBe(true)
+    expect(fs.readFileSync(envFile, 'utf8')).toContain('PANEL_DISABLE_AUTH=1')
+  })
+
+  it('关闭后非本机重新需要密码', () => {
+    const { settings, auth } = makeWithAuth(true)
+    settings.save({ panelDisableAuth: false })
+    expect(auth.disableAuth).toBe(false)
+    expect(fs.readFileSync(envFile, 'utf8')).toContain('PANEL_DISABLE_AUTH=0')
+  })
+
+  it('省略该字段时不动现有开关（不会因为别处保存设置而被悄悄关掉）', () => {
+    const { settings, auth } = makeWithAuth(true)
+    settings.save({ minIntervalMs: 5000 })
+    expect(auth.disableAuth).toBe(true)
+  })
+
+  it("接受 '1'/'true'/'0' 字符串（表单提交的形态）", () => {
+    const { settings, auth } = makeWithAuth(false)
+    settings.save({ panelDisableAuth: '1' })
+    expect(auth.disableAuth).toBe(true)
+    settings.save({ panelDisableAuth: '0' })
+    expect(auth.disableAuth).toBe(false)
+  })
+})
+
+describe('监听地址', () => {
+  it('允许 0.0.0.0 并标记需重启（不能热改，app.listen 已绑好）', () => {
+    const { settings, config } = make()
+    fs.writeFileSync(envFile, 'HOST=127.0.0.1\n')
+    const r = settings.save({ host: '0.0.0.0' })
+    expect(r.errors).toEqual({})
+    expect(config.host).toBe('0.0.0.0')
+    expect(r.restartRequired).toContain('host')
+    expect(fs.readFileSync(envFile, 'utf8')).toContain('HOST=0.0.0.0')
+  })
+
+  it('非法地址被拒且不改动现状', () => {
+    const { settings, config } = make()
+    const r = settings.save({ host: 'not-an-ip' })
+    expect(r.errors.host).toBeTruthy()
+    expect(config.host).toBe('127.0.0.1')
+  })
+
+  it('接受具体网卡地址与回环别名', () => {
+    const { settings } = make()
+    for (const h of ['192.168.0.107', 'localhost', '::']) {
+      expect(settings.save({ host: h }).errors).toEqual({})
+    }
+  })
+})
+
+describe('entryUrls：入口地址（回答"怎么进"）', () => {
+  it('只监听本机时只列本机地址（列出连不上的局域网地址是误导）', () => {
+    const { settings, config } = make()
+    config.host = '127.0.0.1'
+    const urls = settings.entryUrls()
+    expect(urls).toEqual([`http://127.0.0.1:${config.port}/`])
+  })
+
+  it('监听 0.0.0.0 时列出本机与所有非内网回环的 IPv4 地址', () => {
+    const { settings, config } = make()
+    config.host = '0.0.0.0'
+    const urls = settings.entryUrls()
+    expect(urls[0]).toBe(`http://127.0.0.1:${config.port}/`)
+    expect(urls.length).toBeGreaterThanOrEqual(1)
+    for (const u of urls) expect(u).toMatch(/^http:\/\/\d+\.\d+\.\d+\.\d+:\d+\/$/)
+  })
+
+  it('绑定具体网卡地址时把它列出来', () => {
+    const { settings, config } = make()
+    config.host = '192.168.0.107'
+    expect(settings.entryUrls()).toEqual([`http://127.0.0.1:${config.port}/`, `http://192.168.0.107:${config.port}/`])
+  })
+})
+
+// 入口清单里混进虚拟网卡会让用户照着第一个去试，然后得出"从手机打不开"的错误结论。
+// 实测本机 3 个非回环地址里两个是 VMware 宿主-only 网卡，手机连不上。
+describe('entryUrls 滤掉虚拟网卡', () => {
+  it('VMware/WSL/Docker 等虚拟网卡不进清单，物理网卡保留', () => {
+    const { settings, config } = make()
+    config.host = '0.0.0.0'
+    const urls = settings.entryUrls()
+    for (const u of urls) {
+      const ip = u.match(/\/\/([0-9.]+):/)[1]
+      const names = os.networkInterfaces()
+      const owner = Object.entries(names).find(([, as]) => (as ?? []).some((a) => a.address === ip))
+      if (owner) expect(owner[0]).not.toMatch(/vmnet|virtualbox|hyper-?v|docker|wsl/i)
+    }
+    // 至少包含本机地址本身
+    expect(urls[0]).toBe(`http://127.0.0.1:${config.port}/`)
+  })
+
+  it('只有虚拟网卡时退回未过滤列表（有得试好过空着）', () => {
+    const { settings, config } = make()
+    config.host = '0.0.0.0'
+    const urls = settings.entryUrls()
+    expect(urls.length).toBeGreaterThanOrEqual(1)
   })
 })

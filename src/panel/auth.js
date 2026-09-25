@@ -41,15 +41,33 @@ function safeEqual(a, b) {
 }
 
 export class PanelAuth {
-  constructor({ file, bootstrapPassword = '', localBypass = true, now = Date.now, log = () => {} } = {}) {
+  constructor({ file, bootstrapPassword = '', localBypass = true, disableAuth = false, now = Date.now, log = () => {} } = {}) {
     this.file = file
     this.bootstrapPassword = bootstrapPassword || ''
     this.localBypass = localBypass
+    /**
+     * 完全免密：**含非本机**。默认关——管理面板能改 API Key、删账号，
+     * 默认敞开等于把凭据管理交出去。只有用户明确要求（面板里勾选或设环境变量）才开。
+     * 可变字段：面板里可以即时开关，不需要重启。
+     */
+    this.disableAuth = disableAuth === true
     this.now = now
     this.log = log
     /** sha256(token) → { at }。键用哈希而非明文 token：见文件头注释。 */
     this.sessions = new Map()
     this.data = this.#read()
+  }
+
+  setDisableAuth(on) {
+    const next = on === true
+    if (next === this.disableAuth) return this.disableAuth
+    this.disableAuth = next
+    if (next) {
+      this.log('[panel] ⚠️ 已开启完全免密：任何能访问到本端口的人都能管理账号与 API Key（含非本机）')
+    } else {
+      this.log('[panel] 已关闭完全免密，非本机恢复需要密码/token')
+    }
+    return this.disableAuth
   }
 
   #read() {
@@ -182,6 +200,9 @@ export class PanelAuth {
    * 也让"面板挂在反向代理后面"这种部署不会因为代理回源是本机而被无声放行）。
    */
   allow(req) {
+    // 完全免密：最优先。放在这里而不是各路由里，是为了让"放行"只有这一个出口
+    // ——安全开关分散成多处判断时，漏掉一处就是一个洞。
+    if (this.disableAuth) return true
     if (this.localBypass && this.isLocal(req)) return true
     if (this.valid(this.tokenFrom(req))) return true
     // 旧脚本兼容：直接带面板密码（.env 的 PANEL_PASSWORD 或 panel.json 里的那份）。
@@ -193,9 +214,16 @@ export class PanelAuth {
   status(req) {
     return {
       // 非本机是否必须密码：本机放行开着且请求来自本机时，答案为 false（面板据此决定是否显示登录页）。
-      passwordRequired: !(this.localBypass && this.isLocal(req)),
+      passwordRequired: !(this.disableAuth || (this.localBypass && this.isLocal(req))),
       authenticated: this.allow(req),
+      /**
+       * 本次请求是否来自本机。面板用它给出**精确**的后果提示：
+       * 从非本机访问时关掉免密、且没设密码 → 这台设备会立刻失去访问权，
+       * 只能用本机重新打开。不告诉用户就等于给他埋一个"手一滑就进不去"的坑。
+       */
+      fromLocal: this.isLocal(req),
       localBypass: this.localBypass,
+      disableAuth: this.disableAuth,
       hasPassword: this.hasPassword(),
       passwordSource: this.passwordSource(),
       // 用 .env 引导密码时提示去「设置」里改：.env 是明文且可能被同步/备份出去。

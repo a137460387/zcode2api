@@ -86,8 +86,16 @@ export function startFarmServer({ paramPool, port, host = '127.0.0.1', certDir =
     server,
     get url() {
       const addr = server.address()
-      if (!addr) return `${useHttps ? 'https' : 'http'}://${host}:${port}/farm`
-      return `${useHttps ? 'https' : 'http'}://${addr.address}:${addr.port}/farm`
+      const scheme = useHttps ? 'https' : 'http'
+      if (!addr) return `${scheme}://127.0.0.1:${port}/farm`
+      /**
+       * 绑定 `0.0.0.0`/`::` 时**不能**把通配地址当访问地址回给浏览器：
+       * playwright 导航到 `http://0.0.0.0:28631/farm` 会直接失败
+       * （实测 `net::ERR_HTTP_RESPONSE_CODE_FAILURE`），农场浏览器因此根本起不来。
+       * 本机访问始终用 127.0.0.1。
+       */
+      const ip = addr.address === '0.0.0.0' || addr.address === '::' ? '127.0.0.1' : addr.address
+      return `${scheme}://${ip}:${addr.port}/farm`
     },
     get report() {
       return farmReport

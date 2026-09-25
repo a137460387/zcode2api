@@ -251,6 +251,42 @@ footer{max-width:1320px;margin:0 auto;padding:0 22px 30px;font-size:11px;color:v
 
   <div id="page-settings" hidden>
     <section>
+      <h2>怎么进这个后台 <em>入口地址</em></h2>
+      <div class="hint" style="margin-bottom:10px">
+        本机（这台电脑）直接开下面的地址，<b>不需要密码</b>。要从手机或另一台电脑访问，见下一节。
+      </div>
+      <div class="tw"><table><tbody id="entryUrls"></tbody></table></div>
+    </section>
+
+    <section>
+      <h2>从其他设备访问 <em id="setAccessState"></em></h2>
+      <div class="hint" style="margin-bottom:12px">
+        默认只监听 <code>127.0.0.1</code>，别的设备连不上；非本机访问还要求密码。要免密从局域网访问，
+        两步：<b>①</b> 把监听地址改成 <code>0.0.0.0</code>（需重启）；<b>②</b> 打开「完全免密」。
+      </div>
+      <div class="row">
+        <div style="flex:none;min-width:230px">
+          <label class="fld">监听地址（改完需重启）</label>
+          <select id="setHost">
+            <option value="127.0.0.1">127.0.0.1（仅本机，最安全）</option>
+            <option value="0.0.0.0">0.0.0.0（允许局域网访问）</option>
+          </select>
+        </div>
+        <div style="flex:none"><button class="btn primary" data-act="savehost">保存监听地址</button></div>
+        <div style="flex:none;min-width:200px">
+          <label class="fld">完全免密（含非本机）</label>
+          <button class="btn" id="btnOpen" data-act="toggleopen" data-on="0">读不到状态</button>
+        </div>
+      </div>
+      <div id="openWarn" class="hint" style="margin-top:12px"></div>
+      <div class="hint" style="margin-top:10px">
+        不想免密也行：在下面「面板访问密码」里设一个密码，其他设备用密码进。或者完全不开放
+        （保持只监听 127.0.0.1）。注意这个面板能改 API Key、删账号——同一局域网里其他人
+        也能访问时，等于把凭据管理交出去，所以「完全免密」默认是关的。
+      </div>
+    </section>
+
+    <section>
       <h2>面板访问密码 <em id="setPwdState"></em></h2>
       <div class="hint" style="margin-bottom:12px">
         用于从<b>非本机</b>打开本面板。本机访问默认免密（可用 <code>PANEL_LOCAL_BYPASS=0</code> 关闭）。
@@ -281,6 +317,7 @@ footer{max-width:1320px;margin:0 auto;padding:0 22px 30px;font-size:11px;color:v
         <div><label class="fld">单账号最小请求间隔 (ms)</label><input id="rt-minIntervalMs" type="number" min="1"></div>
         <div><label class="fld">3012 风控冷却 (分钟)</label><input id="rt-cooldown3012Min" type="number" min="0"></div>
         <div><label class="fld">captcha 参数 TTL (ms)</label><input id="rt-paramTtlMs" type="number" min="0"></div>
+        <div><label class="fld">参数可用时效 (ms)</label><input id="rt-paramUsableMs" type="number" min="1000"></div>
         <div><label class="fld">参数池上限</label><input id="rt-poolSize" type="number" min="1"></div>
         <div><label class="fld">换号 / 换参重试上限</label><input id="rt-maxRetries" type="number" min="0"></div>
       </div>
@@ -791,6 +828,7 @@ async function loadSettings() {
     $('rt-minIntervalMs').value = rt.minIntervalMs
     $('rt-cooldown3012Min').value = rt.cooldown3012Min
     $('rt-paramTtlMs').value = rt.paramTtlMs
+    $('rt-paramUsableMs').value = rt.paramUsableMs
     $('rt-poolSize').value = rt.poolSize
     $('rt-maxRetries').value = rt.maxRetries
     const rows = [
@@ -807,10 +845,83 @@ async function loadSettings() {
     $('setInfo').innerHTML = rows.map(([k, v]) =>
       '<tr><td style="width:170px;color:var(--dim)">' + esc(k) + '</td><td class="mono">' + esc(v || '-') + '</td></tr>').join('')
     $('logfile').textContent = s.usageDir ? ('用量日志 ' + s.usageDir) : ''
+    renderAccess(s)
     renderPool()
   } catch (e) {
     if (String(e.message) !== 'unauthorized') markStale('设置', e)
   }
+}
+
+/** 入口地址与"从其他设备访问"的状态。把"怎么进"直接写在页面上，而不是只留在文档里。 */
+function renderAccess(s) {
+  const urls = s.entryUrls || ['http://127.0.0.1:' + ((s.listen && s.listen.port) || '') + '/']
+  $('entryUrls').innerHTML = urls.map((u, i) =>
+    '<tr><td style="width:60px;color:var(--dim)">' + (i === 0 ? '本机' : '局域网') + '</td>'
+    + '<td><a href="' + esc(u) + '" target="_blank" rel="noopener" class="mono">' + esc(u) + '</a></td>'
+    + '<td class="hint" style="font-size:11px">' + (i === 0 ? '免密直接进' : '需已开放局域网访问') + '</td></tr>').join('')
+
+  const bindsAll = s.listen && (s.listen.host === '0.0.0.0' || s.listen.host === '::')
+  const open = s.panel && s.panel.disableAuth
+  const hasPwd = s.panel && s.panel.hasPassword
+  $('setAccessState').textContent = open
+    ? (bindsAll ? '(完全免密 + 已开放局域网)' : '(完全免密，但只监听本机)')
+    : (hasPwd ? '(非本机需密码)' : '(仅本机可访问)')
+  if ($('setHost')) $('setHost').value = bindsAll ? '0.0.0.0' : '127.0.0.1'
+  if ($('btnOpen')) {
+    $('btnOpen').textContent = open ? '已开启（点此关闭）' : '已关闭（点此开启）'
+    $('btnOpen').dataset.on = open ? '1' : '0'
+    $('btnOpen').className = 'btn' + (open ? ' danger' : '')
+  }
+  // 警示在开启时**持续显示**（不是一次性 toast）：这个状态会影响谁能管理凭据，
+  // 必须是页面上随时看得见的事实，而不是一条看过就没的提示。
+  $('openWarn').innerHTML = open
+    ? '<span class="badge bad">完全免密已开启</span> 任何能连到这个端口的人都能管理账号与 API Key'
+      + (bindsAll ? '，且服务监听 <code>0.0.0.0</code>（局域网内均可访问）。' : '（目前只监听本机，风险有限）。')
+      + ' 不打算这样就把上面的开关关掉。'
+    : (hasPwd
+      ? '<span class="badge ok">非本机需密码</span> 其他设备用你设置的面板密码登录。'
+      : '<span class="badge off">免密仅限本机</span> 其他设备要进，需设密码或打开上面的开关。')
+  if (s.panel && !s.panel.fromLocal) {
+    $('openWarn').innerHTML += '<div class="hint" style="margin-top:6px">你当前<b>不是</b>从本机访问的'
+      + (s.panel.disableAuth
+        ? '，现在能进来是因为开着完全免密。'
+        : '，现在能进来是因为带了面板密码。')
+      + '关掉免密前请先确认设了密码，否则这台设备会立刻失去访问权限。</div>'
+  }
+}
+
+async function toggleOpen() {
+  const on = $('btnOpen').dataset.on !== '1'
+  const p = (SETTINGS && SETTINGS.panel) || {}
+  if (on) {
+    if (!window.confirm('开启完全免密后，任何能连到这个端口的人都能管理账号与 API Key（含非本机）。确定开启？')) return
+  } else if (!p.fromLocal && !p.hasPassword) {
+    // 这一条是实测踩出来的：从非本机访问时关掉免密，这台设备**立刻**就进不去了
+    // （非本机要密码，而现在还没设密码），只能回到那台电脑上重新打开。
+    if (!window.confirm('你现在是通过非本机访问，且还没有设置面板密码。关掉免密后**这台设备会立刻失去访问权限**，只能在那台运行服务的电脑上重新打开。确定关闭？')) return
+  }
+  try {
+    const r = await postJSON('/settings/save', { panelDisableAuth: on })
+    if (r.errors && Object.keys(r.errors).length) return toast('保存失败：' + JSON.stringify(r.errors), 'err')
+    toast(on ? '已开启完全免密' : '已关闭完全免密', on ? 'err' : 'ok')
+    if (r.settings) SETTINGS = r.settings
+    renderAccess(r.settings || SETTINGS)
+  } catch (e) {
+    toast('操作失败：' + e.message + (e.message === 'unauthorized' ? '（你已经把自己关在门外了：回到那台电脑上用 http://127.0.0.1:' + ((SETTINGS && SETTINGS.listen && SETTINGS.listen.port) || 28630) + '/ 重新打开）' : ''), 'err')
+  }
+}
+
+async function saveHost() {
+  const host = $('setHost').value
+  try {
+    const r = await postJSON('/settings/save', { host })
+    if (r.errors && Object.keys(r.errors).length) return toast('保存失败：' + JSON.stringify(r.errors), 'err')
+    toast(host === '0.0.0.0'
+      ? '监听地址已保存为 0.0.0.0，**重启后生效**（重启前其他设备仍连不上）'
+      : '监听地址已保存为 127.0.0.1，重启后生效', 'ok')
+    if (r.settings) SETTINGS = r.settings
+    loadSettings()
+  } catch (e) { toast('保存失败：' + e.message, 'err') }
 }
 
 async function savePassword() {
@@ -847,6 +958,7 @@ async function saveRuntime() {
     minIntervalMs: $('rt-minIntervalMs').value,
     cooldown3012Min: $('rt-cooldown3012Min').value,
     paramTtlMs: $('rt-paramTtlMs').value,
+    paramUsableMs: $('rt-paramUsableMs').value,
     poolSize: $('rt-poolSize').value,
     maxRetries: $('rt-maxRetries').value,
   }
@@ -995,6 +1107,8 @@ function bindEvents() {
     if (act === 'savekey') return saveApiKey()
     if (act === 'saveruntime') return saveRuntime()
     if (act === 'reloadsettings') return loadSettings()
+    if (act === 'toggleopen') return toggleOpen()
+    if (act === 'savehost') return saveHost()
     if (act === 'logout') return logout()
     return undefined
   })

@@ -339,18 +339,29 @@ export function registerPanelRoutes(app, deps) {
   // ─────────────────────────── 设置 ───────────────────────────
 
   app.get('/settings', panelAuth, (req, res) => {
-    res.json(settings.view({
-      farmUrl,
-      usageDir: path.dirname(usage.logFile),
-      paramPoolStatus: poolStatus(),
-    }))
+    res.json({
+      ...settings.view({
+        farmUrl,
+        usageDir: path.dirname(usage.logFile),
+        paramPoolStatus: poolStatus(),
+      }),
+      // 面板自身的安全状态：免密开关、是否有密码、来源。前端据此显示警示与开关状态。
+      panel: auth.status(req),
+    })
   })
 
   app.post('/settings/save', panelAuth, (req, res) => {
     const r = settings.save(req.body ?? {})
     const ok = Object.keys(r.errors).length === 0
     if (!ok) log(`[panel] 设置部分未生效：${JSON.stringify(r.errors)}`)
-    res.json({ ok, ...r, settings: settings.view({ farmUrl, usageDir: path.dirname(usage.logFile), paramPoolStatus: poolStatus() }) })
+    res.json({
+      ok,
+      ...r,
+      settings: {
+        ...settings.view({ farmUrl, usageDir: path.dirname(usage.logFile), paramPoolStatus: poolStatus() }),
+        panel: auth.status(req),
+      },
+    })
   })
 
   // ─────────────────────────── 兼容与运维 ───────────────────────────
