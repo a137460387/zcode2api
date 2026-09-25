@@ -138,6 +138,7 @@ async function verifyOnce() {
       }, 8000);
       if (res.ok) {
         pushed++; document.getElementById('c-ok').textContent = pushed;
+        lastSuccessAt = Date.now();
         log('param 产出并推送成功（' + r.param.length + ' 字符）', 'ok');
         return true;
       } else {
@@ -171,9 +172,36 @@ async function verifyOnce() {
 // 两类失败都按指数退避（4s → 60s），成功后立即复位。
 let backoffMs = 0;
 const BACKOFF_MAX = 60000;
+let lastSuccessAt = Date.now();
+let failsAtLastReload = 0;
+let lastReloadAt = 0;
+
+/**
+ * 失败循环自愈：整页重载。
+ *
+ * 实测场景：连续验证失败拿到 F001（阿里云风控/自动化判定）后，这个页面的 SDK 状态就
+ * "卡"在失败态——退避到 60s 仍一直 F001，**一个参数都产不出来**，而面板只能显示
+ * "池是空的"。整页重载会重新加载 SDK、重新初始化实例，实测能恢复正常产出。
+ *
+ * 两道闸门避免"失败即重载"变成重载风暴：
+ * - 距上次成功已超过 2 分钟，且期间至少失败 6 次（偶发单次失败不值得重载）；
+ * - 距上次重载已超过 5 分钟（重载后若仍失败，说明不是页面状态问题，别再刷）。
+ */
+function maybeReloadOnFailureLoop() {
+  const now = Date.now();
+  if (now - lastSuccessAt < 120000) return;
+  if (fails - failsAtLastReload < 6) return;
+  if (now - lastReloadAt < 300000) return;
+  failsAtLastReload = fails;
+  lastReloadAt = now;
+  log('连续失败且已 ' + Math.round((now - lastSuccessAt) / 1000) + 's 无成功产出，整页重载以复位 SDK 状态', 'warn');
+  report({ force: true }).finally(() => { try { location.reload() } catch (e) { /* 忽略 */ } });
+}
+
 async function loop() {
   for (;;) {
     let pool = null;
+    let usable = null;
     let newestAgeMs = null;
     let reachable = false;
     try {
@@ -181,12 +209,14 @@ async function loop() {
       if (res.ok) {
         const s = await res.json();
         pool = s.pool;
+        // 优先用 usable（还能被上游接受的个数）；老版本服务没有这个字段时回退到 pool
+        usable = s.usable ?? s.pool;
         newestAgeMs = s.newestAgeMs ?? null;
         reachable = true;
       }
     } catch { /* 服务不可达（含 5s 超时） */ }
     document.getElementById('c-pool').textContent = reachable
-      ? (pool + (newestAgeMs != null ? '（最新 ' + Math.round(newestAgeMs / 1000) + 's）' : ''))
+      ? (pool + (usable != null && usable !== pool ? '（可用 ' + usable + '）' : '') + (newestAgeMs != null ? '（最新 ' + Math.round(newestAgeMs / 1000) + 's）' : ''))
       : '服务未连接';
 
     if (!reachable) {
@@ -196,20 +226,20 @@ async function loop() {
     } else {
       if (backoffMs > 0) { log('连接已恢复', 'ok'); backoffMs = 0; }
       /*
-       * 产出条件（两者之一）：
-       * ① 池内数量不足（< 3）—— 保证够用
-       * ② 池内**没有新鲜参数**（最新那个已超过 FRESH_MS）—— 保证有效性
+       * 产出判据：**可用参数**不足 TARGET_POOL 就补货。
        *
-       * 为什么必须有 ②：只按数量判断时，池满即停止产出，池里参数会逐秒变陈；
-       * 取到陈参数会被上游判 3007。实测池稳定在 3 个、最新参数已 48s 大仍不产出。
-       * 上游对 param 的实际时效短于我们的 TTL（8 分钟），故按"新鲜度"补充。
+       * 这是"按需产出"而不是"定时滴灌"。曾经的判据是"最新参数超过 FRESH_MS(20s) 就产一个"，
+       * 于是稳态变成每 20s 必产一个（约 180 次/小时），与池里有没有无关——空转时也在持续
+       * 做验证。实测这样跑到约 25 次后被阿里云风控判 F001，之后一个参数都产不出来。
+       *
+       * 用 `usable` 而不是 `pool` 是关键：池里 6 个全陈时 pool=6 看着健康，实际一个都不能用；
+       * 服务端的 ParamPool 现在也会主动丢弃过时效的参数（不再递给上游换 3007）。
        */
-      const FRESH_MS = 20000;
-      const needFresh = newestAgeMs == null || newestAgeMs > FRESH_MS;
-      const needCount = pool != null && pool < 3;
-      if (needCount || needFresh) {
+      const TARGET_POOL = 2;
+      const needCount = usable != null && usable < TARGET_POOL;
+      if (needCount) {
         const ok = await verifyOnce();
-        // 验证失败（断网/SDK 加载失败等）也要退避，避免持续失败刷屏与白耗请求
+        // 验证失败（断网/SDK 加载失败/被风控等）也要退避，避免持续失败刷屏与白耗请求
         if (ok === false) {
           backoffMs = Math.min(backoffMs ? backoffMs * 2 : 8000, BACKOFF_MAX);
           if (backoffMs > 8000) log('验证连续失败，退避 ' + Math.round(backoffMs / 1000) + 's 后重试（检查网络与阿里 SDK 是否可访问）', 'warn');
@@ -217,6 +247,7 @@ async function loop() {
           backoffMs = 0;
         }
       }
+      maybeReloadOnFailureLoop();
     }
     await report();
     await new Promise((r) => setTimeout(r, backoffMs || 2000));

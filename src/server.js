@@ -288,7 +288,7 @@ export async function main() {
   })
   const store = new AccountStore(config.poolDir)
   const pool = new AccountPool(store, { minIntervalMs: config.minIntervalMs, cooldown3012Ms: config.cooldown3012Ms })
-  const paramPool = new ParamPool({ ttlMs: config.paramTtlMs, maxSize: config.poolSize })
+  const paramPool = new ParamPool({ ttlMs: config.paramTtlMs, maxSize: config.poolSize, usableMs: config.paramUsableMs })
   const requestLog = createRequestLog({})
   const usage = new UsageStore({ dir: path.join(config.rootDir, 'usage'), log })
   const panelAuth = new PanelAuth({
