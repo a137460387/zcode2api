@@ -48,7 +48,7 @@ async function verifyOnce() {
   if (verifying) return;
   verifying = true;
   try {
-    if (typeof window.initAliyunCaptcha !== 'function') { log('SDK 未加载', 'bad'); return; }
+    if (typeof window.initAliyunCaptcha !== 'function') { log('SDK 未加载（网络不通？阿里 SDK CDN 无法访问）', 'bad'); return false; }
     window.AliyunCaptchaConfig = { region: 'cn', prefix: 'no8xfe' };
     // 每次全新容器（官方逻辑：每轮验证重新 init）
     const host = document.getElementById('cap-host');
@@ -66,10 +66,10 @@ async function verifyOnce() {
       onError: (e) => window.__rp({ ok: false, d: String(e && e.message || e).slice(0, 200) }),
     });
     const inst = await Promise.race([instP, new Promise((_, r) => setTimeout(() => r(new Error('实例超时')), 15000))]);
-    if (typeof inst.startTracelessVerification !== 'function') { log('无 traceless 能力', 'bad'); return; }
+    if (typeof inst.startTracelessVerification !== 'function') { log('无 traceless 能力', 'bad'); return false; }
     inst.startTracelessVerification();
     const r = await Promise.race([parP, new Promise((res) => setTimeout(() => res({ ok: false, d: 'param 超时' }), 25000))]);
-    if (!r.ok) { log('验证失败: ' + (r.d || ''), 'bad'); return; }
+    if (!r.ok) { log('验证失败: ' + (r.d || ''), 'bad'); return false; }
     total++;
     document.getElementById('c-total').textContent = total;
     document.getElementById('c-last').textContent = new Date().toLocaleTimeString();
@@ -79,24 +79,32 @@ async function verifyOnce() {
       if (res.ok) {
         pushed++; document.getElementById('c-ok').textContent = pushed;
         log('param 产出并推送成功（' + r.param.length + ' 字符）', 'ok');
+        return true;
       } else {
         // 服务在，但拒绝了这次上报（如参数格式不符）
         log('推送被拒绝 HTTP ' + res.status + '（param 未入池）', 'warn');
+        return false;
       }
     } catch {
       // 服务不可达：该 param 只能丢弃（一次性凭据，无法重放）
       log('推送失败：代理服务不可达，本次 param 已丢弃', 'bad');
+      return false;
     }
   } catch (e) {
     log('异常: ' + (e && e.message || e), 'bad');
+    return false;
   } finally {
     verifying = false;
   }
 }
 
 // 循环：池不满时持续产出（代理通过 /param-status 告知池状态）
-// 失败退避：服务不可达时不再白跑验证（验证码会白耗），并按指数退避探测，
-// 避免服务未启动时每 4 秒刷一次 Failed to fetch 把日志打爆。
+//
+// 退避（覆盖两类失败，均为实测遇到的问题）：
+// ① 代理服务不可达 —— 每 4s 硬重试会刷爆日志（实测曾累积 408 条 Failed to fetch）
+// ② 验证环节失败（如断网导致阿里 SDK CDN 加载不了、实例初始化超时）——
+//    同样会持续失败刷屏（实测断网时反复出现"实例超时"）
+// 两类失败都按指数退避（4s → 60s），成功后立即复位。
 let backoffMs = 0;
 const BACKOFF_MAX = 60000;
 async function loop() {
@@ -114,12 +122,21 @@ async function loop() {
     document.getElementById('c-pool').textContent = reachable ? pool : '服务未连接';
 
     if (!reachable) {
-      // 明确提示原因，且只在状态变化时记一条日志（不刷屏）
+      // 只在状态变化时记一条日志（不刷屏）
       if (backoffMs === 0) log('代理服务不可达（' + new URL('/param-status', location.href).origin + '）——等待恢复，期间不产出 param', 'bad');
       backoffMs = Math.min(backoffMs ? backoffMs * 2 : 4000, BACKOFF_MAX);
     } else {
-      if (backoffMs > 0) { log('代理服务已恢复连接', 'ok'); backoffMs = 0; }
-      if (pool != null && pool < 3) await verifyOnce();
+      if (backoffMs > 0) { log('连接已恢复', 'ok'); backoffMs = 0; }
+      if (pool != null && pool < 3) {
+        const ok = await verifyOnce();
+        // 验证失败（断网/SDK 加载失败等）也要退避，避免持续失败刷屏与白耗请求
+        if (ok === false) {
+          backoffMs = Math.min(backoffMs ? backoffMs * 2 : 8000, BACKOFF_MAX);
+          if (backoffMs > 8000) log('验证连续失败，退避 ' + Math.round(backoffMs / 1000) + 's 后重试（检查网络与阿里 SDK 是否可访问）', 'warn');
+        } else {
+          backoffMs = 0;
+        }
+      }
     }
     await new Promise((r) => setTimeout(r, backoffMs || 4000));
   }
