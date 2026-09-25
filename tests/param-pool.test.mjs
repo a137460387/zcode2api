@@ -78,3 +78,36 @@ describe('ParamPool 配置健壮性', () => {
     expect(p.status().received).toBe(1)
   })
 })
+
+// 农场页按"新鲜度"补充参数（不只按数量）——此前提按数量时，池满即停产出，
+// 池里参数逐秒变陈，取到陈参数会被上游判 3007。故 status() 需暴露最新参数年龄。
+describe('ParamPool.status 暴露参数新鲜度', () => {
+  it('空池时 newestAgeMs 为 null', () => {
+    const p = new ParamPool({})
+    expect(p.status().newestAgeMs).toBeNull()
+  })
+
+  it('newestAgeMs 反映"最新"那个参数的年龄（不是最旧的）', () => {
+    let t = 1000
+    const p = new ParamPool({ ttlMs: 600000, maxSize: 6, now: () => t })
+    p.push('OLD')
+    t += 30000
+    p.push('NEW')
+    expect(p.status().newestAgeMs).toBe(0)  // 刚推入的
+    t += 5000
+    expect(p.status().newestAgeMs).toBe(5000)
+  })
+
+  it('取走最新参数后，newestAgeMs 退回到剩下的最新者', () => {
+    let t = 1000
+    const p = new ParamPool({ ttlMs: 600000, maxSize: 6, now: () => t })
+    p.push('A')
+    t += 40000
+    p.push('B')
+    expect(p.status().newestAgeMs).toBe(0)
+    p.takeSync() // 取走 A（FIFO）
+    expect(p.status().newestAgeMs).toBe(0) // B 仍是 0 龄
+    t += 10000
+    expect(p.status().newestAgeMs).toBe(10000)
+  })
+})

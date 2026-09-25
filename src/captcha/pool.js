@@ -58,12 +58,19 @@ export class ParamPool {
 
   status() {
     this.prune()
+    // 最新参数的年龄（ms）：农场页据此判断"池里还有没有新鲜参数可补"。
+    // 只看池的数量是不够的——池满时农场会停止产出，池里参数逐渐变陈，
+    // 取到陈参数会被上游判 3007（实测：池稳定在 3 个但最新参数已 48s 大）。
+    const newestAgeMs = this.items.length
+      ? this.now() - Math.max(...this.items.map((it) => it.bornAt))
+      : null
     return {
       pool: this.items.length,
       received: this.received,
       used: this.used,
       lastPushAt: this.lastPushAt,
       lastConsumeAt: this.lastConsumeAt,
+      newestAgeMs,
     }
   }
 }

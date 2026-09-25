@@ -110,16 +110,20 @@ const BACKOFF_MAX = 60000;
 async function loop() {
   for (;;) {
     let pool = null;
+    let newestAgeMs = null;
     let reachable = false;
     try {
       const res = await fetch('/param-status');
       if (res.ok) {
         const s = await res.json();
         pool = s.pool;
+        newestAgeMs = s.newestAgeMs ?? null;
         reachable = true;
       }
     } catch { /* 服务不可达 */ }
-    document.getElementById('c-pool').textContent = reachable ? pool : '服务未连接';
+    document.getElementById('c-pool').textContent = reachable
+      ? (pool + (newestAgeMs != null ? '（最新 ' + Math.round(newestAgeMs / 1000) + 's）' : ''))
+      : '服务未连接';
 
     if (!reachable) {
       // 只在状态变化时记一条日志（不刷屏）
@@ -127,7 +131,19 @@ async function loop() {
       backoffMs = Math.min(backoffMs ? backoffMs * 2 : 4000, BACKOFF_MAX);
     } else {
       if (backoffMs > 0) { log('连接已恢复', 'ok'); backoffMs = 0; }
-      if (pool != null && pool < 3) {
+      /*
+       * 产出条件（两者之一）：
+       * ① 池内数量不足（< 3）—— 保证够用
+       * ② 池内**没有新鲜参数**（最新那个已超过 FRESH_MS）—— 保证有效性
+       *
+       * 为什么必须有 ②：只按数量判断时，池满即停止产出，池里参数会逐秒变陈；
+       * 取到陈参数会被上游判 3007。实测池稳定在 3 个、最新参数已 48s 大仍不产出。
+       * 上游对 param 的实际时效短于我们的 TTL（8 分钟），故按"新鲜度"补充。
+       */
+      const FRESH_MS = 20000;
+      const needFresh = newestAgeMs == null || newestAgeMs > FRESH_MS;
+      const needCount = pool != null && pool < 3;
+      if (needCount || needFresh) {
         const ok = await verifyOnce();
         // 验证失败（断网/SDK 加载失败等）也要退避，避免持续失败刷屏与白耗请求
         if (ok === false) {
@@ -138,7 +154,7 @@ async function loop() {
         }
       }
     }
-    await new Promise((r) => setTimeout(r, backoffMs || 4000));
+    await new Promise((r) => setTimeout(r, backoffMs || 2000));
   }
 }
 document.getElementById('btn-now').onclick = verifyOnce;
