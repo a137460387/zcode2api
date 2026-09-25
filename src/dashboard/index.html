@@ -629,9 +629,23 @@ function renderCards() {
   const ageCls = age === null || age === undefined ? 'bad' : age < 20000 ? 'ok' : age < 60000 ? 'warn' : 'bad'
   const card = (k, v, s, cls) => '<div class="card ' + (cls || '') + '"><div class="k">' + k + '</div>'
     + '<div class="v">' + v + '</div><div class="s">' + s + '</div></div>'
+  /**
+   * 不可用的原因**按实际数量列出来**，不要写死一串可能对不上的原因。
+   * 实测踩到：文案写"停用/冷却/需重登"，而当时 6 个不可用账号的真实原因是
+   * "4 个无资源包 + 1 个密钥无效 + 1 个停用"——写着的原因一个都对不上，
+   * 用户会以为面板看错了。
+   */
+  const reasonCount = {
+    停用: ACCOUNTS.filter((a) => !a.enabled).length,
+    冷却: ACCOUNTS.filter((a) => a.enabled && a.cooldownRemainMs > 0).length,
+    需重登: ACCOUNTS.filter((a) => a.enabled && a.needsRelogin).length,
+    无资源包: ACCOUNTS.filter((a) => a.enabled && a.noPackage).length,
+    密钥无效: ACCOUNTS.filter((a) => a.enabled && a.invalidKey).length,
+  }
+  const badDetail = Object.entries(reasonCount).filter(([, n]) => n > 0).map(([k, n]) => n + ' 个' + k).join(' · ')
   box.innerHTML =
     card('可用账号', healthy + ' <small>/ ' + total + '</small>',
-      total - healthy > 0 ? (total - healthy) + ' 个不可用（停用/冷却/需重登）' : '全部健康', healthy ? 'ok' : 'bad')
+      total - healthy > 0 ? badDetail : '全部健康', healthy ? 'ok' : 'bad')
     + card('套餐剩余', bal ? fmt(bal) + ' <small>单位</small>' : '-',
       balTotal ? '总量 ' + fmt(balTotal) + ' · 剩余 ' + ((bal / balTotal) * 100).toFixed(1) + '%' : '未查询额度', 'accent')
     + card('captcha 参数池', (pool.pool === undefined ? '-' : pool.pool) + ' <small>个</small>',
