@@ -137,6 +137,38 @@ export class AccountStore {
     }))
   }
 
+  /**
+   * 更新某个**已存在**账号的凭据（重新导入本机登录 / 重新走一次 OAuth）。
+   *
+   * 为什么不能直接用 save()：`save(newAccountFields(...))` 是一份**全新快照**，对已存在的 id
+   * 会把整条记录覆盖掉——`stats`（请求数、token 累计）、`strikes`（累计风控次数）、
+   * `createdAt`、`enabled` 全部归零。实测踩到：用户点了「扫描本机 ZCode 登录」，
+   * 面板上的请求数立刻变成 0、Flash 用量归零，看着像"账丢了"。
+   * 那些是**历史事实**，与凭据新旧无关，重新登录不该抹掉它们。
+   *
+   * 唯一要主动清掉的是 `needsRelogin`：重新登录成功本身就证明凭据可用了，
+   * 不清它的话账号会永远被选号池排除在外（`healthy()` 会一直判它不健康）。
+   * 不重新启用 `enabled`：被系统因风控停用的号要不要恢复，交给用户在面板上决定，
+   * 悄悄启用等于把风控防线绕过去。
+   */
+  upsertCredentials(fields) {
+    if (!fields || typeof fields !== 'object') return Promise.reject(new TypeError('account must be an object'))
+    const { id } = fields
+    if (typeof id !== 'string' || id.length === 0) {
+      return Promise.reject(new TypeError('account.id is required'))
+    }
+    return Promise.resolve(this.withLock(id, () => {
+      const cur = this.get(id)
+      if (!cur) return this.writeUnlocked(fields)
+      const KEEP = ['stats', 'strikes', 'createdAt', 'enabled', 'cooldownUntil']
+      const next = { ...cur, ...fields }
+      for (const k of KEEP) if (cur[k] !== undefined) next[k] = cur[k]
+      next.needsRelogin = false
+      this.writeUnlocked(next)
+      return next
+    }))
+  }
+
   delete(id) {
     try { fs.unlinkSync(this.fileFor(id)); return true } catch { return false }
   }

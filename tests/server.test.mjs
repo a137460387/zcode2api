@@ -162,9 +162,13 @@ describe('account login & management', () => {
 // rejection（Node ≥15 默认模式下可能终止进程）。
 // 断言方式：supertest 不设 deadline，若实现仍挂死则整个测试超时失败；正确的实现回 500。
 describe('管理面 async 路由的异常处理', () => {
+  // 只把"写"方法做成失败：读仍可用（否则测不出"写失败→500"这条路径本身）。
+  // 三个写方法都要列上：管理面不同路径分别用 save / update / upsertCredentials，
+  // 漏一个就会出现"某个写路径的失败被静默吞掉"的假绿。
   const throwingStore = (base, msg = 'disk full') => Object.assign(Object.create(base), {
     update: () => Promise.reject(new Error(msg)),
     save: () => Promise.reject(new Error(msg)),
+    upsertCredentials: () => Promise.reject(new Error(msg)),
     list: () => base.list(),
     get: (id) => base.get(id),
     delete: (id) => base.delete(id),
@@ -179,7 +183,7 @@ describe('管理面 async 路由的异常处理', () => {
     expect(r.body.error.message).toBeTruthy()
   })
 
-  it('/accounts/login/:provider/poll：store.save 抛错时返回 500，而不是挂死', async () => {
+  it('/accounts/login/:provider/poll：store 写盘抛错时返回 500，而不是挂死', async () => {
     const base = buildDeps({
       fetchImpl: async (url) => (url.includes('/oauth/token')
         ? { json: async () => ({ code: 0, data: { token: 'ZJWT' } }) }

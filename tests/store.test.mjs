@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach } from 'vitest'
+import { describe, it, expect, beforeEach, afterEach } from 'vitest'
 import os from 'node:os'
 import fs from 'node:fs'
 import path from 'node:path'
@@ -328,5 +328,72 @@ describe('AccountStore concurrency', () => {
     expect(results.filter((r) => r.status === 'rejected').every((r) => r.reason instanceof TypeError)).toBe(true)
     expect(store.get('bigmodel:async2').stats.requests).toBe(50)
     expect(store.locks.size).toBe(0)
+  })
+})
+
+/**
+ * 重新导入 / 重新登录同一账号时，**历史统计不能被抹掉**。
+ *
+ * 实测踩到：用户点了「扫描本机 ZCode 登录」，面板上的请求数立刻变成 0、累计 token 归零，
+ * 看着像"账丢了"。原因是导入走的是 `save(newAccountFields(...))` —— 一份全新快照，
+ * 对已存在的 id 会把整条记录覆盖（stats/strikes/createdAt/enabled 全部清零）。
+ */
+describe('upsertCredentials：刷新凭据但保留历史', () => {
+  let dir
+  beforeEach(() => { dir = fs.mkdtempSync(path.join(os.tmpdir(), 'z2a-store-')) })
+  afterEach(() => { fs.rmSync(dir, { recursive: true, force: true }) })
+
+  it('已存在的账号：统计与风控状态保留，凭据被更新', async () => {
+    const store = new AccountStore(dir)
+    await store.save(newAccountFields({ provider: 'bigmodel', type: 'oauth', jwt: 'OLD', userInfo: { user_id: '7' } }))
+    await store.update('bigmodel:7', {
+      stats: { requests: 42, inputTokens: 1000, outputTokens: 200, lastUsedAt: 123, lastError: null },
+      strikes: 2,
+      enabled: false,
+      cooldownUntil: 999,
+    })
+    const before = store.get('bigmodel:7').createdAt
+    await store.upsertCredentials(newAccountFields({ provider: 'bigmodel', type: 'oauth', jwt: 'NEW', userInfo: { user_id: '7' } }))
+    const after = store.get('bigmodel:7')
+    expect(after.jwt).toBe('NEW')                  // 凭据更新了
+    expect(after.stats.requests).toBe(42)          // 统计没被抹掉
+    expect(after.stats.inputTokens).toBe(1000)
+    expect(after.strikes).toBe(2)
+    expect(after.enabled).toBe(false)              // 停用状态保留（是否恢复由用户决定）
+    expect(after.cooldownUntil).toBe(999)
+    expect(after.createdAt).toBe(before)
+  })
+
+  it('重新登录清掉 needsRelogin（否则账号永远进不了选号池）', async () => {
+    const store = new AccountStore(dir)
+    await store.save(newAccountFields({ provider: 'bigmodel', type: 'oauth', jwt: 'OLD', userInfo: { user_id: '8' } }))
+    await store.update('bigmodel:8', { needsRelogin: true })
+    await store.upsertCredentials(newAccountFields({ provider: 'bigmodel', type: 'oauth', jwt: 'NEW', userInfo: { user_id: '8' } }))
+    expect(store.get('bigmodel:8').needsRelogin).toBe(false)
+  })
+
+  it('不存在的账号：等价于新建', async () => {
+    const store = new AccountStore(dir)
+    const a = await store.upsertCredentials(newAccountFields({ provider: 'bigmodel', type: 'oauth', jwt: 'J', userInfo: { user_id: '9' } }))
+    expect(a.id).toBe('bigmodel:9')
+    expect(store.get('bigmodel:9').jwt).toBe('J')
+    expect(store.get('bigmodel:9').stats.requests).toBe(0)
+  })
+
+  it('并发写入不丢更新（与 update 走同一把 per-id 锁）', async () => {
+    const store = new AccountStore(dir)
+    await store.save(newAccountFields({ provider: 'bigmodel', type: 'oauth', jwt: 'J', userInfo: { user_id: '10' } }))
+    await Promise.all([
+      ...Array.from({ length: 20 }, () => store.update('bigmodel:10', (cur) => ({ stats: { ...cur.stats, requests: cur.stats.requests + 1 } }))),
+      store.upsertCredentials(newAccountFields({ provider: 'bigmodel', type: 'oauth', jwt: 'NEW', userInfo: { user_id: '10' } })),
+    ])
+    expect(store.get('bigmodel:10').stats.requests).toBe(20)
+    expect(store.get('bigmodel:10').jwt).toBe('NEW')
+  })
+
+  it('参数非法时拒绝，不产生排队任务', async () => {
+    const store = new AccountStore(dir)
+    await expect(store.upsertCredentials(null)).rejects.toThrow(/object/)
+    await expect(store.upsertCredentials({})).rejects.toThrow(/id is required/)
   })
 })

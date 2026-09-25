@@ -7,6 +7,7 @@ import { beginBigModelLogin } from '../auth/bigmodel.js'
 import { beginZaiLogin } from '../auth/zai.js'
 import { readLocalZcodeCredentials } from '../auth/local-import.js'
 import { maskSecret } from './settings.js'
+import { modelCatalog } from '../models.js'
 
 /**
  * 管理面路由（看板用的全部接口）。
@@ -133,7 +134,30 @@ export function registerPanelRoutes(app, deps) {
     const poolNow = now()
     const rn = realNow()
     const raw = store.list()
-    return raw.map((a) => enrichAccount(a, { poolNow, realNow: rn, healthy: pool.healthy(a) }))
+    /**
+     * 账号行上的"请求数 / token"取自**落盘用量日志**（`usage/usage.jsonl`），
+     * 而不是账号自带的 `stats` 计数器。
+     *
+     * 为什么：同一件事原本有两套数字，而且会不一致——账号计数器存在账号文件里，
+     * 任何把它整条覆盖的写入（实测：重新导入本机登录）都会让它归零，于是面板出现
+     * "账号行 请求 0" 与 "用量分析里有 5 条记录" 自相矛盾。日志是只追加的事实账，
+     * 不会因为账号文件被重写而丢失；两处同源后就不会再对不上。
+     */
+    const byAcct = new Map((usage?.byAccount() ?? []).map((a) => [a.account, a.all_time]))
+    return raw.map((a) => {
+      const u = byAcct.get(a.id)
+      const view = enrichAccount(a, { poolNow, realNow: rn, healthy: pool.healthy(a) })
+      view.usage = u
+        ? {
+          requests: u.requests,
+          promptTokens: u.prompt_tokens,
+          cacheReadTokens: u.cache_read_tokens,
+          completionTokens: u.completion_tokens,
+          totalTokens: u.total_tokens,
+        }
+        : { requests: 0, promptTokens: 0, cacheReadTokens: 0, completionTokens: 0, totalTokens: 0 }
+      return view
+    })
   }
 
   // ─────────────────────────── 面板自身 ───────────────────────────
@@ -223,6 +247,8 @@ export function registerPanelRoutes(app, deps) {
     const uid = `apikey:${slug}`
     const id = `${provider}:${uid}`
     if (store.get(id)) return res.status(409).json({ error: { message: `账号 ${id} 已存在，请换一个名字` } })
+    // 已存在则 409（上面那行），所以这里确定是**新建**，用 save 而不是 upsert——
+    // upsert 的语义是"刷新已有账号的凭据并保留统计"，用在这里会让读者以为会覆盖合并。
     const account = await store.save(newAccountFields({
       provider,
       type: 'apikey',
@@ -255,7 +281,7 @@ export function registerPanelRoutes(app, deps) {
     if (!r.ok) return res.status(400).json({ error: { message: r.message, reason: r.reason } })
     const imported = []
     for (const a of r.accounts) {
-      const account = await store.save(newAccountFields({
+      const account = await store.upsertCredentials(newAccountFields({
         provider: a.provider, type: 'oauth', jwt: a.jwt,
         accessToken: a.accessToken, refreshToken: a.refreshToken, userInfo: a.userInfo,
       }))
@@ -303,7 +329,7 @@ export function registerPanelRoutes(app, deps) {
     logins.delete(loginId)
     if (winner.ok) {
       const info = winner.r.userInfo ?? {}
-      const account = await store.save(newAccountFields({
+      const account = await store.upsertCredentials(newAccountFields({
         provider: entry.provider, type: 'oauth', jwt: winner.r.token,
         accessToken: winner.r.accessToken, refreshToken: winner.r.refreshToken, userInfo: info,
       }))
@@ -324,6 +350,13 @@ export function registerPanelRoutes(app, deps) {
   })
 
   // ─────────────────────────── 用量 ───────────────────────────
+
+  /**
+   * 模型目录（面板用，走面板鉴权）。
+   * 单独开一个口而不是让面板去调 `/v1/models`：后者要 API Key，而面板不该为了显示
+   * 一张表而持有对外密钥。两边都从 `modelCatalog()` 取，不会各说各话。
+   */
+  app.get('/models', panelAuth, (req, res) => res.json(modelCatalog()))
 
   app.get('/usage/recent', panelAuth, (req, res) => {
     const limit = Math.min(500, Math.max(1, Math.floor(Number(req.query.limit) || 60)))

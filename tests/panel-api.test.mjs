@@ -437,3 +437,73 @@ describe('农场页状态接入面板', () => {
     expect(r.body.paramPool.farmReport).toEqual(report)
   })
 })
+
+// 面板的模型清单从服务端取：前端硬编码那次把别名当模型列出来，2 个模型看起来像 3 个。
+describe('/models 模型目录', () => {
+  it('返回 2 个模型，别名另列', async () => {
+    const r = await request(createApp(buildDeps())).get('/models')
+    expect(r.status).toBe(200)
+    expect(r.body.models).toHaveLength(2)
+    expect(r.body.models.map((m) => m.id)).toEqual(['glm-5.3', 'glm-5.3-flash'])
+    expect(r.body.aliases.length).toBeGreaterThan(0)
+    const ids = r.body.models.map((m) => m.id)
+    for (const a of r.body.aliases) expect(ids).not.toContain(a.pattern)
+  })
+
+  it('非本机无凭据 → 401（与其它管理面接口一致）', async () => {
+    const deps = { ...buildDeps(), isLocal: () => false }
+    expect((await request(createApp(deps)).get('/models')).status).toBe(401)
+  })
+})
+
+// 重新导入本机登录不该抹掉历史统计。实测：用户点了「扫描本机 ZCode 登录」后
+// 面板上请求数变 0、token 归零，看着像账丢了。
+describe('重新导入保留历史统计', () => {
+  it('同一账号再次导入：凭据更新、统计保留', async () => {
+    const deps = buildDeps()
+    const read = () => ({
+      ok: true,
+      source: 'test',
+      accounts: [{ provider: 'bigmodel', type: 'oauth', jwt: 'NEWJWT', accessToken: 'AT', refreshToken: 'RT', userInfo: { user_id: '42', email: 'a@b.c' } }],
+    })
+    const app = createApp({ ...deps, readLocalCredentials: read })
+    await request(app).post('/accounts/import/local').send({})
+    expect(deps.store.get('bigmodel:42').jwt).toBe('NEWJWT')
+    // 模拟已有使用历史
+    await deps.store.update('bigmodel:42', {
+      stats: { requests: 99, inputTokens: 5000, outputTokens: 900, lastUsedAt: 1, lastError: null },
+      strikes: 1,
+    })
+    await request(app).post('/accounts/import/local').send({})
+    const a = deps.store.get('bigmodel:42')
+    expect(a.jwt).toBe('NEWJWT')
+    expect(a.stats.requests).toBe(99)
+    expect(a.stats.inputTokens).toBe(5000)
+    expect(a.strikes).toBe(1)
+  })
+})
+
+// 账号行的用量必须与「用量分析」同源，否则会出现"账号行 请求 0 / 用量分析有记录"这种
+// 自相矛盾（实测：重新导入把账号自带的计数器清零后，两处数字对不上）。
+describe('/accounts 的用量取自落盘日志', () => {
+  it('账号行用量来自 usage.jsonl，而不是账号自带的 stats 计数器', async () => {
+    const deps = await withAccount(buildDeps())
+    // 账号计数器留空（模拟被覆盖后的状态），日志里有真实记录
+    await deps.usage.record({ at: Date.now(), model: 'glm-5.3', account: 'bigmodel:42', prompt_tokens: 100, cache_read_tokens: 20, completion_tokens: 7, status: 200 })
+    await deps.usage.record({ at: Date.now(), model: 'glm-5.3', account: 'bigmodel:42', prompt_tokens: 5, completion_tokens: 1, status: 200 })
+    const r = await request(createApp(deps)).get('/accounts')
+    const a = r.body.accounts[0]
+    expect(deps.store.get('bigmodel:42').stats.requests).toBe(0) // 自带计数器确实是空的
+    expect(a.usage.requests).toBe(2)                            // 面板显示的是日志里的真数
+    expect(a.usage.promptTokens).toBe(105)
+    expect(a.usage.cacheReadTokens).toBe(20)
+    expect(a.usage.completionTokens).toBe(8)
+    expect(a.usage.totalTokens).toBe(133)
+  })
+
+  it('日志里没有该账号时用量为 0（不报错、不显示 null）', async () => {
+    const deps = await withAccount(buildDeps())
+    const a = (await request(createApp(deps)).get('/accounts')).body.accounts[0]
+    expect(a.usage).toEqual({ requests: 0, promptTokens: 0, cacheReadTokens: 0, completionTokens: 0, totalTokens: 0 })
+  })
+})

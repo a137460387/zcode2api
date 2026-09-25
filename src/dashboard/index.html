@@ -206,12 +206,26 @@ footer{max-width:1320px;margin:0 auto;padding:0 22px 30px;font-size:11px;color:v
     </section>
 
     <section>
-      <h2>模型清单 <em>客户端可用的模型 id</em></h2>
+      <h2>模型清单 <em id="modelNote"></em></h2>
       <div class="tw">
         <table>
           <thead><tr><th>模型 id</th><th>映射到上游</th><th>通道</th><th>需要 captcha</th></tr></thead>
           <tbody id="models"></tbody>
         </table>
+      </div>
+      <div class="hint" style="margin-top:10px">
+        模型名<b>大小写不敏感</b>，<code>glm-5.3</code> 与 <code>GLM-5.3</code> 等价。
+      </div>
+      <div style="margin-top:14px">
+        <div class="hint" style="margin-bottom:6px">
+          别名（<b>不是模型</b>，只是"客户端写这些名字也能用"）：
+        </div>
+        <div class="tw">
+          <table>
+            <thead><tr><th>客户端写入</th><th>实际路由到</th><th>说明</th></tr></thead>
+            <tbody id="aliases"></tbody>
+          </table>
+        </div>
       </div>
     </section>
 
@@ -556,8 +570,10 @@ function accountRow(a) {
     + '<td><span class="badge info">' + esc(a.provider) + ' · ' + esc(a.type) + '</span></td>'
     + '<td>' + statusBadges(a) + '</td>'
     + '<td>' + quotaCell(a) + '</td>'
-    + '<td class="mono">' + esc(fmt(a.stats.requests)) + '</td>'
-    + '<td class="mono">' + esc(fmt(a.stats.inputTokens)) + ' / ' + esc(fmt(a.stats.outputTokens)) + '</td>'
+    + '<td class="mono">' + esc(fmt(a.usage && a.usage.requests)) + '</td>'
+    + '<td class="mono">' + esc(fmt(a.usage && a.usage.promptTokens)) + ' / '
+    + (a.usage && a.usage.cacheReadTokens ? '<span title="命中缓存的输入">' + esc(fmt(a.usage.cacheReadTokens)) + '</span>' : '0') + ' / '
+    + esc(fmt(a.usage && a.usage.completionTokens)) + '</td>'
     + '<td class="hint">' + esc(ago(a.stats.lastUsedAtIso)) + '<br>' + esc(a.createdAtIso ? '建于 ' + localTime(a.createdAtIso).slice(0, 10) : '') + '</td>'
     + '<td style="white-space:nowrap">'
     +   '<button class="btn mini" data-act="toggle" data-id="' + esc(a.id) + '" data-enabled="' + (a.enabled ? '1' : '0') + '">' + (a.enabled ? '停用' : '启用') + '</button> '
@@ -579,7 +595,7 @@ function renderAccounts() {
     return
   }
   box.innerHTML = '<table><thead><tr>'
-    + '<th>账号</th><th>类型</th><th>状态</th><th>套餐余量</th><th>请求</th><th>输入 / 输出</th><th>最近使用</th><th>操作</th>'
+    + '<th>账号</th><th>类型</th><th>状态</th><th>套餐余量</th><th>请求</th><th>输入 / 缓存 / 输出</th><th>最近使用</th><th>操作</th>'
     + '</tr></thead><tbody>' + ACCOUNTS.map(accountRow).join('') + '</tbody></table>'
 }
 
@@ -655,20 +671,36 @@ function renderFarmReport(r) {
     + (r.lastLine ? '<div class="hint mono" style="font-size:11px;margin-top:4px">' + esc(r.lastLine) + '</div>' : '')
 }
 
-const MODELS = [
-  { id: 'glm-5.3', up: 'GLM-5.3', ch: 'oauth（免费套餐）', cap: '需要' },
-  { id: 'glm-5.3-flash', up: 'GLM-5.3-Flash', ch: 'oauth（免费套餐）', cap: '需要' },
-  { id: 'claude-*', up: 'GLM-5.3-Flash', ch: '自动映射', cap: '需要' },
-]
-function renderModels() {
-  const body = $('models')
-  if (!body) return
-  body.innerHTML = MODELS.map((m) => '<tr>'
-    + '<td class="mono"><b>' + esc(m.id) + '</b></td>'
-    + '<td class="mono">' + esc(m.up) + '</td>'
-    + '<td>' + esc(m.ch) + '</td>'
-    + '<td><span class="badge warn">' + esc(m.cap) + '</span></td>'
-    + '</tr>').join('')
+/**
+ * 模型清单。**从服务端取的**（`/models`），不再是前端硬编码的数组。
+ *
+ * 前端硬编码那次把别名 `claude-*` 和两个正式模型混排在同一张"模型清单"里，
+ * 于是只有 2 个模型的产品看起来像 3 个——用户当场就问了"不是只有两个模型吗"。
+ * 现在模型与别名分两张表，数量也由数据算出来，不会再出现这种自相矛盾。
+ */
+async function loadModels() {
+  try {
+    const c = await getJSON('/models')
+    const models = c.models || []
+    const aliases = c.aliases || []
+    $('modelNote').textContent = '共 ' + models.length + ' 个模型'
+      + (aliases.length ? ' · ' + aliases.length + ' 条别名' : '')
+    $('models').innerHTML = models.map((m) => '<tr>'
+      + '<td class="mono"><b>' + esc(m.id) + '</b></td>'
+      + '<td class="mono">' + esc(m.upstream) + '</td>'
+      + '<td>' + esc(m.channel === 'oauth' ? 'oauth（免费套餐）' : m.channel) + '</td>'
+      + '<td>' + (m.needsCaptcha ? '<span class="badge warn">需要</span>' : '<span class="badge ok">不需要</span>') + '</td>'
+      + '</tr>').join('')
+    $('aliases').innerHTML = aliases.length
+      ? aliases.map((a) => '<tr>'
+        + '<td class="mono">' + esc(a.pattern) + '</td>'
+        + '<td class="mono">' + esc(a.mapsTo) + '</td>'
+        + '<td class="hint">' + esc(a.note || '') + '</td>'
+        + '</tr>').join('')
+      : '<tr><td colspan="3" class="hint">无</td></tr>'
+  } catch (e) {
+    if (String(e.message) !== 'unauthorized') markStale('模型清单', e)
+  }
 }
 
 function renderRecent(rows, total) {
@@ -1123,7 +1155,7 @@ async function startDashboard() {
   if (STARTED) return
   STARTED = true
   bindEvents()
-  renderModels()
+  await loadModels()
   await refresh()
   await loadSettings()
   await loadAnalytics()
