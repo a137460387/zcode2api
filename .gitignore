@@ -1,14 +1,25 @@
-node_modules/
-accounts/
-certs/*
-!certs/README.txt
-.env
-*.log
+# ── 注意：本机数据目录必须用**前导斜杠锚定到仓库根** ─────────────────────
+# 不带 `/` 的 `usage/` 会匹配**任意层级**的同名目录，于是把源码目录 `src/usage/`
+# 一并忽略——`src/usage/store.js` 曾因此从未进过仓库，新克隆装完依赖后 npm test /
+# npm start 直接报 "Cannot find module ./usage/store.js"。而且它是**静默**的：
+# 本地一切正常（文件就在磁盘上），只有别人克隆时才暴露。
+# 同理，`accounts/`、`certs/` 也要锚定——`usage` 是很容易撞上的模块名，`accounts` 也是。
 
-# 用量账（本机请求记录：含账号 id 与 token 计数）与面板密码哈希，均属本机数据
-usage/
+# ── 本机数据（锚定到根目录，只忽略仓库根下那一份）──────────────────────
+/accounts/
+/certs/*
+!/certs/README.txt
+/usage/
+
+# ── 密钥与凭据：**故意不锚定**，任何位置都别提交 ────────────────────────
+# 这几条宁可过宽也不要过窄：漏提交一个文件只是麻烦，误提交一个密钥是事故。
+.env
 panel.json
 panel.json.tmp
+*.log
+
+# ── 依赖与临时工作目录 ──────────────────────────────────────────────────
+node_modules/
 
 # 审查/执行过程的临时工作目录（进度账本、探针、报告），不入库
 .superpowers/
