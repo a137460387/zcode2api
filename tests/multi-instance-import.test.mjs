@@ -12,6 +12,8 @@ import {
 } from '../src/auth/local-import.js'
 
 const KEY = deriveCredentialKey({ platform: 'win32', home: 'C:\\Users\\tester', user: 'tester' })
+/** 与 KEY 同源的参数，供"默认行为不变"类断言复用（避免在多处重复写反斜杠路径）。 */
+const WIN = { platform: 'win32', home: 'C:\\Users\\tester', user: 'tester' }
 let dir
 const setup = () => { dir = fs.mkdtempSync(path.join(os.tmpdir(), 'z2a-mi-')) }
 
@@ -225,5 +227,55 @@ describe('Coding Plan API Key', () => {
     expect(k).toBeTruthy()
     expect(k.provider).toBe('bigmodel')
     expect(k.userInfo.id).toBe('coding-plan:zzz-1')
+  })
+})
+
+// 客户端支持用 ZCODE_CREDENTIAL_SECRET 覆盖凭据密钥。原注释写了这条、代码却没读——
+// 用户一旦给客户端设过该变量，导入就会以"解密失败"告终，而提示会误导他去重新登录。
+describe('ZCODE_CREDENTIAL_SECRET', () => {
+  it('设了该环境变量时用它派生密钥（能解开用同一 secret 加密的凭据）', () => {
+    const prev = process.env.ZCODE_CREDENTIAL_SECRET
+    try {
+      process.env.ZCODE_CREDENTIAL_SECRET = 'my-custom-secret'
+      const k = deriveCredentialKey({ platform: 'win32', home: 'X', user: 'u' })
+      expect(k.equals(crypto.createHash('sha256').update('my-custom-secret').digest())).toBe(true)
+      expect(k.equals(KEY)).toBe(false)
+    } finally {
+      if (prev === undefined) delete process.env.ZCODE_CREDENTIAL_SECRET
+      else process.env.ZCODE_CREDENTIAL_SECRET = prev
+    }
+  })
+
+  it('未设时回落到路径派生（默认行为不变）', () => {
+    const prev = process.env.ZCODE_CREDENTIAL_SECRET
+    try {
+      delete process.env.ZCODE_CREDENTIAL_SECRET
+      expect(deriveCredentialKey(WIN).equals(KEY)).toBe(true)
+    } finally {
+      if (prev !== undefined) process.env.ZCODE_CREDENTIAL_SECRET = prev
+    }
+  })
+
+  it('显式传入的 secret 优先于环境变量（测试与隔离 profile 依赖这点）', () => {
+    const prev = process.env.ZCODE_CREDENTIAL_SECRET
+    try {
+      process.env.ZCODE_CREDENTIAL_SECRET = 'env-secret'
+      const k = deriveCredentialKey({ secret: 'explicit' })
+      expect(k.equals(crypto.createHash('sha256').update('explicit').digest())).toBe(true)
+    } finally {
+      if (prev === undefined) delete process.env.ZCODE_CREDENTIAL_SECRET
+      else process.env.ZCODE_CREDENTIAL_SECRET = prev
+    }
+  })
+
+  it('空字符串视为未设置（不要派生成 sha256("")）', () => {
+    const prev = process.env.ZCODE_CREDENTIAL_SECRET
+    try {
+      process.env.ZCODE_CREDENTIAL_SECRET = '   '
+      expect(deriveCredentialKey(WIN).equals(KEY)).toBe(true)
+    } finally {
+      if (prev === undefined) delete process.env.ZCODE_CREDENTIAL_SECRET
+      else process.env.ZCODE_CREDENTIAL_SECRET = prev
+    }
   })
 })

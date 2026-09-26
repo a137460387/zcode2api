@@ -24,8 +24,14 @@ import crypto from 'node:crypto'
 
 const CRED_REL = path.join('.zcode', 'v2', 'credentials.json')
 
-/** 派生凭据解密密钥。暴露出来便于单测注入自定义 secret。 */
-export function deriveCredentialKey({ platform = process.platform, home = os.homedir(), user = os.userInfo().username, secret } = {}) {
+/**
+ * 派生凭据解密密钥。暴露出来便于单测注入自定义 secret。
+ *
+ * `secret` 缺省时**读 `ZCODE_CREDENTIAL_SECRET`**：ZCode 客户端支持用这个环境变量覆盖密钥，
+ * 那么它写出的 credentials.json 就只认那个密钥。原先注释写了这条、代码却没读——
+ * 用户一旦给客户端设过该变量，导入就会以"解密失败"告终，而提示会误导他去重新登录。
+ */
+export function deriveCredentialKey({ platform = process.platform, home = os.homedir(), user = os.userInfo().username, secret = process.env.ZCODE_CREDENTIAL_SECRET } = {}) {
   const raw = secret?.trim() || `zcode-credential-fallback:${platform}:${home}:${user}`
   return crypto.createHash('sha256').update(raw).digest()
 }
