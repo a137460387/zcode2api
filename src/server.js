@@ -183,7 +183,8 @@ export function createApp(deps) {
     const sessionKey = req.get('x-session-id') ?? null
     const timer = makeTimer(clock)
     try {
-      const body = openaiToAnthropic(req.body, mapToZcodePlan)
+      // openaiToAnthropic 现在是异步的：远程图片 URL 要先抓取转 base64。
+      const body = await openaiToAnthropic(req.body, mapToZcodePlan, { fetchImpl: deps.fetchImpl })
       const { response, account } = await gateway.complete(body, { sessionKey })
       logRequest({ model: clientModel, account: account.id, stream: body.stream, status: 200 })
       if (body.stream) {
