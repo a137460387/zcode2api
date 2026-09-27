@@ -59,6 +59,43 @@ npm start
 > 后台模式无需处理（服务启动时自动指向新端口）。
 
 
+## 开机自启
+
+已注册计划任务 **`zcode2api-Gateway`**：登录时延迟 20s 启动，无控制台窗口。
+
+```
+触发器   登录时（当前用户）
+操作     wscript.exe "D:\code\Ai\zcode2api\launch-hidden.vbs"
+工作目录  D:\code\Ai\zcode2api
+设置     允许按需启动 / 电池下也启动 / 3 次重试（间隔 1min）/ 多实例 IgnoreNew
+```
+
+启动链路与两个脚本的职责：
+
+```
+计划任务 → launch-hidden.vbs  隐藏控制台窗口（只隐藏这个，不是农场窗口）
+         → start-gateway.bat  写 logs\gateway-startup.log，然后 node src/server.js
+         → 服务自己再拉起有头 Chrome（农场，可见）
+```
+
+- **日志**：`logs\gateway-startup.log`，每次启动**截断重写**（只看当前这次启动；要留历史就在重启前自己拷走）。
+  内容里中文显示为乱码是编码问题，不影响判断——看 `[farm]` 那两行是否出现即可确认农场起来了。
+- **`start-gateway.bat` 必须保持纯 ASCII**：cmd.exe 按 OEM 代码页（本机 GBK）读 `.bat`，
+  写 UTF-8 中文注释会被解析成乱码命令（实测报 `'he' 不是内部或外部命令`）并**中断启动**。
+  中文说明放 README，别写进 `.bat`。
+- **改了 `.env` 后**：计划任务只在登录时读一次，改完要手动重启服务才生效：
+  `Stop-ScheduledTask -TaskName zcode2api-Gateway` 不会杀掉已启动的 node，
+  需结束监听 28630 的进程再 `Start-ScheduledTask`。
+- **重复触发是安全的**：`MultipleInstances=IgnoreNew`，服务已在跑时再触发不会起第二个实例
+  （已验证：PID 不变、日志无第二次启动记录）。
+- **端到端验证**：`Start-ScheduledTask -TaskName zcode2api-Gateway`，然后确认
+  `http://127.0.0.1:28630/health` 返回 200 且 `logs\gateway-startup.log` 里有 `[farm]` 行。
+
+> 排查这台机器上的进程时注意：**另一个项目 `trae2api` 的进程命令行也是 `node src/server.js`**
+> （它和自己的 `start-gateway.bat` 一起在 `D:\code\Ai\trae2api`，占 28620/28621）。
+> 按命令行匹配会误伤它——要定位本服务请按**监听端口 28630 的 PID** 找。
+
+
 ## 怎么进后台
 
 **本机（运行服务的这台电脑）**：浏览器打开 `http://127.0.0.1:28630/`，**不需要密码**。
