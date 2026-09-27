@@ -1,9 +1,74 @@
+import dns from 'node:dns'
+
 const uuid = () => globalThis.crypto.randomUUID()
 
 // Anthropic 语义的图片媒体类型白名单（png/jpeg/gif/webp）。
 const IMAGE_MEDIA_TYPES = new Set(['image/png', 'image/jpeg', 'image/gif', 'image/webp'])
 // 单张图片解码后的字节上限（Anthropic 协议按 5MB 计；超限请求发到上游也只会被拒）。
 const MAX_IMAGE_BYTES = 5 * 1024 * 1024
+
+/**
+ * SSRF 防线：拒绝让本服务代客户端抓取"内网/回环/链路本地"地址。
+ *
+ * 为什么需要：客户端在 image_url 里可以写任意 URL，服务会用 fetch 替它拉。
+ * 没有这道防线时，持有 API_KEY 的客户端可以让本机访问：
+ *   - http://169.254.169.254/...  （云元数据接口，可能泄露临时密钥）
+ *   - http://192.168.x.x / 10.x / 172.16-31.x  （内网服务，绕过防火墙）
+ *   - http://127.0.0.1:28630/...  （本机回环，包括面板自身）
+ * 即便默认 HOST=127.0.0.1 意味着攻击者先要能本机执行代码才能调 API，一旦哪天
+ * 改成 0.0.0.0（手机/另一台电脑接入），这条就立刻变成真实风险。
+ *
+ * 防什么与防不了什么：
+ * - 字面私网/回环/链路本地 IP（IPv4 + IPv6 全形式）→ 拒
+ * - hostname 解析到这些段 → 拒（靠 dns.lookup，但不防 DNS rebinding：
+ *   攻击者控制一个域名先解析到公网、抓时再切到 127.0.0.1 仍可绕过。
+ *   对"个人本地工具"的威胁模型可接受，不值得为它接 unbound/dnscrypt）
+ * - file:// / gopher:// / 非 http(s) → 拒
+ */
+const PRIVATE_IP_PATTERNS = [
+  /^127\./,                              // 回环
+  /^10\./,                               // 私网 A 类
+  /^172\.(1[6-9]|2\d|3[01])\./,          // 私网 B 类 172.16-31
+  /^192\.168\./,                         // 私网 C 类
+  /^169\.254\./,                         // 链路本地（含云元数据 169.254.169.254）
+  /^0\./,                                // "本网络"
+  /^::1$/, /^::ffff:127\./,              // IPv6 回环 / 映射回环
+  /^fe80:/i, /^fec0:/i,                  // IPv6 链路本地 / 站点本地（已废弃但仍有老设备）
+  /^fc00:/i, /^fd00:/i,                  // IPv6 ULA（唯一本地地址）
+]
+
+function isPrivateIp(ip) {
+  return PRIVATE_IP_PATTERNS.some((re) => re.test(ip))
+}
+
+async function assertPublicHttpUrl(url) {
+  let u
+  try { u = new URL(url) } catch { contentError('图片 URL 无法解析', 'invalid_image_url') }
+  if (u.protocol !== 'http:' && u.protocol !== 'https:') {
+    contentError(`图片 URL 协议不支持: ${u.protocol}（仅 http/https）`, 'invalid_image_url')
+  }
+  const host = u.hostname.toLowerCase()
+  if (host === 'localhost' || host.endsWith('.localhost') || host === 'ip6-localhost') {
+    contentError('图片 URL 指向本机，已拒绝（SSRF 防护）', 'ssrf_blocked')
+  }
+  // 字面 IP：直接判；hostname：查 DNS
+  if (/^\d+\.\d+\.\d+\.\d+$/.test(host) || host.includes(':')) {
+    if (isPrivateIp(host)) contentError('图片 URL 指向内网/回环地址，已拒绝（SSRF 防护）', 'ssrf_blocked')
+  } else {
+    let addrs
+    try {
+      addrs = await dns.promises.lookup(host, { all: true, verbatim: true })
+    } catch (e) {
+      contentError(`图片 URL 域名解析失败: ${e.code || e.message}`, 'invalid_image_url')
+    }
+    if (!addrs.length) contentError('图片 URL 域名无解析结果', 'invalid_image_url')
+    for (const { address } of addrs) {
+      if (isPrivateIp(address)) {
+        contentError(`图片 URL 域名解析到内网地址 ${address}，已拒绝（SSRF 防护）`, 'ssrf_blocked')
+      }
+    }
+  }
+}
 
 function contentError(message, code = 'unsupported_content') {
   const err = new Error(message)
@@ -33,11 +98,14 @@ function dataUrlToImageBlock(url) {
  * 避免把无关大文件整个拉下来才发现不能要。
  */
 async function fetchUrlToImageBlock(url, fetchImpl) {
+  await assertPublicHttpUrl(url)
   let res
   try {
     res = await fetchImpl(url, { signal: AbortSignal.timeout(10_000) })
   } catch (e) {
-    contentError(`图片下载失败: ${e.message}`, 'image_fetch_failed')
+    // 不透传 e.message：网络错误消息里会带上完整 URL（"fetch failed: ... http://..."），
+    // 这条 URL 是客户端提交的，但回显进错误消息会让它进入 usage 日志，多一处泄露面。
+    contentError(`图片下载失败: ${e.cause?.code || e.name || 'network error'}`, 'image_fetch_failed')
   }
   if (!res.ok) contentError(`图片下载失败: HTTP ${res.status}`, 'image_fetch_failed')
   const mediaType = (res.headers.get('content-type') ?? '').split(';')[0].trim().toLowerCase()

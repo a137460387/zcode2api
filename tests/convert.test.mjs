@@ -182,6 +182,39 @@ describe('openaiToAnthropic 图片输入', () => {
     }, (m) => m, { fetchImpl: async () => new Response('nope', { status: 404 }) })).rejects.toThrow(/图片下载失败/)
   })
 
+  it('SSRF：回环 IP 被直接拒绝', async () => {
+    await expect(openaiToAnthropic({
+      messages: [{ role: 'user', content: [{ type: 'image_url', image_url: { url: 'http://127.0.0.1:28630/settings' } }] }],
+    }, (m) => m)).rejects.toThrow(/SSRF/)
+  })
+
+  it('SSRF：私网 IP（10/172.16/192.168/169.254）全段被拒', async () => {
+    for (const url of [
+      'http://10.0.0.1/internal',
+      'http://172.16.0.1/internal',
+      'http://192.168.1.1/router',
+      'http://169.254.169.254/latest/meta-data/',
+    ]) {
+      await expect(openaiToAnthropic({
+        messages: [{ role: 'user', content: [{ type: 'image_url', image_url: { url } }] }],
+      }, (m) => m)).rejects.toThrow(/SSRF/)
+    }
+  })
+
+  it('SSRF：localhost 与 *.localhost 被拒', async () => {
+    await expect(openaiToAnthropic({
+      messages: [{ role: 'user', content: [{ type: 'image_url', image_url: { url: 'http://localhost:8080/admin' } }] }],
+    }, (m) => m)).rejects.toThrow(/SSRF/)
+  })
+
+  it('SSRF：非 http(s) 协议（file:/gopher:/data:）被拒', async () => {
+    for (const url of ['file:///etc/passwd', 'gopher://internal/', 'ftp://x/']) {
+      await expect(openaiToAnthropic({
+        messages: [{ role: 'user', content: [{ type: 'image_url', image_url: { url } }] }],
+      }, (m) => m)).rejects.toThrow(/协议不支持/)
+    }
+  })
+
   it('非视觉模型（映射为 GLM-5.3）的带图请求被本地拒绝', async () => {
     await expect(openaiToAnthropic({
       model: 'glm-5.3',
