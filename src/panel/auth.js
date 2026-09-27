@@ -70,6 +70,20 @@ export class PanelAuth {
     return this.disableAuth
   }
 
+  /**
+   * 本机免密开关（localBypass）。挂在反向代理后时必须关掉——代理回源地址是 127.0.0.1，
+   * 开着它等于"任何能到代理的人都被当本机放行"。
+   */
+  setLocalBypass(on) {
+    const next = on === true
+    if (next === this.localBypass) return this.localBypass
+    this.localBypass = next
+    this.log(next
+      ? '[panel] 已开启本机免密：本机请求跳过密码/token'
+      : '[panel] 已关闭本机免密：本机也需密码/token（挂反向代理后应选此）')
+    return this.localBypass
+  }
+
   #read() {
     if (!this.file) return null
     try {

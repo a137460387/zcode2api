@@ -76,7 +76,12 @@ export class AccountStore {
    */
   writeUnlocked(account) {
     const file = this.fileFor(account.id)
-    const tmp = file + '.tmp'
+    // tmp 名带 pid + 随机后缀：本进程内 withLock 已排队，但**跨进程**（服务里跑一份、
+    // 又手动 npm start 起第二份）仍可能同时写同一账号。固定 `file + '.tmp'` 会出现
+    // "A 写 tmp、B 覆盖 tmp、A rename 拿到 B 的内容、B rename 时 tmp 已不存在"四部曲。
+    // 各写各的 tmp，再 rename（POSIX rename 原子、Windows 下 MoveFileEx 也足够稳），
+    // 即便最后一写覆盖前一写，至少每个进程拿到的都是自己刚写的版本。
+    const tmp = `${file}.${process.pid}.${crypto.randomUUID()}.tmp`
     fs.writeFileSync(tmp, JSON.stringify(account, null, 2))
     fs.renameSync(tmp, file)
     return account

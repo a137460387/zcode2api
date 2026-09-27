@@ -25,6 +25,7 @@ const ENV_KEYS = {
   maxRetries: 'MAX_RETRIES',
   host: 'HOST',
   panelDisableAuth: 'PANEL_DISABLE_AUTH',
+  panelLocalBypass: 'PANEL_LOCAL_BYPASS',
 }
 
 /**
@@ -213,6 +214,19 @@ export class RuntimeSettings {
       c.panelDisableAuth = next
       envPatch[ENV_KEYS.panelDisableAuth] = next ? '1' : '0'
       applied.panelDisableAuth = next
+    }
+
+    /**
+     * 本机免密。默认开（本机工具的使用直觉）。
+     * 挂反向代理时必须关：代理回源地址是 127.0.0.1，开着它等于任何能到代理的人都被当本机放行。
+     * 与 panelDisableAuth 同样的交互模型：即时生效，无需重启。
+     */
+    if (patch.panelLocalBypass !== undefined) {
+      const on = patch.panelLocalBypass === true || patch.panelLocalBypass === '1' || patch.panelLocalBypass === 'true'
+      const next = this.auth ? this.auth.setLocalBypass(on) : on
+      c.panelLocalBypass = next
+      envPatch[ENV_KEYS.panelLocalBypass] = next ? '1' : '0'
+      applied.panelLocalBypass = next
     }
 
     const applyNum = (field, { min, max }, fn) => {

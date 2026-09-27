@@ -220,8 +220,17 @@ export function registerPanelRoutes(app, deps) {
     }
   }
 
+  /**
+   * 打印日志前先把 `?panel=` session token 抹掉。
+   *
+   * 面板允许用 `?panel=<token>` 在 URL 里带会话（为了"复制链接即登录"的便利），
+   * 但 `req.originalUrl` 原样进日志会把有效 token 写进日志文件，谁拿到日志谁就拿到会话。
+   * 抹掉它：日志仍可读（路径 + 其它参数保留），token 不再落盘。
+   */
+  const sanitizeUrl = (url) => String(url ?? '').replace(/([?&])panel=[^&]*/g, '$1panel=…')
+
   const wrap = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch((err) => {
-    log(`[panel] ${req.method} ${req.originalUrl} failed: ${err?.message ?? err}`)
+    log(`[panel] ${req.method} ${sanitizeUrl(req.originalUrl)} failed: ${err?.message ?? err}`)
     if (res.headersSent) return res.end()
     return res.status(500).json({ error: { message: err?.message ?? 'internal error' } })
   })

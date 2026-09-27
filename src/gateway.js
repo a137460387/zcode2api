@@ -71,7 +71,11 @@ export function createGateway({ pool, paramPool, senders, config, log = () => {}
      * 客户端应看到"上游风控/凭据失效"（429/401）而非"账号池无号"。
      */
     let lastRetryable = null
-    let waitedMs = 0
+    // 用"请求开始时刻"作为唯一基准，而非累加 waitedMs。累加口径在换号失败路径上不守恒
+    // （审计 B4）：拿到账号就清零，于是"拿 A 失败 → 等 8s → 拿 B 失败 → 再等 8s"会反复
+    // 重置，实际等待远超 maxPickWaitMs 注释承诺的 15s。改成始终从 startedAt 算起，
+    // 无论中间换几次号都不重置。
+    const startedAt = Date.now()
     while (true) {
       if (!account) {
         // 把请求的 model 透传给池：同账号同模型多套餐时，"紧迫度"应按"该模型下未过期的
@@ -105,26 +109,40 @@ export function createGateway({ pool, paramPool, senders, config, log = () => {}
             })
           }
           const wait = waitMs ?? 0
-          // 只按**累计时长**设防（见 maxPickWaitMs 注释）：不用尝试次数，否则并发下
-          // N 个请求各自计数同一个节流事件，会把合法等待误判为失败。
-          // `wait === 0` 视为错误形态（当前池不会产生：无号时恒有正 waitMs 或 null+warn），
-          // 直接失败而不是空转——否则 waitedMs 不推进会变成死循环。
-          if (wait <= 0 || waitedMs + wait > maxPickWaitMs) {
+          // 绝对时长判断（修复 B4）：
+          // ① 本次 wait 自身就超过 maxPickWaitMs（冷却 30min 这种）→ 立即失败，不干睡。
+          // ② 已消耗时长 ≥ maxPickWaitMs → 立即失败，不再等（换号失败路径也守恒）。
+          // 与"先判 elapsed + wait 再决定等不等"的区别：setTimeout 实际有毫秒级误差，
+          // 先判会让总耗时略低于 maxPickWaitMs（实测 217ms < 250ms 期望）；先等后判更宽松，
+          // 与旧"累加 waitedMs"的行为边界一致，同时仍堵住 B4 的换号失败不守恒漏洞。
+          if (wait <= 0) {
             throw new GatewayError({
               status: 503,
               code: 3012,
-              message: wait > 0
-                ? `no usable account: next available in ~${Math.round(wait / 1000)}s (${reason})`
-                : `no usable account: pool reported no wait (${reason})`,
+              message: `no usable account: pool reported no wait (${reason})`,
               hint: '账号处于冷却（风控/限流）：单次请求不宜等待，请稍后重试或增补账号',
             })
           }
-          waitedMs += wait
+          if (wait > maxPickWaitMs) {
+            throw new GatewayError({
+              status: 503,
+              code: 3012,
+              message: `no usable account: next available in ~${Math.round(wait / 1000)}s (${reason})`,
+              hint: '账号处于冷却（风控/限流）：单次请求不宜等待，请稍后重试或增补账号',
+            })
+          }
+          if (Date.now() - startedAt >= maxPickWaitMs) {
+            throw new GatewayError({
+              status: 503,
+              code: 3012,
+              message: `no usable account: exceeded max wait budget ~${Math.round(maxPickWaitMs / 1000)}s (${reason})`,
+              hint: '账号处于冷却（风控/限流）：单次请求不宜等待，请稍后重试或增补账号',
+            })
+          }
           await new Promise((r) => setTimeout(r, wait))
           continue
         }
       }
-      waitedMs = 0
       // 注意：`account` 非空时 `waitMs` 是"建议节流间隔"（选中后到它下次可用），
       // 由池自身记账节制后续选号，网关**不等待**它——否则每个请求都白白慢一个节流窗。
       let res

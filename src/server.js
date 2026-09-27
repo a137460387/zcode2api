@@ -189,13 +189,22 @@ export function createApp(deps) {
       logRequest({ model: clientModel, account: account.id, stream: body.stream, status: 200 })
       if (body.stream) {
         res.writeHead(200, { 'content-type': 'text/event-stream; charset=utf-8', 'cache-control': 'no-cache', connection: 'keep-alive' })
-        const write = (chunk) => { timer.markFirstByte(); return res.write(chunk) }
+        // 客户端中途断开（Esc/关闭页/网络断）→ 立刻取消上游 body，避免孤儿流继续耗 token。
+        // 不设这个钩子时，即便 res 已 destroyed，for-await 仍会从上游拉完整段回答（实测扣费照算）。
+        const cancelUpstream = () => { try { response.body?.cancel().catch(() => {}) } catch (e) {} }
+        req.on('close', cancelUpstream)
+        const write = (chunk) => {
+          timer.markFirstByte()
+          if (res.writableEnded || res.destroyed) return false
+          return res.write(chunk)
+        }
         // 流中途失败（上游中断/客户端断开）时 headers 已发出，只能结束响应。
         try {
           const u = await pipeAnthropicToOpenAISSE(response, write, clientModel)
           await recordUsage(account, u)
           recordAnalytics({ ...usageToRecord(u, clientModel, account.id, timer.finish({ stream: true, outputTokens: u.outputTokens }), true, u) })
         } finally {
+          req.off('close', cancelUpstream)
           if (!res.writableEnded) res.end()
         }
         return
@@ -220,12 +229,20 @@ export function createApp(deps) {
       logRequest({ model: clientModel, account: account.id, stream: body.stream, status: 200 })
       if (body.stream) {
         res.writeHead(200, { 'content-type': 'text/event-stream; charset=utf-8', 'cache-control': 'no-cache', connection: 'keep-alive' })
-        const write = (chunk) => { timer.markFirstByte(); return res.write(chunk) }
+        // 同 /v1/chat/completions：客户端断开即取消上游，避免孤儿流继续耗 token。
+        const cancelUpstream = () => { try { response.body?.cancel().catch(() => {}) } catch (e) {} }
+        req.on('close', cancelUpstream)
+        const write = (chunk) => {
+          timer.markFirstByte()
+          if (res.writableEnded || res.destroyed) return false
+          return res.write(chunk)
+        }
         try {
           const u = await pipeAnthropicSSEWithUsage(response, write)
           await recordUsage(account, u)
           recordAnalytics({ ...usageToRecord(u, clientModel, account.id, timer.finish({ stream: true, outputTokens: u.outputTokens }), true, u) })
         } finally {
+          req.off('close', cancelUpstream)
           if (!res.writableEnded) res.end()
         }
         return
