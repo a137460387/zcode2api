@@ -18,6 +18,38 @@ import { sendBigModel } from '../upstream/bigmodel-api.js'
  */
 
 /**
+ * 余量档位：把"还能不能跑"从一串数字变成一个可直接显示的结论。
+ *
+ * 为什么需要它：面板原先只按 `healthy` 标绿色，而 `healthy` 只信 `noPackage` 这个
+ * **布尔标志**（见 accounts.js 的 healthy()），不检查 `planCache` 里到底有没有余量。
+ * 于是实测踩到两种"看着健康、实际有问题"的账号，在面板上与大把满格账号毫无区别：
+ *   1. 从未查到过套餐数据（`balances` 为空）——`healthy` 仍为真，被正常轮询；
+ *   2. 余量已见底（实测一个号 GLM-5.3-Flash 只剩 2.8%）。
+ * 面板必须把这两类单独显示，否则用户只能靠"最近错误"事后发现。
+ *
+ * - `unqueried`：没查询过余量。**不等于**没额度，但也不能当作健康——无从判断。
+ * - `low`：任一模型余量跌破 `LOW_PCT`。整体仍可用，但很快会耗尽，值得提前处理。
+ * - `empty`：任一模型余量为 0。该模型已经跑不动了。
+ * - `ok`：有余量且都在 `LOW_PCT` 以上。
+ *
+ * 判定按**逐个模型**取最差值：账号是按模型发额度的，GLM-5.3 满格而 Flash 见底时，
+ * 整号不能算健康——模型级失败会直接打到用户请求上。
+ */
+export const LOW_PCT = 10
+
+function quotaLevel(balances) {
+  if (!balances.length) return 'unqueried'
+  const pcts = balances
+    .filter((b) => (Number(b.total) || 0) > 0)
+    .map((b) => (Number(b.remaining) || 0) / Number(b.total) * 100)
+  // 有 balances 但 total 全是 0：上游给了条目却没给额度，与"没查询过"一样无从判断。
+  if (!pcts.length) return 'unqueried'
+  if (pcts.some((p) => p <= 0)) return 'empty'
+  if (pcts.some((p) => p < LOW_PCT)) return 'low'
+  return 'ok'
+}
+
+/**
  * 账号脱敏投影。**绝不含 jwt / apiKey / accessToken / refreshToken**——面板只需要知道
  * "有没有凭据""是不是这一条"，原文一旦进过浏览器就等于多了一处泄露面。
  *
@@ -52,6 +84,15 @@ export function enrichAccount(acc, { poolNow, realNow, healthy = null } = {}) {
     userId: acc.userInfo?.user_id ?? acc.userInfo?.id ?? null,
     planCache: acc.planCache ?? null,
     quota: balances.length ? { total, remaining, used: Math.max(0, total - remaining), pct: total > 0 ? (remaining / total) * 100 : 0 } : null,
+    /** 余量档位（见 quotaLevel）：unqueried / empty / low / ok。面板据此单独标出。 */
+    quotaLevel: quotaLevel(balances),
+    /** 最紧的那个模型的余量百分比（用于显示"最紧 2.8%"），无可用余量数据时为 null。 */
+    worstPct: (() => {
+      const pcts = balances
+        .filter((b) => (Number(b.total) || 0) > 0)
+        .map((b) => (Number(b.remaining) || 0) / Number(b.total) * 100)
+      return pcts.length ? Math.min(...pcts) : null
+    })(),
     stats: {
       requests: acc.stats?.requests ?? 0,
       inputTokens: acc.stats?.inputTokens ?? 0,

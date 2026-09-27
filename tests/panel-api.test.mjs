@@ -130,6 +130,60 @@ describe('enrichAccount：池内时钟 → 真实时刻', () => {
   })
 })
 
+/**
+ * 余量档位（quotaLevel）：面板据此把"未查询 / 余量偏低 / 已用尽"单独标出。
+ *
+ * 【为什么需要】实测事故：面板原先只按 `healthy` 标绿色，而 `healthy()` 只看
+ * `noPackage` 布尔标志，**不检查有没有余量数据**。于是这两个账号在状态列上与满格
+ * 账号完全一样：① 从未查询过余量的（healthy 仍为真、照样被轮询）；
+ * ② GLM-5.3-Flash 只剩 2.8% 的。用户只能靠事后出现的「最近错误」发现。
+ */
+describe('enrichAccount：余量档位（quotaLevel）', () => {
+  const withBal = (balances) => enrichAccount(
+    { id: 'x', provider: 'p', type: 'oauth', planCache: { balances } },
+    { poolNow: 0, realNow: 0 },
+  )
+  const bal = (remaining, total) => ({ total, remaining })
+
+  it('无 balances / balances 为空 → unqueried（不是 ok）', () => {
+    expect(enrichAccount({ id: 'x' }, { poolNow: 0, realNow: 0 }).quotaLevel).toBe('unqueried')
+    expect(withBal([]).quotaLevel).toBe('unqueried')
+  })
+
+  it('total 全为 0 → unqueried：给了条目却没给额度，同样无从判断', () => {
+    expect(withBal([bal(0, 0), bal(0, 0)]).quotaLevel).toBe('unqueried')
+    expect(withBal([bal(0, 0)]).worstPct).toBeNull()
+  })
+
+  it('任一模型余量为 0 → empty（该模型已跑不动）', () => {
+    expect(withBal([bal(0, 1000), bal(1000, 1000)]).quotaLevel).toBe('empty')
+  })
+
+  it('任一模型余量低于 10% → low，并给出最紧的那个百分比', () => {
+    // 实测数据形态：Flash 300M 额度只剩 2.8%，另两个模型满格
+    const e = withBal([bal(8_372_482, 300_000_000), bal(3_000_000, 3_000_000), bal(5_000_000, 5_000_000)])
+    expect(e.quotaLevel).toBe('low')
+    expect(e.worstPct).toBeCloseTo(2.79, 2)
+  })
+
+  it('全部高于阈值 → ok', () => {
+    expect(withBal([bal(30, 100), bal(1000, 1000)]).quotaLevel).toBe('ok')
+  })
+
+  it('阈值是 10%：正好 10% 算 ok（不因浮点边界误报）', () => {
+    expect(withBal([bal(10, 100)]).quotaLevel).toBe('ok')
+    expect(withBal([bal(9, 100)]).quotaLevel).toBe('low')
+  })
+
+  it('取最差模型而非整体：一个满格 + 一个见底，整号必须报低', () => {
+    // 整体百分比会被大额度模型稀释（实测 308M 总额里只剩 5.3%），
+    // 模型级失败会直接打到用户请求上，故按最紧的模型判定。
+    const e = withBal([bal(99_999_999, 100_000_000), bal(1, 100_000_000)])
+    expect(e.quotaLevel).toBe('low')
+    expect(e.worstPct).toBeLessThan(0.01)
+  })
+})
+
 describe('账号操作', () => {
   it('set 启用停用；不存在的 id → 404', async () => {
     const deps = await withAccount(buildDeps())
