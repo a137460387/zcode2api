@@ -34,19 +34,26 @@ npm start
 - API：`http://127.0.0.1:28630/v1`（OpenAI `/v1/chat/completions`、Anthropic `/v1/messages`）
 - **管理面板**：`http://127.0.0.1:28630/` —— 本机直接开，**不需要密码**（见 [怎么进后台](#怎么进后台)）
 - farm 页：`http://127.0.0.1:28631/farm`
-  - **默认后台模式**（`FARM_AUTO_BROWSER=1` + `FARM_HEADLESS=1`）：playwright 启动无头浏览器
-    自动产参数，**无任何可见窗口**，无需人工干预。
+  - **默认后台模式**（`FARM_AUTO_BROWSER=1` + `FARM_HEADLESS=0`）：playwright 启动**有头**
+    浏览器自动产参数。桌面会出现一个 Chrome 窗口——**别关它**，关掉即断供（详见下面"为什么默认有头"）。
   - 手动模式（`FARM_AUTO_BROWSER=0`）：用你自己的 Chrome 打开上述地址并保持标签页。
     产出成功的标志是页面顶部出现绿色 `param 产出并推送成功`，且"池内 param"不为 `-`。
-  - 两种模式的参数**实测均可被上游接受**（headless 3/3 成功；手动模式同样可用）。
-    无头模式必须覆盖 UA（启动器已自动处理，见 `src/captcha/browser.js`）。
+  - **为什么默认有头**：无头模式（`FARM_HEADLESS=1`）**已不可用**。实测无头下会稳定吃
+    `F011`（`success:true` 但 `verifyResult:false`），参数产出恒为 0，整个 API 对外只会回
+    `captcha param pool is empty`；同一台机器改成有头后 F011 立即消失、参数稳定产出。
+    启动器的 UA 覆盖（见 `src/captcha/browser.js`）**不足以**绕过——SDK 已能从 UA 与
+    `navigator.webdriver` 之外的指纹特征（Canvas/WebGL/GPU 等）识别无头环境。
+    排查时已逐一排除：整页重载、清掉同 IP 的重复实例、**更换出口 IP**（`14.146.x` → `14.31.x`）
+    均无效；既然换 IP 都不影响，就不是网络层的问题，别再往代理/换网络方向折腾。
   - 农场按**可用参数数**补货：服务端会丢弃超过 `PARAM_USABLE_MS`（默认 40s）的参数，
     农场只在"可用参数不足 2 个"时产新的。**不是定时滴灌**——定时产出（曾经每 20s 一个，
     约 180 次/小时）会在空转时也持续做验证，实测跑到约 25 次后被阿里云风控判 `F001`
     （`verifyResult:false`），此后一个参数都产不出来；页面现在还会在连续失败时自动整页重载
-    以复位 SDK 状态。
-  - 后台模式下农场页不可见，故页面会把自身状态（最近一条日志、失败次数、退避时长）上报给
-    服务端，面板「captcha 参数池与农场」里直接显示——卡住时会标红，不必去猜。
+    以复位 SDK 状态（注意：该自愈对 `F011` **无效**，那是环境问题不是页面状态问题）。
+  - 农场页会把自身状态（最近一条日志、失败次数、退避时长）上报给服务端，
+    面板「captcha 参数池与农场」里直接显示——卡住时会标红，不必去猜。
+    判断有没有真恢复，看的是产出计数（面板里的 `total`/`pushed`），**不是** `pool` 或失败次数清零：
+    页面自愈重载会把失败计数清零并显示"农场页就绪"，但产出仍可能是 0。
 
 > **改端口后**：手动模式需用新地址重开 farm 页（旧标签页会持续 `Failed to fetch`，参数推不进池）；
 > 后台模式无需处理（服务启动时自动指向新端口）。
@@ -277,9 +284,10 @@ GLM-5.3-Flash       → 200（含 thinking 块）
   需要同步更新 `src/upstream/zcode-system.json` 与组装逻辑，否则会重新出现 3012。
 - farm 依赖阿里云验证码 SDK 配置（SceneId `11xygtvd` / prefix `no8xfe`）。该配置由服务端下发，
   可用 `GET https://zcode.z.ai/api/v1/client/configs`（带 JWT）读取，便于核对是否变更。
-- farm 的浏览器 UA 必须覆盖且版本要真实：playwright 在 headless 下默认 UA 含
-  `HeadlessChrome/<ver>`，SDK 见之即返回 `F001`（verifyResult:false）导致**一个参数都产不出来**。
-  `src/captcha/browser.js` 会自动探测本机 Chrome 版本并构造桌面 UA。
+- farm 的浏览器 UA 覆盖**已不足以**骗过 SDK：UA 必须覆盖且版本要真实（playwright 在 headless 下
+  默认 UA 含 `HeadlessChrome/<ver>`，SDK 见之即返回 `F001`），`src/captcha/browser.js` 会自动探测
+  本机 Chrome 版本并构造桌面 UA。但**单靠 UA 已经救不回无头模式**——SDK 现在还会看 Canvas/WebGL/GPU
+  等指纹，无头下稳定返回 `F011`。**结论：农场必须跑有头模式**（默认值已改为 `FARM_HEADLESS=0`）。
   注：SDK 不检查 `navigator.webdriver`（实测该标志始终为 true，不影响结果）。
 - 手动模式：`FARM_AUTO_BROWSER=0` 时不启动自动浏览器，改用你自己的真实 Chrome 打开
   farm 页（`http://127.0.0.1:28631/farm`）。

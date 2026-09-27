@@ -46,7 +46,19 @@ export function loadConfig({ rootDir = process.cwd(), env = process.env } = {}) 
     panelDisableAuth: bool(env.PANEL_DISABLE_AUTH, false),
     poolDir: env.POOL_DIR || path.join(rootDir, 'accounts'),
     certDir: env.CERT_DIR || path.join(rootDir, 'certs'),
-    farmHeadless: bool(env.FARM_HEADLESS, true),
+    /**
+     * 默认**有头**（false）。这与最初的默认值相反，是实测后的修正。
+     *
+     * 早先的结论是"无头 + 覆盖 UA 即可正常产出"，故默认无头。2026-09-27 实测该结论已失效：
+     * 同一台机器、同一份配置，无头模式下连续数小时稳定吃 `F011`（`success:true` 但
+     * `verifyResult:false`），`param` 产出恒为 0，整个 API 对外只会回 `captcha param pool
+     * is empty`；改为有头后 F011 立即消失、参数稳定产出。
+     *
+     * 排查过程排除了这些假设，别再重复走：整页重载（无效）、清掉同 IP 的重复实例（无效）、
+     * 换出口 IP（`14.146.x` → `14.31.x`，无效）。既然换 IP 都不影响，就不是网络层的事，
+     * 而是 SDK 已能从 UA/`navigator.webdriver` 之外的指纹特征（Canvas/WebGL/GPU 等）认出无头。
+     */
+    farmHeadless: bool(env.FARM_HEADLESS, false),
     // 手动模式：关闭自动农场浏览器，改用用户自己的真实 Chrome 打开 farm 页。
     // 必要性：playwright 驱动的浏览器（即便覆盖 UA）仍带自动化特征，产出的 captcha 参数
     // 会被上游判低风险分并返回 3012；真实 Chrome 环境产出的参数才能通过（详见 README）。

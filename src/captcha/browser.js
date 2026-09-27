@@ -9,6 +9,12 @@ import fs from 'node:fs'
  *    并返回 F001（verifyResult:false），农场一个参数都产不出来。
  *    实测（受控实验）：headless + 默认 UA → F001；headless + 本 UA → 正常产出 3 个。
  *    注：SDK **不检查** `navigator.webdriver`（实验中该标志始终为 true，不影响结果）。
+ *
+ *    ⚠️ 上面这条"headless + 本 UA 即可正常产出"的结论 **2026-09-27 已被推翻**。
+ *    现在无头模式（即便 UA 正确）会稳定吃 `F011`，产出恒为 0；改为有头立即恢复。
+ *    说明 SDK 已能从 UA 与 `navigator.webdriver` 之外的指纹特征识别无头环境，
+ *    覆盖 UA 不再够用。故默认值已改为有头（见 config.js 的 farmHeadless）。
+ *    本函数保留 UA 覆盖仍有用——防的是"写死旧版本号被判低分 → 上游 3012"（第 2 点）。
  * 2. **版本号要真实**：写死旧版本号（如 `Chrome/141`）会与实际浏览器不符，
  *    参数可能被判低分（上游返回 3012 行为风控）。故优先探测本机 Chrome 的真实版本。
  */
@@ -42,7 +48,7 @@ function desktopUA(chromePath) {
   return cachedUA
 }
 
-export async function launchFarmBrowser({ url, headless = true, chromePath = '', log = () => {} }) {
+export async function launchFarmBrowser({ url, headless = false, chromePath = '', log = () => {} }) {
   let pw
   try {
     pw = await import('playwright')
