@@ -35,11 +35,32 @@ import { sendBigModel } from '../upstream/bigmodel-api.js'
  * 判定按**逐个模型**取最差值：账号是按模型发额度的，GLM-5.3 满格而 Flash 见底时，
  * 整号不能算健康——模型级失败会直接打到用户请求上。
  */
+/**
+ * 该 entitlement 在 poolNow 时刻是否已过期。`expiresAt` 是秒级 epoch（见 accounts.js 的
+ * planUrgency 注释），此处统一乘 1000 换成毫秒再比较。无 expiresAt / 非数字 / 0 → 不算过期
+ * （老数据没有这个字段，算过期会误伤）。
+ */
+function isExpired(b, poolNow) {
+  const exp = Number(b?.expiresAt)
+  if (!Number.isFinite(exp) || exp <= 0) return false
+  return exp * 1000 <= poolNow
+}
+
 export const LOW_PCT = 10
 
-function quotaLevel(balances) {
+/**
+ * quotaLevel：按**未过期**的 entitlement 统计。
+ *
+ * - 账号下所有 entitlement 都已过期 → 返回 'empty'（面板显示「已用尽」，与"该账号已
+ *   无可用套餐"语义一致；调度层的 allPlansExpired 也会同时把它挡在池外）。
+ * - 部分 entitlement 过期 → 只看剩下未过期的（这部分才是账号的"真实余量"）。
+ * - 全部不带 expiresAt → 按原逻辑（兼容旧数据）。
+ */
+function quotaLevel(balances, poolNow = Date.now()) {
   if (!balances.length) return 'unqueried'
-  const pcts = balances
+  const live = balances.filter((b) => !isExpired(b, poolNow))
+  if (!live.length) return 'empty'
+  const pcts = live
     .filter((b) => (Number(b.total) || 0) > 0)
     .map((b) => (Number(b.remaining) || 0) / Number(b.total) * 100)
   // 有 balances 但 total 全是 0：上游给了条目却没给额度，与"没查询过"一样无从判断。
@@ -85,10 +106,11 @@ export function enrichAccount(acc, { poolNow, realNow, healthy = null } = {}) {
     planCache: acc.planCache ?? null,
     quota: balances.length ? { total, remaining, used: Math.max(0, total - remaining), pct: total > 0 ? (remaining / total) * 100 : 0 } : null,
     /** 余量档位（见 quotaLevel）：unqueried / empty / low / ok。面板据此单独标出。 */
-    quotaLevel: quotaLevel(balances),
+    quotaLevel: quotaLevel(balances, poolNow),
     /** 最紧的那个模型的余量百分比（用于显示"最紧 2.8%"），无可用余量数据时为 null。 */
     worstPct: (() => {
       const pcts = balances
+        .filter((b) => !isExpired(b, poolNow))
         .filter((b) => (Number(b.total) || 0) > 0)
         .map((b) => (Number(b.remaining) || 0) / Number(b.total) * 100)
       return pcts.length ? Math.min(...pcts) : null

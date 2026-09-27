@@ -74,7 +74,10 @@ export function createGateway({ pool, paramPool, senders, config, log = () => {}
     let waitedMs = 0
     while (true) {
       if (!account) {
-        const picked = pool.pick(sessionKey)
+        // 把请求的 model 透传给池：同账号同模型多套餐时，"紧迫度"应按"该模型下未过期的
+        // entitlement 最早过期"算（例：账号同时挂着 GLM-5.3 周末包和 GLM-5.3-Flash 日包，
+        // 烧 Flash 的请求不该被 GLM-5.3 的临近过期误导）。
+        const picked = pool.pick(sessionKey, { model: anthropicBody?.model })
         const { waitMs, warn, reason } = picked
         account = picked.account
         if (!account) {

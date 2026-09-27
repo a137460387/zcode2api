@@ -202,6 +202,46 @@ describe('enrichAccount：余量档位（quotaLevel）', () => {
     expect(e.quotaLevel).toBe('low')
     expect(e.worstPct).toBeLessThan(0.01)
   })
+
+  it('全部 entitlement 已过期 → empty（账号已无可用套餐）', () => {
+    const NOW = 1_700_000_000_000
+    const past = Math.floor(NOW / 1000) - 60
+    const e = enrichAccount(
+      { id: 'x', planCache: { balances: [{ total: 1000, remaining: 500, expiresAt: past }] } },
+      { poolNow: NOW, realNow: NOW },
+    )
+    expect(e.quotaLevel).toBe('empty')
+  })
+
+  it('部分 entitlement 过期 → 只看未过期那条算档位', () => {
+    const NOW = 1_700_000_000_000
+    const past = Math.floor(NOW / 1000) - 60
+    const future = Math.floor(NOW / 1000) + 3600
+    const e = enrichAccount(
+      {
+        id: 'x',
+        planCache: {
+          balances: [
+            { total: 1000, remaining: 0, expiresAt: past },     // 过期 0%（不再算）
+            { total: 1000, remaining: 1000, expiresAt: future }, // 未过期 100%
+          ],
+        },
+      },
+      { poolNow: NOW, realNow: NOW },
+    )
+    // 如果按"任一 0% 即 empty"的旧口径会误判为 empty；按"未过期"口径应为 ok。
+    expect(e.quotaLevel).toBe('ok')
+    expect(e.worstPct).toBeCloseTo(100, 1)
+  })
+
+  it('entitlement 不带 expiresAt（旧数据）→ 不参与过期判定', () => {
+    const NOW = 1_700_000_000_000
+    const e = enrichAccount(
+      { id: 'x', planCache: { balances: [{ total: 1000, remaining: 500 }] } },
+      { poolNow: NOW, realNow: NOW },
+    )
+    expect(e.quotaLevel).toBe('ok')
+  })
 })
 
 describe('账号操作', () => {

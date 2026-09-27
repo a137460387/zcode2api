@@ -703,3 +703,178 @@ describe('never-provisioned accounts（未确认套餐的号不进池）', () =>
     expect(pool.healthy(store.get(bad.id))).toBe(false)
   })
 })
+
+/**
+ * 套餐有效期调度（planUrgency / allPlansExpired / modelQuotaExhausted）。
+ *
+ * 真实场景：同一账号可能同时挂着多个 entitlement（GLM-5.3 周末包 + GLM-5.3-Flash 日包），
+ * 每个都有自己的 expiresAt。按"账号+模型+额度"三维关联的规则：
+ * - 紧迫度按"指定模型下未过期 entitlement 最早过期"算，同账号其它模型的临近过期不参与；
+ * - 指定模型下所有 entitlement 已过期 → 该账号对该模型不可用，但对其它模型仍可用；
+ * - 指定模型下所有未过期 entitlement remaining ≤ 0 → 该账号对该模型不可用；
+ * - expiresAt 缺失的 entitlement 不参与过期判定（兼容旧数据）；
+ * - 过期判定与"是否刷新过"无关，按 expiresAt * 1000 <= now 走真实时钟。
+ */
+describe('plan expiry（套餐有效期调度）', () => {
+  const NOW_MS = 1_700_000_000_000 // 一个固定的"现在"毫秒值，方便算过期
+  const S = 1000 // 秒→毫秒换算
+
+  const withBalances = async (balances, over = {}) => {
+    // 不能直接走 add()：add 在 over.planCache 存在时提前 return（行 63），不会写入 planCache。
+    // 这里手写"save + update"两步，与 add 的常规路径一致。
+    const acc = await store.save(newAccountFields({
+      provider: 'bigmodel', type: 'oauth', jwt: 'j',
+      userInfo: { user_id: String(Math.random()).slice(2) },
+      ...over,
+    }))
+    await store.update(acc.id, { planCache: { plans: [], balances } })
+    return store.get(acc.id)
+  }
+
+  const bal = (modelName, remaining, expiresAtSec) =>
+    ({ modelName, total: 1000, remaining, expiresAt: expiresAtSec })
+
+  it('账号只有一个 entitlement 且已过期 → 不健康，不进池', async () => {
+    clock.t = NOW_MS
+    const a = await withBalances([bal('GLM-5.3', 500, Math.floor(NOW_MS / 1000) - 60)])
+    expect(pool.healthy(store.get(a.id))).toBe(false)
+    expect(pool.pick(null).account).toBeNull()
+  })
+
+  it('账号只有一个 entitlement 未过期 → 不受影响', async () => {
+    clock.t = NOW_MS
+    const a = await withBalances([bal('GLM-5.3', 500, Math.floor(NOW_MS / 1000) + 3600)])
+    expect(pool.healthy(store.get(a.id))).toBe(true)
+    expect(pool.pick(null).account?.id).toBe(a.id)
+  })
+
+  it('同账号多 entitlement：一个过期一个未过期 → 仍可调度（不整号跳过）', async () => {
+    clock.t = NOW_MS
+    const a = await withBalances([
+      bal('GLM-5.3', 500, Math.floor(NOW_MS / 1000) - 60),       // 已过期
+      bal('GLM-5.3-Flash', 500, Math.floor(NOW_MS / 1000) + 3600), // 未过期
+    ])
+    expect(pool.healthy(store.get(a.id))).toBe(true)
+  })
+
+  it('指定模型下全过期 → 该模型不可用；其它模型仍可用（账号+模型+额度关联）', async () => {
+    clock.t = NOW_MS
+    // 用户的真实场景：GLM-5.3 全过期但 Flash 还有效——Flash 请求应能用这个账号。
+    const a = await withBalances([
+      bal('GLM-5.3', 500, Math.floor(NOW_MS / 1000) - 60),
+      bal('GLM-5.3-Flash', 500, Math.floor(NOW_MS / 1000) + 3600),
+    ])
+    expect(pool.healthy(store.get(a.id), 'glm-5.3')).toBe(false)
+    expect(pool.healthy(store.get(a.id), 'glm-5.3-flash')).toBe(true)
+    expect(pool.pick(null, { model: 'glm-5.3' }).account).toBeNull()
+    expect(pool.pick(null, { model: 'glm-5.3-flash' }).account?.id).toBe(a.id)
+  })
+
+  it('指定模型下所有未过期 entitlement remaining=0 → 该账号对该模型不可用', async () => {
+    clock.t = NOW_MS
+    const a = await withBalances([
+      bal('GLM-5.3', 0, Math.floor(NOW_MS / 1000) + 3600),       // 未过期但已用尽
+      bal('GLM-5.3-Flash', 500, Math.floor(NOW_MS / 1000) + 3600),
+    ])
+    expect(pool.healthy(store.get(a.id), 'glm-5.3')).toBe(false)
+    expect(pool.healthy(store.get(a.id), 'glm-5.3-flash')).toBe(true)
+  })
+
+  it('指定模型下任一未过期 entitlement remaining>0 → 该账号对该模型可用', async () => {
+    clock.t = NOW_MS
+    // 截图场景：Flash 同时挂两个 entitlement，一个用完一个还有，账号对 Flash 仍可用。
+    const a = await withBalances([
+      bal('GLM-5.3-Flash', 0, Math.floor(NOW_MS / 1000) + 3600),
+      bal('GLM-5.3-Flash', 500, Math.floor(NOW_MS / 1000) + 7200),
+    ])
+    expect(pool.healthy(store.get(a.id), 'glm-5.3-flash')).toBe(true)
+  })
+
+  it('不传 model：allPlansExpired 退化为"账号任一 entitlement 未过期即可用"', async () => {
+    clock.t = NOW_MS
+    const a = await withBalances([
+      bal('GLM-5.3', 500, Math.floor(NOW_MS / 1000) - 60),
+      bal('GLM-5.3-Flash', 500, Math.floor(NOW_MS / 1000) + 3600),
+    ])
+    // 向后兼容：不传 model 时与改动前一致，不因"GLM-5.3 过期"误伤整号。
+    expect(pool.healthy(store.get(a.id))).toBe(true)
+  })
+
+  it('紧迫度优先于 LRU：1h 后过期的号先于 24h 后过期的号被选中', async () => {
+    clock.t = NOW_MS
+    const soon = await withBalances([bal('GLM-5.3', 500, Math.floor(NOW_MS / 1000) + 3600)])
+    const later = await withBalances([bal('GLM-5.3', 500, Math.floor(NOW_MS / 1000) + 86400)])
+    // 两个号都没有 lastUsed 历史（lastUsed=0），按 LRU 应该平秩；紧迫度排第一关键字。
+    expect(pool.pick(null).account?.id).toBe(soon.id)
+    expect(pool.pick(null).account?.id).not.toBe(later.id)
+  })
+
+  it('紧迫度相同 → 退化为 lastUsed 升序（保持现有 LRU 行为）', async () => {
+    clock.t = NOW_MS
+    const sameExpiry = Math.floor(NOW_MS / 1000) + 3600
+    const a = await withBalances([bal('GLM-5.3', 500, sameExpiry)])
+    const b = await withBalances([bal('GLM-5.3', 500, sameExpiry)])
+    // 人为设置 lastUsed 顺序：b 更久没用
+    pool.lastPick.set(a.id, NOW_MS - 1000)
+    pool.lastPick.set(b.id, NOW_MS - 5000)
+    // 但 minIntervalMs=2000，b 已过窗、a 还在窗内——a 被节流门挡住
+    clock.t = NOW_MS + 3000 // 让 a 也过窗
+    const r = pool.pick(null)
+    expect(r.account?.id).toBe(b.id) // b lastUsed 更早 → LRU 选它
+  })
+
+  it('指定模型时紧迫度只看该模型：GLM-5.3 临近过期不影响 Flash 选号', async () => {
+    clock.t = NOW_MS
+    const a = await withBalances([
+      bal('GLM-5.3', 500, Math.floor(NOW_MS / 1000) + 600),       // 10min 后过期
+      bal('GLM-5.3-Flash', 500, Math.floor(NOW_MS / 1000) + 86400), // 24h 后过期
+    ])
+    const b = await withBalances([
+      bal('GLM-5.3-Flash', 500, Math.floor(NOW_MS / 1000) + 43200), // 12h 后过期
+    ])
+    // 请求 GLM-5.3-Flash：b 紧迫度 12h < a 紧迫度 24h → 选 b
+    expect(pool.pick(null, { model: 'glm-5.3-flash' }).account?.id).toBe(b.id)
+    // 推进时钟过节流窗（每次 pick 会 stampUsed，下一次需要 minIntervalMs=2000ms）
+    clock.t += 3000
+    // 请求 GLM-5.3：a 是唯一候选
+    expect(pool.pick(null, { model: 'glm-5.3' }).account?.id).toBe(a.id)
+  })
+
+  it('同模型多 entitlement 的紧迫度取最早过期（"先烧快过期的"）', async () => {
+    clock.t = NOW_MS
+    const a = await withBalances([
+      bal('GLM-5.3-Flash', 500, Math.floor(NOW_MS / 1000) + 86400), // 24h 后过期
+      bal('GLM-5.3-Flash', 500, Math.floor(NOW_MS / 1000) + 600),   // 10min 后过期
+    ])
+    const b = await withBalances([
+      bal('GLM-5.3-Flash', 500, Math.floor(NOW_MS / 1000) + 43200), // 12h 后过期
+    ])
+    // a 该模型下最快 10min 过期，b 该模型下 12h → 选 a（尽管 a 还有一条 24h 的）
+    expect(pool.pick(null, { model: 'glm-5.3-flash' }).account?.id).toBe(a.id)
+  })
+
+  it('过期判定按真实时钟，与"是否刷新过余额"无关', async () => {
+    clock.t = NOW_MS
+    const expiresInSec = Math.floor(NOW_MS / 1000) + 60
+    const a = await withBalances([bal('GLM-5.3', 500, expiresInSec)])
+    expect(pool.healthy(store.get(a.id))).toBe(true)
+    // 时钟前推到过期之后——没有"刷新余额"动作，纯按时间。
+    clock.t = NOW_MS + 120_000
+    expect(pool.healthy(store.get(a.id))).toBe(false)
+  })
+
+  it('expiresAt 缺失的 entitlement 不参与过期判定（兼容旧数据）', async () => {
+    clock.t = NOW_MS
+    const a = await withBalances([{ modelName: 'GLM-5.3', total: 1000, remaining: 500 }])
+    expect(pool.healthy(store.get(a.id))).toBe(true)
+  })
+
+  it('网关调用：model 透传给 pool.pick', async () => {
+    // 由 gateway.js 的 complete 调用点保证；这里通过签名验证 pick 接受 model 第二参
+    clock.t = NOW_MS
+    const a = await withBalances([bal('GLM-5.3', 500, Math.floor(NOW_MS / 1000) + 3600)])
+    expect(() => pool.pick(null, { model: 'glm-5.3' })).not.toThrow()
+    clock.t += 3000
+    expect(pool.pick(null, { model: 'glm-5.3' }).account?.id).toBe(a.id)
+  })
+})

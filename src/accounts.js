@@ -41,13 +41,15 @@ export class AccountPool {
    * 它此前唯一的作用就是制造失败。这也意味着一旦它成功过一次，就会重新获得入场资格，
    * 不会把"暂时查不到额度但能用"的号永久困死。
    */
-  healthy(acc) {
+  healthy(acc, model = null) {
     return acc.enabled !== false
       && acc.needsRelogin !== true
       && acc.noPackage !== true
       && acc.invalidKey !== true
       && (acc.cooldownUntil ?? 0) <= this.now()
       && !this.neverProvisioned(acc)
+      && !this.allPlansExpired(acc, model)
+      && !this.modelQuotaExhausted(acc, model)
   }
 
   /**
@@ -61,6 +63,110 @@ export class AccountPool {
     const balances = acc.planCache?.balances
     const hasQueriedQuota = Array.isArray(balances) && balances.length > 0
     return !hasQueriedQuota && (acc.stats?.requests ?? 0) <= 0
+  }
+
+  /**
+   * 账号的"套餐紧迫度"：其下**未过期**的 entitlement 中，最快过期那一个的过期时刻（毫秒）。
+   *
+   * - `expiresAt` 在磁盘上是秒级 epoch（`billing.js` 接进来后未做单位转换），这里统一乘 1000
+   *   换成毫秒再与 `now` 比较。
+   * - `expiresAt` 缺失 / null / 0 / 非数字 → 该 entitlement 不参与排序，也不参与过期判断
+   *   （上游曾经不返回这个字段；兼容旧数据）。
+   * - 所有 entitlement 都已过期、或没有任何带 expiresAt 的 entitlement → 返回 `Infinity`
+   *   （最不紧迫，不会被优先选中，但也不因此单独被排除）。
+   *
+   * **model 过滤**：传入 `model`（例如 `'glm-5.3-flash'`）时，只看 `modelName` 与之匹配
+   * （大小写不敏感）的 entitlement——同一账号常同时挂着多套餐，GLM-5.3 的"周末包 09:00
+   * 过期"不该影响"烧 Flash 时该选谁"。`model` 缺省时不过滤（取账号下所有 entitlement
+   * 的最快过期），向后兼容老的"账号级紧迫度"语义。
+   *
+   * 与 `allPlansExpired` 的分工：本方法只回答"紧迫度数值"，不回答"是否还能用"。
+   * "还能不能用"由 `allPlansExpired` 单独判定（见下）——两者故意分开，免得排序键
+   * 里偷偷藏着健康判断（读 `pool2.sort` 的人不该需要去翻 healthy 才能理解为什么
+   * 某个号排在后面）。
+   */
+  planUrgency(acc, now, model = null) {
+    const balances = acc.planCache?.balances
+    if (!Array.isArray(balances)) return Infinity
+    const want = model ? String(model).toLowerCase() : null
+    let earliest = Infinity
+    for (const b of balances) {
+      if (want && String(b?.modelName ?? '').toLowerCase() !== want) continue
+      const exp = Number(b?.expiresAt)
+      if (!Number.isFinite(exp) || exp <= 0) continue
+      const expMs = exp * 1000
+      if (expMs <= now) continue // 已过期：这条不算可用
+      if (expMs < earliest) earliest = expMs
+    }
+    return earliest
+  }
+
+  /**
+   * 该账号下所有带 `expiresAt` 的 entitlement 是否全部已过期。
+   *
+   * 硬过滤的落地点：返回 true 时 `healthy()` 会判它不进入轮询池（与"只跳过过期的
+   * entitlement"决策一致——只要还有任何一条未过期 entitlement，账号仍可被调度）。
+   *
+   * **按时间判定，与"是否刷新"无关**：只看 `expiresAt * 1000 <= now`，不依赖最近一次
+   * 拉余额的时刻——上游随时可能让某条 entitlement 过期，面板按"刷新时间"是判不出来的，
+   * 必须用真实时钟对比。
+   *
+   * 不带 `expiresAt` 的 entitlement 不算"已过期"（上游老接口/旧账号数据可能没这个字段；
+   * 把它们算作过期会误伤正常账号）。
+   *
+   * **model 过滤**：与 `planUrgency` 一致，传入 model 时只判该模型下是否全过期——
+   * 同一账号 GLM-5.3 过期而 Flash 未过期时，请求 Flash 仍应能用它。
+   */
+  allPlansExpired(acc, model = null) {
+    const balances = acc.planCache?.balances
+    if (!Array.isArray(balances) || balances.length === 0) return false
+    const now = this.now()
+    const want = model ? String(model).toLowerCase() : null
+    let sawExpirable = false
+    for (const b of balances) {
+      if (want && String(b?.modelName ?? '').toLowerCase() !== want) continue
+      const exp = Number(b?.expiresAt)
+      if (!Number.isFinite(exp) || exp <= 0) continue
+      sawExpirable = true
+      if (exp * 1000 > now) return false // 还有一条未过期 → 账号仍可用
+    }
+    return sawExpirable
+  }
+
+  /**
+   * 该账号在指定模型下"可用额度已用尽"：该模型下所有未过期 entitlement 的 `remaining`
+   * 全部 ≤ 0。
+   *
+   * **账号 + 模型 + 额度** 三者关联的最后一环（用户规则）：
+   * "调用 GLM-5.3-Flash 时，即便 GLM-5.3 已用尽，只要 Flash 还有额度，这个账号就仍可用"。
+   * 反向也成立：GLM-5.3 全用尽的账号在请求 GLM-5.3 时不应被选中（让 Flash 还能被
+   * 其它请求用），即便它的 GLM-5.3 还没过期。
+   *
+   * 判定细节：
+   * - 不传 model → 返回 false（不参与过滤；账号级"整体用尽"由 `allPlansExpired` 与
+   *   `neverProvisioned` 已覆盖）。
+   * - 该模型下没有任何 entitlement（账号只挂了别的模型的套餐）→ 返回 false。
+   *   "账号没这个模型"由模型映射层（`models.js`）负责，这里不替它做决定。
+   * - entitlement 已过期 → 不参与额度判断（`allPlansExpired` 已管）。
+   * - entitlement 不带 `remaining` 字段（兼容老数据）→ 视为"无法判断额度"，跳过它。
+   */
+  modelQuotaExhausted(acc, model = null) {
+    if (!model) return false
+    const balances = acc.planCache?.balances
+    if (!Array.isArray(balances) || balances.length === 0) return false
+    const now = this.now()
+    const want = String(model).toLowerCase()
+    let sawLiveForModel = false
+    for (const b of balances) {
+      if (String(b?.modelName ?? '').toLowerCase() !== want) continue
+      const exp = Number(b?.expiresAt)
+      if (Number.isFinite(exp) && exp > 0 && exp * 1000 <= now) continue // 过期的不算
+      const remaining = Number(b?.remaining)
+      if (!Number.isFinite(remaining)) continue // 老数据无法判断额度
+      sawLiveForModel = true
+      if (remaining > 0) return false // 还有可用额度
+    }
+    return sawLiveForModel
   }
 
   /**
@@ -228,7 +334,7 @@ export class AccountPool {
    * 池层**不**为此放开"冷池允许多个新号同时在途"——那会让同一个上游在同一个 `minIntervalMs`
    * 窗口内被两个新号并发打（新号打上游同样是高频），并使节流防线在不同账号间失去统一性。
    */
-  pick(sessionKey) {
+  pick(sessionKey, { model = null } = {}) {
     const t = this.now()
     const all = this.store.list()
     // 本会话的亲和绑定（若未过期）：只用于"挑谁"，不用于"能不能挑"——见下方注释。
@@ -237,7 +343,7 @@ export class AccountPool {
       const hit = this.affinity.get(sessionKey)
       return hit && t - hit.at < AFFINITY_TTL ? hit.accountId : null
     })()
-    const healthy = all.filter((a) => this.healthy(a))
+    const healthy = all.filter((a) => this.healthy(a, model))
     if (!healthy.length) {
       const waitMs = this.earliestWaitMs(all)
       return {
@@ -303,9 +409,18 @@ export class AccountPool {
        * （`lastUsed = 0`），故与已过窗的历史号合并后按 least-recently-used 取号：既保证连拍后
        * 逐个换号，也保证新号不会被已用过的号长期压住。平秩用 `nextThrottleAt`（历史号在窗内
        * 早已被挡下，这里只可能是都已过窗）。
+       *
+       * **第一关键字是套餐紧迫度**（`planUrgency`，最快过期的未过期 entitlement 先烧），
+       * LRU 退为第二关键字。动机：截图场景里同一账号同时挂着"周末包 09:00 过期"与
+       * "Start Plan 23:59 过期"，按 LRU 平均分散会让周末包的 1.4% 到点作废；紧迫度优先
+       * 能把它先烧完。`planUrgency` 把无 expiresAt 的账号排到 `Infinity`（最不紧迫），
+       * 与"无 expiresAt 字段"的旧数据兼容。
        */
       const pool2 = fresh.concat(used)
-      pool2.sort((a, b) => this.lastUsed(a) - this.lastUsed(b) || this.nextThrottleAt(a) - this.nextThrottleAt(b))
+      pool2.sort((a, b) =>
+        this.planUrgency(a, t, model) - this.planUrgency(b, t, model)
+        || this.lastUsed(a) - this.lastUsed(b)
+        || this.nextThrottleAt(a) - this.nextThrottleAt(b))
       /**
        * 亲和绑定在**轮到挑谁**时优先：只要绑定号落在本次候选（即它已过窗、或它是从未用过的号），
        * 就发它，保证会话粘性。它若还在节流窗内，根本进不了这里——上面的 `blocking` 门已经
@@ -320,6 +435,14 @@ export class AccountPool {
       this.stampUsed(chosen.id, t)
       return { account: chosen, waitMs: Math.max(0, this.nextThrottleAt(chosen) - t) }
     }
+    /**
+     * 全 fresh 分支（冷池）：同样按紧迫度排，避免冷启动时把"最快过期"的号排到后面。
+     * 与上方 `pool2.sort` 同序：紧迫度 → lastUsed → nextThrottleAt。
+     */
+    fresh.sort((a, b) =>
+      this.planUrgency(a, t, model) - this.planUrgency(b, t, model)
+      || this.lastUsed(a) - this.lastUsed(b)
+      || this.nextThrottleAt(a) - this.nextThrottleAt(b))
     const chosen = (boundId && fresh.find((a) => a.id === boundId)) || fresh[0]
     if (sessionKey) this.affinity.set(sessionKey, { accountId: chosen.id, at: t })
     this.stampUsed(chosen.id, t)
