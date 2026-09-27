@@ -184,3 +184,97 @@ describe('管理面板：凭据不回显', () => {
     expect(rendered).toContain('eyJhbG…ture')
   })
 })
+
+describe('管理面板：OAuth 登录弹窗', () => {
+  it('授权 URL 通过 href 属性 / textContent 注入，不经 innerHTML（避免 javascript: 协议注入）', () => {
+    // 授权 URL 由上游返回，理论上受控于 zcode.z.ai，但跨上游转发/中间代理仍可能被改写。
+    // 防线：URL 只能作为 <a href> 属性或元素 textContent 写进 DOM，绝不能拼进 innerHTML。
+    // 新版弹窗的渲染路径：
+    //   $('dlgLoginUrl').href = r.authorizeUrl        ← 属性赋值，浏览器会拒绝 javascript:
+    //   $('dlgLoginUrlText').textContent = r.authorizeUrl  ← 纯文本，不产生标签
+    expect(html).toMatch(/\$\('dlgLoginUrl'\)\.href\s*=\s*r\.authorizeUrl/)
+    expect(html).toMatch(/\$\('dlgLoginUrlText'\)\.textContent\s*=\s*r\.authorizeUrl/)
+    // 反例防线：授权 URL 不得出现在任何 innerHTML 拼字符串里。
+    expect(html).not.toMatch(/innerHTML\s*\+?=.*authorizeUrl/)
+  })
+
+  it('弹窗按钮不带 onclick，状态文案经 textContent 注入（不经 innerHTML）', () => {
+    // 弹窗内的按钮（复制链接 / 重新生成 / 关闭）必须走 data-act 委托，不写 onclick。
+    const dlgMatch = html.match(/<dialog id="dlgLogin">([\s\S]*?)<\/dialog>/)
+    expect(dlgMatch).toBeTruthy()
+    const dlg = dlgMatch[1]
+    expect(dlg).not.toMatch(/onclick\s*=/i)
+    expect(dlg).not.toMatch(/javascript\s*:/i)
+    // 错误消息与计时文本只通过 setLoginStatus → textContent 注入：
+    // 即便上游返回 "<script>alert(1)</script>" 作为 p.error，也不会变成可执行标签。
+    expect(html).toMatch(/el\.textContent\s*=\s*text/)
+  })
+
+  it('三个步骤都有 data-state 属性用于状态机渲染（pending/active/done）', () => {
+    // 状态机靠 data-state 视觉化（CSS 选择器 [data-state="active"]），
+    // 这三行必须存在，否则 startLogin 找不到目标元素会静默失败。
+    expect(html).toContain('id="dlgLoginStep1"')
+    expect(html).toContain('id="dlgLoginStep2"')
+    expect(html).toContain('id="dlgLoginStep3"')
+    expect(html).toContain('data-state="pending"')
+  })
+})
+
+describe('管理面板：套餐有效期渲染', () => {
+  it('expiresAt 数字被解析为时间文本，不允许注入 HTML', async () => {
+    // expiresAt 在上游是秒级 epoch 数字，但写库前可能经过客户端/扫描路径，不能假设类型安全。
+    // 即便异常数据（字符串里塞 HTML）混进来，渲染也必须用 esc() 兜住——fmtExpiry 内部已做
+    // Number() 转换，非数字会落空，但若有任何分支把它当字符串原样拼接，这里就会暴露。
+    const evilExp = '1"><script>alert(5)</script>'
+    const acc = accountFixture({
+      planCache: {
+        balances: [
+          { entitlementId: 'e1', modelName: 'GLM-5.3', total: 100, remaining: 90, expiresAt: evilExp },
+          { entitlementId: 'e2', modelName: 'GLM-5.3-Flash', total: 100, remaining: 90, expiresAt: Math.floor(Date.now() / 1000) + 3600 },
+        ],
+      },
+    })
+    const rendered = await makeEnv({ accounts: [acc] }).render()
+    expect(rendered).not.toContain('<script>alert(5)')
+    // evilExp 里的 `"><script>` 不能被解析为真实标签：要么被 esc() 实体转义，要么整个被 Number() 拒绝
+    expect(rendered).not.toContain('<script>')
+    // 正常那条 Flash 的有效期应正常渲染（"Xh 后到期"或"Xmin 后到期"）
+    expect(rendered).toMatch(/\d+(min|h|天) 后到期/)
+  })
+
+  it('同模型多 entitlement 各自一行渲染（不合并），且模型名走 esc()', async () => {
+    // 用户决策：显示层不合并——同账号下同模型多 entitlement 的 expiresAt/reset 节奏不同，
+    // 合并会掩盖"周末包快烧完、日包还早"的差异。调度层内部仍按模型合并紧迫度，
+    // 但面板必须逐条显示。
+    const acc = accountFixture({
+      planCache: {
+        balances: [
+          { entitlementId: 'e1', modelName: EVIL_MODEL, total: 100, remaining: 90, expiresAt: Math.floor(Date.now() / 1000) + 3600 },
+          { entitlementId: 'e2', modelName: EVIL_MODEL, total: 200, remaining: 180, expiresAt: Math.floor(Date.now() / 1000) + 7200 },
+        ],
+      },
+    })
+    const rendered = await makeEnv({ accounts: [acc] }).render()
+    expect(rendered).not.toContain('<script>alert(3)')
+    expect(rendered).toContain('&lt;script&gt;')
+    // 逐条显示：应同时出现 90/100 与 180/200（而不是合并的 270/300）
+    expect(rendered).toContain('90 / 100')
+    expect(rendered).toContain('180 / 200')
+    expect(rendered).not.toContain('270 / 300')
+  })
+
+  it('已过期的 entitlement 在自己的行内显示红字"已过期"，不另起汇总行', async () => {
+    const pastSec = Math.floor(Date.now() / 1000) - 60
+    const acc = accountFixture({
+      planCache: {
+        balances: [
+          { entitlementId: 'e1', modelName: 'GLM-5.3', total: 100, remaining: 50, expiresAt: pastSec },
+        ],
+      },
+    })
+    const rendered = await makeEnv({ accounts: [acc] }).render()
+    expect(rendered).toContain('已过期')
+    // 不再渲染合并版的"└ 已过期 X/Y 作废"汇总行——已过期信息挂在该 entitlement 自己的行内
+    expect(rendered).not.toContain('作废')
+  })
+})

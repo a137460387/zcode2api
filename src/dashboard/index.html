@@ -135,6 +135,35 @@ dialog::backdrop{background:rgba(0,0,0,.55)}
 .step{display:flex;gap:10px;margin-bottom:10px;font-size:13px;align-items:flex-start}
 .step .n{flex:none;width:20px;height:20px;border-radius:50%;background:var(--panel2);border:1px solid var(--line);
   font-size:11px;display:flex;align-items:center;justify-content:center;color:var(--dim)}
+/* 步进状态（OAuth 登录弹窗）：当前步高亮呼吸、已完成打勾、未启动灰显。 */
+.step[data-state="active"] .n{background:var(--accent);border-color:var(--accent);color:#fff;
+  box-shadow:0 0 0 4px var(--accent-soft, rgba(88,101,242,.18));animation:stepPulse 1.4s ease-in-out infinite}
+.step[data-state="active"] .stxt{color:var(--fg)}
+.step[data-state="done"] .n{background:var(--ok);border-color:var(--ok);color:#fff}
+.step[data-state="done"] .stxt{color:var(--dim)}
+.step[data-state="pending"] .stxt{color:var(--dim)}
+.step .stxt{flex:1;line-height:1.6}
+@keyframes stepPulse{0%,100%{box-shadow:0 0 0 3px rgba(88,101,242,.18)}50%{box-shadow:0 0 0 6px rgba(88,101,242,.08)}}
+/* 授权链接区：完整 URL 可见，右侧"复制链接"按钮，下方一行辅助说明。 */
+.authurl{background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:10px 12px;
+  display:flex;gap:10px;align-items:center;margin:8px 0 4px}
+.authurl .u{flex:1;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12px;
+  color:var(--accent);word-break:break-all;line-height:1.5;user-select:all}
+.authurl .copybtn{flex:none}
+.authurl-note{display:flex;justify-content:space-between;align-items:center;gap:10px;font-size:12px;color:var(--dim)}
+/* 状态行：等待计时、错误、成功 各归一色。 */
+.login-status{margin-top:12px;padding:10px 12px;border-radius:8px;font-size:12px;line-height:1.6;
+  border:1px solid var(--line);background:var(--panel2)}
+.login-status[data-kind="wait"]{color:var(--dim)}
+.login-status[data-kind="ok"]{color:var(--ok);border-color:var(--ok-soft);background:var(--ok-soft)}
+.login-status[data-kind="err"]{color:var(--bad);border-color:var(--bad-soft);background:var(--bad-soft)}
+/* OAuth 弹窗顶部"版本选择"：单选切换，与 WorkBuddy 截图一致（左 label、右两个 radio）。 */
+.provider-pick{display:flex;align-items:center;gap:18px;padding:10px 12px;margin-bottom:14px;
+  background:var(--panel2);border:1px solid var(--line);border-radius:8px}
+.provider-pick .lb{font-size:12px;color:var(--dim);flex:none}
+.provider-pick .radio{display:flex;align-items:center;gap:6px;cursor:pointer;font-size:13px}
+.provider-pick .radio input{cursor:pointer;accent-color:var(--accent)}
+.provider-pick .radio .hint{font-size:11px;margin-left:2px}
 code{background:var(--panel2);padding:1px 5px;border-radius:4px;font-size:12px}
 footer{max-width:1320px;margin:0 auto;padding:0 22px 30px;font-size:11px;color:var(--dim2)}
 </style>
@@ -195,8 +224,7 @@ footer{max-width:1320px;margin:0 auto;padding:0 22px 30px;font-size:11px;color:v
     <section>
       <h2>账号 <em id="acctCount"></em></h2>
       <div class="toolbar">
-        <button class="btn primary" data-act="login" data-provider="bigmodel">+ BigModel 登录</button>
-        <button class="btn primary" data-act="login" data-provider="zai">+ Z.AI 登录</button>
+        <button class="btn primary" data-act="login">+ OAuth 登录</button>
         <button class="btn" data-act="addkey">+ API Key 账号</button>
         <button class="btn" data-act="import" title="扫描本机所有 ZCode 实例（默认 + 多开）的登录凭据与 Coding Plan key，无需重新授权">⤓ 扫描本机 ZCode 登录</button>
         <button class="btn" data-act="balance">刷新套餐额度</button>
@@ -298,12 +326,18 @@ footer{max-width:1320px;margin:0 auto;padding:0 22px 30px;font-size:11px;color:v
           <label class="fld">完全免密（含非本机）</label>
           <button class="btn" id="btnOpen" data-act="toggleopen" data-on="0">读不到状态</button>
         </div>
+        <div style="flex:none;min-width:200px">
+          <label class="fld">本机免密</label>
+          <button class="btn" id="btnLocal" data-act="togglelocal" data-on="0">读不到状态</button>
+        </div>
       </div>
       <div id="openWarn" class="hint" style="margin-top:12px"></div>
       <div class="hint" style="margin-top:10px">
         不想免密也行：在下面「面板访问密码」里设一个密码，其他设备用密码进。或者完全不开放
         （保持只监听 127.0.0.1）。注意这个面板能改 API Key、删账号——同一局域网里其他人
         也能访问时，等于把凭据管理交出去，所以「完全免密」默认是关的。
+        <br><b>「本机免密」何时该关</b>：本面板挂在反向代理（nginx / caddy / Cloudflare Tunnel 等）
+        后面时——代理回源地址总是 127.0.0.1，开着它等于"任何能到代理的人都被当本机放行"。
       </div>
     </section>
 
@@ -364,14 +398,46 @@ footer{max-width:1320px;margin:0 auto;padding:0 22px 30px;font-size:11px;color:v
 <footer>每 5 秒自动刷新 · <span id="logfile"></span></footer>
 
 <dialog id="dlgLogin">
-  <div class="dlg-hd" id="dlgLoginTitle">OAuth 登录</div>
+  <div class="dlg-hd">添加账号（OAuth 授权）</div>
   <div class="dlg-bd">
-    <div class="step"><div class="n">1</div><div>点击下面的链接，在浏览器里完成授权</div></div>
-    <div class="step"><div class="n">2</div><div><a id="dlgLoginUrl" href="#" target="_blank" rel="noopener" style="word-break:break-all">授权链接</a></div></div>
-    <div class="step"><div class="n">3</div><div>授权完成后本窗口会自动检测并入库</div></div>
-    <div class="hint" id="dlgLoginStatus">等待授权…</div>
+    <div class="provider-pick">
+      <div class="lb">选择要登录的版本：</div>
+      <label class="radio">
+        <input type="radio" name="loginProvider" value="bigmodel" checked id="rpBigmodel">
+        <span>BigModel <span class="hint">(bigmodel.cn)</span></span>
+      </label>
+      <label class="radio">
+        <input type="radio" name="loginProvider" value="zai" id="rpZai">
+        <span>Z.AI <span class="hint">(z.ai)</span></span>
+      </label>
+    </div>
+    <div class="step" data-state="pending" id="dlgLoginStep1"><div class="n">1</div><div class="stxt">正在向 <span id="dlgLoginProviderName">BigModel</span> 申请授权…</div></div>
+    <div class="step" data-state="pending" id="dlgLoginStep2">
+      <div class="n">2</div>
+      <div class="stxt">
+        <div>在浏览器里打开下方链接并完成登录授权</div>
+        <div class="authurl">
+          <a class="u" id="dlgLoginUrlText" href="#" target="_blank" rel="noopener" title="点击在浏览器中打开">…</a>
+          <button class="btn mini copybtn" data-act="copyloginurl" type="button">复制链接</button>
+        </div>
+        <div class="authurl-note">
+          <span>点击上方链接在浏览器里完成登录授权。完成后本窗口会自动检测并完成入库。</span>
+          <a id="dlgLoginUrl" href="#" target="_blank" rel="noopener" style="display:none">在新标签页打开</a>
+        </div>
+      </div>
+    </div>
+    <div class="step" data-state="pending" id="dlgLoginStep3">
+      <div class="n">3</div>
+      <div class="stxt">
+        <div>等待授权回调完成（自动检测）</div>
+        <div class="login-status" data-kind="wait" id="dlgLoginStatus">等待授权…</div>
+      </div>
+    </div>
   </div>
-  <div class="dlg-ft"><button class="btn" data-act="cancellogin">取消</button></div>
+  <div class="dlg-ft">
+    <button class="btn" data-act="cancellogin">关闭</button>
+    <button class="btn primary" data-act="retrylogin" id="dlgLoginRetry" style="display:none">重新生成链接</button>
+  </div>
 </dialog>
 
 <dialog id="dlgKey">
@@ -539,11 +605,15 @@ async function logout() {
 let ACCOUNTS = []
 
 /**
- * 余量徽章：把"未查询 / 已用尽 / 余量偏低"单独标出。
+ * 余量徽章：把"未查询 / 余量偏低"单独标出。
  *
  * 存在的理由（实测）：面板状态列原先只有按 `healthy` 的绿"可用"，而 `healthy` 只看
  * `noPackage` 标志、不看余量数据。于是「从未查询过余量」和「Flash 只剩 2.8%」这两种
  * 账号，与满格账号在状态列上完全一样——只能靠用户自己盯余量条才发现。
+ *
+ * 不显示"已用尽"徽标：quotaLevel === 'empty' 时该模型的余量进度条本身就是 0% 红条，
+ * 信息已经够显眼；状态列再叠一个红徽标只会把"为什么不可用"的真正原因（冷却/重登/停用）
+ * 挤下去。低余量（'low'）则不同——它不是"已经跑不动"，是"快要跑不动"，值得预警。
  */
 function quotaBadge(a) {
   switch (a.quotaLevel) {
@@ -552,7 +622,8 @@ function quotaBadge(a) {
       return '<span class="badge warn" title="从未查询过套餐余量，无从判断；该账号仍会被正常轮询。'
         + '点上方「刷新套餐额度」查询">余量未知</span>'
     case 'empty':
-      return '<span class="badge bad" title="至少一个模型的余量已归零，该模型已跑不动">余量已用尽</span>'
+      // 不再显示：余量列自身的 0% 红条已够醒目；状态列只留给"为什么不可用"的负向原因。
+      return ''
     case 'low':
       return '<span class="badge warn" title="至少一个模型余量低于 10%，很快会跑不动">余量偏低'
         + (a.worstPct != null ? ' ' + a.worstPct.toFixed(1) + '%' : '') + '</span>'
@@ -584,6 +655,25 @@ function statusBadges(a) {
   return out.join(' ')
 }
 
+// 有效期后缀的格式化：<1h → "Xmin 后到期"；<24h → "Xh 后到期"；<7d → "X天后到期"；
+// 更长 → "M月D日到期"。已过期 → "已过期"（红字）。无 expiresAt / 非数字 / 0 → 空串
+// （老数据没有这个字段，不显示）。
+function fmtExpiry(expiresAtSec, nowMs) {
+  const exp = Number(expiresAtSec)
+  if (!Number.isFinite(exp) || exp <= 0) return { text: '', cls: '' }
+  const expMs = exp * 1000
+  if (expMs <= nowMs) return { text: '已过期', cls: 'bad' }
+  const remain = expMs - nowMs
+  const min = Math.floor(remain / 60_000)
+  if (min < 60) return { text: min + 'min 后到期', cls: min < 30 ? 'bad' : 'warn' }
+  const h = Math.floor(min / 60)
+  if (h < 24) return { text: h + 'h 后到期', cls: h < 6 ? 'warn' : '' }
+  const d = Math.floor(h / 24)
+  if (d < 7) return { text: d + '天后到期', cls: '' }
+  const dt = new Date(expMs)
+  return { text: (dt.getMonth() + 1) + '月' + dt.getDate() + '日到期', cls: '' }
+}
+
 function quotaCell(a) {
   const bs = (a.planCache && a.planCache.balances) || []
   // 「余量未知」必须显式带警示色：它与"满格健康"在面板上原本长得一样，
@@ -593,28 +683,44 @@ function quotaCell(a) {
     return '<span class="badge warn" title="从未查询过套餐余量，无从判断还能不能跑'
       + '（该账号仍会被正常轮询）。点上方「刷新套餐额度」查询">余量未知</span>'
   }
+  const nowMs = Date.now()
+  const isExp = (b) => {
+    const exp = Number(b && b.expiresAt)
+    return Number.isFinite(exp) && exp > 0 && exp * 1000 <= nowMs
+  }
+  // 每条 entitlement 一行：同一账号下同模型常有多个 entitlement（周末包 + 日包），
+  // 它们的 expiresAt、reset 节奏完全不同；合并显示会掩盖"周末包快烧完、日包还早"的差异。
+  // 调度层已按"账号+模型"三维关联（planUrgency 内部仍合并多 entitlement），
+  // 但**显示层**保留逐条明细，让用户能看到具体是哪一条快过期/快用尽。
   const rows = bs.map((b) => {
     const t = Number(b.total) || 0
     const r = Number(b.remaining) || 0
     const p = t > 0 ? Math.max(0, Math.min(100, (r / t) * 100)) : 0
-    const cls = p <= 0 ? 'bad' : p < 10 ? 'bad' : p < 30 ? 'warn' : ''
-    // 见底时把百分比也写出来：只靠进度条的一小截很难判断是"快没了"还是"已经没了"。
+    const expired = isExp(b)
+    const cls = expired ? 'bad' : (p <= 0 ? 'bad' : p < 10 ? 'bad' : p < 30 ? 'warn' : '')
     const pctTxt = t > 0 && p < 30 ? ' <span class="hint">' + p.toFixed(1) + '%</span>' : ''
+    // 有效期后缀：已过期的红字"已过期"；未过期按剩余时长格式化
+    let expTxt = ''
+    if (expired) {
+      expTxt = ' <span class="hint bad">· 已过期</span>'
+    } else {
+      const f = fmtExpiry(b.expiresAt, nowMs)
+      if (f.text) expTxt = ' <span class="hint ' + f.cls + '">· ' + esc(f.text) + '</span>'
+    }
     return '<div class="qrow">'
       + '<span class="nm">' + esc(b.modelName || b.entitlementId) + '</span>'
       + '<span class="bar"><i class="' + cls + '" style="width:' + p.toFixed(1) + '%"></i></span>'
-      + '<span class="vl">' + esc(fmt(r)) + ' / ' + esc(fmt(t)) + pctTxt + '</span>'
+      + '<span class="vl">' + esc(fmt(r)) + ' / ' + esc(fmt(t)) + pctTxt + expTxt + '</span>'
       + '</div>'
   }).join('')
-  // 整号结论放在最前：逐个模型看条需要用户自己对总量下判断，而"这号还能不能跑"
-  // 应该一眼可见——按最紧的模型判定（模型级失败会直接打到用户请求上）。
+  // 整号结论放在最前：低余量需要预警（它还不是失败，但快要失败）；
+  // 已用尽不再单独加徽标——该模型的余量进度条本身就是 0% 红条，再叠一个红徽标
+  // 会把状态列真正的不可用原因（冷却/重登/停用）挤下去。
   const lvl = a.quotaLevel
-  const head = lvl === 'empty'
-    ? '<div><span class="badge bad">已用尽</span></div>'
-    : lvl === 'low'
-      ? '<div><span class="badge warn" title="至少一个模型余量已低于 10%，很快会跑不动">余量偏低'
-        + (a.worstPct != null ? ' ' + a.worstPct.toFixed(1) + '%' : '') + '</span></div>'
-      : ''
+  const head = lvl === 'low'
+    ? '<div><span class="badge warn" title="至少一个模型余量已低于 10%，很快会跑不动">余量偏低'
+      + (a.worstPct != null ? ' ' + a.worstPct.toFixed(1) + '%' : '') + '</span></div>'
+    : ''
   return head + rows
 }
 
@@ -648,15 +754,12 @@ function accountRow(a) {
 function renderAccounts() {
   const box = $('accounts')
   if (!box) return
-  // 计数分三层说清：能用的（含余量未知）/ 余量偏低 / 已用尽。
-  // 只报"健康 N 个"是不够的——实测 5 个账号全显示健康，其中 1 个余量未知、
-  // 1 个只剩 2.8%，而这些正是下一个会失败的对象。
+  // 计数分两层说清：能用的（含余量未知）/ 余量偏低。
+  // "已用尽"不再单独计数：该模型自身的余量条已经直观显示 0%，此处再列数字是冗余。
   if (ACCOUNTS.length) {
     const low = ACCOUNTS.filter((a) => a.quotaLevel === 'low').length
-    const empty = ACCOUNTS.filter((a) => a.quotaLevel === 'empty').length
     const parts = ['共 ' + ACCOUNTS.length + ' 个', '健康 ' + ACCOUNTS.filter((a) => a.healthy).length + ' 个']
     if (low) parts.push('余量偏低 ' + low + ' 个')
-    if (empty) parts.push('已用尽 ' + empty + ' 个')
     $('acctCount').textContent = parts.join(' · ')
   } else {
     $('acctCount').textContent = ''
@@ -994,6 +1097,14 @@ function renderAccess(s) {
     $('btnOpen').dataset.on = open ? '1' : '0'
     $('btnOpen').className = 'btn' + (open ? ' danger' : '')
   }
+  // 本机免密开关：与"完全免密"对称的 UI。挂在反代后必须关掉，否则代理回源 127.0.0.1
+  // 会让"任何能到代理的人"都被当本机放行。
+  const local = s.panel && s.panel.localBypass
+  if ($('btnLocal')) {
+    $('btnLocal').textContent = local ? '已开启（点此关闭）' : '已关闭（点此开启）'
+    $('btnLocal').dataset.on = local ? '1' : '0'
+    $('btnLocal').className = 'btn' + (local ? '' : ' danger')
+  }
   // 警示在开启时**持续显示**（不是一次性 toast）：这个状态会影响谁能管理凭据，
   // 必须是页面上随时看得见的事实，而不是一条看过就没的提示。
   $('openWarn').innerHTML = open
@@ -1030,6 +1141,22 @@ async function toggleOpen() {
     renderAccess(r.settings || SETTINGS)
   } catch (e) {
     toast('操作失败：' + e.message + (e.message === 'unauthorized' ? '（你已经把自己关在门外了：回到那台电脑上用 http://127.0.0.1:' + ((SETTINGS && SETTINGS.listen && SETTINGS.listen.port) || 28630) + '/ 重新打开）' : ''), 'err')
+  }
+}
+
+async function toggleLocal() {
+  const on = $('btnLocal').dataset.on !== '1'
+  if (!on) {
+    if (!window.confirm('关闭本机免密后，本机访问面板也必须带密码/token。仅当面板挂在反向代理后时该关；确定关闭？')) return
+  }
+  try {
+    const r = await postJSON('/settings/save', { panelLocalBypass: on })
+    if (r.errors && Object.keys(r.errors).length) return toast('保存失败：' + JSON.stringify(r.errors), 'err')
+    toast(on ? '已开启本机免密' : '已关闭本机免密（本机也将要求密码/token）', on ? 'ok' : 'err')
+    if (r.settings) SETTINGS = r.settings
+    renderAccess(r.settings || SETTINGS)
+  } catch (e) {
+    toast('操作失败：' + e.message, 'err')
   }
 }
 
@@ -1183,35 +1310,113 @@ function renderImportSources(sources) {
 }
 
 let LOGIN = null
-async function startLogin(provider) {
-  try {
-    const r = await postJSON('/accounts/login/' + provider + '/start', {})
-    LOGIN = { id: r.loginId, provider, timer: null }
-    $('dlgLoginTitle').textContent = (provider === 'zai' ? 'Z.AI' : 'BigModel') + ' OAuth 登录'
-    $('dlgLoginUrl').href = r.authorizeUrl
-    $('dlgLoginStatus').textContent = '等待授权…'
-    $('dlgLogin').showModal()
-    LOGIN.timer = setInterval(async () => {
-      if (!LOGIN) return
-      try {
-        const p = await postJSON('/accounts/login/' + provider + '/poll', { loginId: LOGIN.id })
-        if (p.status === 'pending') return
-        stopLoginPoll()
-        if (p.status === 'ready') {
-          toast('登录成功，账号已入库', 'ok')
-          $('dlgLogin').close()
-          refresh()
-        } else {
-          $('dlgLoginStatus').textContent = '失败：' + (p.error || '未知错误')
-        }
-      } catch (e) { /* 轮询失败不中断，下一轮再试 */ }
-    }, 1200)
-  } catch (e) { toast('发起登录失败：' + e.message, 'err') }
+const LOGIN_WAIT_HINT_AFTER_MS = 60_000 // 超过 60s 仍未回调 → 提示"链接可能未点/网络慢"
+
+function providerName(p) { return p === 'zai' ? 'Z.AI' : 'BigModel' }
+function currentLoginProvider() {
+  const el = document.querySelector('input[name="loginProvider"]:checked')
+  return el ? el.value : 'bigmodel'
 }
+
+function setLoginStep(stepEl, state, text) {
+  if (!stepEl) return
+  stepEl.dataset.state = state // pending | active | done
+  if (text != null) {
+    const txt = stepEl.querySelector('.stxt > div:first-child')
+    if (txt) txt.textContent = text
+  }
+}
+
+function setLoginStatus(kind, text) {
+  const el = $('dlgLoginStatus')
+  if (!el) return
+  el.dataset.kind = kind // wait | ok | err
+  el.textContent = text
+}
+
+function fmtElapsed(ms) {
+  const s = Math.floor(ms / 1000)
+  if (s < 60) return s + 's'
+  const m = Math.floor(s / 60)
+  return m + 'min ' + (s % 60) + 's'
+}
+
+async function startLogin(provider) {
+  provider = provider || currentLoginProvider()
+  // 重置弹窗到初始状态
+  setLoginStep($('dlgLoginStep1'), 'active', '正在向 ' + providerName(provider) + ' 申请授权…')
+  setLoginStep($('dlgLoginStep2'), 'pending')
+  setLoginStep($('dlgLoginStep3'), 'pending')
+  setLoginStatus('wait', '等待授权…')
+  $('dlgLoginProviderName').textContent = providerName(provider)
+  $('dlgLoginUrlText').textContent = '…'
+  $('dlgLoginUrlText').href = '#'
+  $('dlgLoginUrl').href = '#'
+  $('dlgLoginRetry').style.display = 'none'
+  if (!$('dlgLogin').open) $('dlgLogin').showModal()
+
+  let r
+  try {
+    r = await postJSON('/accounts/login/' + provider + '/start', {})
+  } catch (e) {
+    setLoginStep($('dlgLoginStep1'), 'pending')
+    setLoginStatus('err', '申请授权失败：' + e.message)
+    $('dlgLoginRetry').style.display = ''
+    return
+  }
+  LOGIN = {
+    id: r.loginId, provider,
+    pollTimer: null, elapsedTimer: null,
+    startedAt: Date.now(),
+    authorizeUrl: r.authorizeUrl,
+  }
+  setLoginStep($('dlgLoginStep1'), 'done')
+  setLoginStep($('dlgLoginStep2'), 'active')
+  setLoginStep($('dlgLoginStep3'), 'active')
+  // URL 同时写到 <a> 的 href 与 textContent：href 让"点击跳转"工作，textContent 是用户看到的文本。
+  // 这条赋值必须走属性通道（不经 innerHTML），防止上游返回伪协议时被注入。
+  $('dlgLoginUrlText').textContent = r.authorizeUrl
+  $('dlgLoginUrlText').href = r.authorizeUrl
+  $('dlgLoginUrl').href = r.authorizeUrl
+
+  // 已等待时长显示（让用户知道"等了多久"，长等待会提示去检查浏览器/网络）
+  LOGIN.elapsedTimer = setInterval(() => {
+    if (!LOGIN) return
+    const elapsed = Date.now() - LOGIN.startedAt
+    const base = '等待授权… 已等待 ' + fmtElapsed(elapsed)
+    setLoginStatus('wait', elapsed > LOGIN_WAIT_HINT_AFTER_MS
+      ? base + '（较久未完成：请确认浏览器里已点击授权，或检查网络）'
+      : base)
+  }, 1000)
+
+  // 轮询授权状态
+  LOGIN.pollTimer = setInterval(async () => {
+    if (!LOGIN) return
+    try {
+      const p = await postJSON('/accounts/login/' + provider + '/poll', { loginId: LOGIN.id })
+      if (p.status === 'pending') return
+      stopLoginPoll()
+      if (p.status === 'ready') {
+        setLoginStep($('dlgLoginStep2'), 'done')
+        setLoginStep($('dlgLoginStep3'), 'done')
+        setLoginStatus('ok', '登录成功，账号已入库')
+        toast('登录成功，账号已入库', 'ok')
+        setTimeout(() => { try { $('dlgLogin').close() } catch (e) {} refresh() }, 800)
+      } else {
+        setLoginStatus('err', '授权失败：' + (p.error || '未知错误'))
+        $('dlgLoginRetry').style.display = ''
+      }
+    } catch (e) { /* 轮询失败不中断，下一轮再试 */ }
+  }, 1200)
+}
+
 function stopLoginPoll() {
-  if (LOGIN && LOGIN.timer) clearInterval(LOGIN.timer)
+  if (!LOGIN) return
+  if (LOGIN.pollTimer) clearInterval(LOGIN.pollTimer)
+  if (LOGIN.elapsedTimer) clearInterval(LOGIN.elapsedTimer)
   LOGIN = null
 }
+
 async function cancelLogin() {
   if (LOGIN) {
     const { id, provider } = LOGIN
@@ -1219,6 +1424,46 @@ async function cancelLogin() {
     try { await postJSON('/accounts/login/' + provider + '/cancel', { loginId: id }) } catch (e) { /* 关窗优先 */ }
   }
   $('dlgLogin').close()
+}
+
+async function retryLogin() {
+  // 用户在授权链接失效/未完成时点"重新生成"：先取消当前 loginId，再以同 provider 重开一轮
+  if (!LOGIN) {
+    return startLogin(currentLoginProvider())
+  }
+  const { provider } = LOGIN
+  await cancelLogin()
+  await startLogin(provider)
+}
+
+// 切换"版本"（BigModel ↔ Z.AI）：中断当前 loginId 并立刻以新 provider 重新申请。
+async function switchLoginProvider(newProvider) {
+  if (LOGIN) {
+    const { id, provider } = LOGIN
+    stopLoginPoll()
+    try { await postJSON('/accounts/login/' + provider + '/cancel', { loginId: id }) } catch (e) {}
+  }
+  await startLogin(newProvider)
+}
+
+async function copyLoginUrl() {
+  const url = ($('dlgLoginUrlText').textContent || '').trim()
+  if (!url || url === '…') return
+  try {
+    await navigator.clipboard.writeText(url)
+    toast('已复制授权链接', 'ok')
+  } catch (e) {
+    // navigator.clipboard 在非 HTTPS/旧浏览器可能不可用，退化用 execCommand
+    const ta = document.createElement('textarea')
+    ta.value = url
+    ta.style.position = 'fixed'
+    ta.style.opacity = '0'
+    document.body.appendChild(ta)
+    ta.select()
+    try { document.execCommand('copy'); toast('已复制授权链接', 'ok') }
+    catch (e2) { toast('复制失败：' + e2.message, 'err') }
+    ta.remove()
+  }
 }
 async function submitKey() {
   const name = $('keyName').value.trim()
@@ -1245,6 +1490,18 @@ function bindEvents() {
   })
   $('gateBtn').addEventListener('click', submitLogin)
   $('gateInput').addEventListener('keydown', (ev) => { if (ev.key === 'Enter') submitLogin() })
+  $('dlgLogin').addEventListener('click', (ev) => {
+    const btn = ev.target.closest('button[data-act]')
+    if (!btn) return
+    const act = btn.dataset.act
+    if (act === 'cancellogin') return cancelLogin()
+    if (act === 'retrylogin') return retryLogin()
+    if (act === 'copyloginurl') return copyLoginUrl()
+  })
+  // 弹窗内单选"版本"切换：换 provider 时中断当前 loginId 并用新 provider 重新申请
+  document.querySelectorAll('input[name="loginProvider"]').forEach((el) => {
+    el.addEventListener('change', (ev) => switchLoginProvider(ev.target.value))
+  })
   document.querySelector('main').addEventListener('click', (ev) => {
     const btn = ev.target.closest('button[data-act]')
     if (!btn) return
@@ -1256,7 +1513,7 @@ function bindEvents() {
     if (act === 'balance') return refreshBalance()
     if (act === 'setall') return setAll(btn.dataset.enabled === '1')
     if (act === 'import') return importLocal()
-    if (act === 'login') return startLogin(btn.dataset.provider)
+    if (act === 'login') return startLogin()
     if (act === 'cancellogin') return cancelLogin()
     if (act === 'addkey') return $('dlgKey').showModal()
     if (act === 'closekey') return $('dlgKey').close()
@@ -1266,6 +1523,7 @@ function bindEvents() {
     if (act === 'saveruntime') return saveRuntime()
     if (act === 'reloadsettings') return loadSettings()
     if (act === 'toggleopen') return toggleOpen()
+    if (act === 'togglelocal') return toggleLocal()
     if (act === 'savehost') return saveHost()
     if (act === 'logout') return logout()
     return undefined
