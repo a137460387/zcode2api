@@ -19,12 +19,48 @@ export class AccountPool {
     this.lastPick = new Map()
   }
 
+  /**
+   * 账号是否可以进入轮询池。
+   *
+   * 最后一条是"从未确认过套餐"的账号排除规则，实测事故驱动：
+   * 一个 `userInfo` 与 `planCache.plans` 皆空、`requests: 0`（从未成功过一次）的账号，
+   * 五个标志位却全是"健康"形态（`enabled`/`needsRelogin:false`/`noPackage:false`/
+   * `invalidKey:false`/无冷却），于是被当成可用号反复调度 —— **每次轮到就回上游 1005**
+   * （HTTP 200 但业务失败），而 1005 在网关里属"客户端错误直接透传"：不换号、不冷却、
+   * 不计 `strikes`，所以它永远保持"健康"，形成死循环。实测该账号造成约 20% 的请求失败。
+   *
+   * 为什么不能只靠 `noPackage`：那个标志只在**上游回 1113** 时才置位，而这类账号回的是
+   * 1005，标志永远不置。判据必须自己看数据。
+   *
+   * 判据用"**从未查询过套餐**（`planCache.balances` 为空）**且**从未成功过（`requests: 0`）"
+   * 两条同时成立 —— 只看空 `balances` 会误伤两类正常账号：
+   *   1. 刚导入、还没点过「刷新套餐额度」的新号；
+   *   2. 有套餐但 `plans` 元数据没回填的号（实测 `ecddf87c` 就是 `userInfo` 空、`balances`
+   *      有值且发过 346 次请求，属于正常工作）。
+   * 加上 `requests > 0` 这一半，就只有"**从未查到额度、且从未跑通过**"的账号会被挡住——
+   * 它此前唯一的作用就是制造失败。这也意味着一旦它成功过一次，就会重新获得入场资格，
+   * 不会把"暂时查不到额度但能用"的号永久困死。
+   */
   healthy(acc) {
     return acc.enabled !== false
       && acc.needsRelogin !== true
       && acc.noPackage !== true
       && acc.invalidKey !== true
       && (acc.cooldownUntil ?? 0) <= this.now()
+      && !this.neverProvisioned(acc)
+  }
+
+  /**
+   * 从未确认过套餐、也从未成功过的账号（见 `healthy()` 的说明）。
+   *
+   * `planCache` 缺失或 `balances` 为空即视为"没查到过额度"；`stats.requests` 计数来自
+   * 用量记账（见 panel/api.js 的注释：账号行计数以只追加的用量日志为准），为 0 表示
+   * 这个号在本池里从未成功产出过一次。
+   */
+  neverProvisioned(acc) {
+    const balances = acc.planCache?.balances
+    const hasQueriedQuota = Array.isArray(balances) && balances.length > 0
+    return !hasQueriedQuota && (acc.stats?.requests ?? 0) <= 0
   }
 
   /**
@@ -92,8 +128,12 @@ export class AccountPool {
    */
   earliestWaitMs(all) {
     const t = this.now()
+    // 与 `healthy()` 同一条判据取"可自愈"子集：`neverProvisioned` 的账号（从未查到
+    // 额度、也从未成功过）不会随时间变好 —— 等下去毫无意义，必须回 `null` 让调用方
+    // 暴露"需人工干预"，而不是报一个永远等不到的 waitMs 让请求空转重试。
     const selfHealing = all.filter(
-      (a) => a.enabled !== false && a.needsRelogin !== true && a.noPackage !== true,
+      (a) => a.enabled !== false && a.needsRelogin !== true && a.noPackage !== true
+        && !this.neverProvisioned(a),
     )
     if (!selfHealing.length) return null
     /**

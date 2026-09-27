@@ -7,6 +7,29 @@ import { AccountPool } from '../src/accounts.js'
 
 const AFFINITY_TTL = 2 * 60 * 60 * 1000
 
+/**
+ * 最小内存账号夹具：**已确认套餐**，故 `healthy()` 会放行它进入轮询池。
+ *
+ * 必须带 `planCache.balances`：`neverProvisioned` 的账号（从未查到额度、且从未成功过）
+ * 会被 `healthy()` 排除。本文件绝大多数用例考的是节流/轮询/亲和，需要账号可被调度；
+ * "不带套餐就不该进场"这一条另有专门用例覆盖（'never-provisioned accounts'）。
+ */
+const prov = (over = {}) => ({
+  ...over,
+  enabled: true,
+  cooldownUntil: 0,
+  needsRelogin: false,
+  noPackage: false,
+  invalidKey: false,
+  strikes: 0,
+  // 顺序要紧：这三项必须**压在 `...over` 之后**。`over` 常常直接来自 `newAccountFields()`，
+  // 而它把 `planCache` 硬编码为 `null`、`stats.requests` 为 0 —— 若让 `...over` 在后，
+  // 它们会把这里给的值盖掉，账号又变回"从未确认套餐"而被 `healthy()` 排除，
+  // 表现为 `pick()` 返回 null / `waitMs` 变 null，且**看不出跟夹具写法有关**（实测踩过）。
+  planCache: { plans: [], balances: [{ modelName: 'GLM-5.3', total: 1000, remaining: 1000 }] },
+  stats: { requests: 0, inputTokens: 0, outputTokens: 0, lastUsedAt: 0, lastError: null, ...over.stats },
+})
+
 let store, pool, clock
 beforeEach(() => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'z2a-pool-'))
@@ -18,8 +41,29 @@ beforeEach(() => {
     now: () => clock.t,
   })
 })
-const add = async (over = {}) =>
-  store.save(newAccountFields({ provider: 'bigmodel', type: 'oauth', jwt: 'j', userInfo: { user_id: String(Math.random()).slice(2) }, ...over }))
+/**
+ * 造一个**已确认套餐**的账号作为默认夹具。
+ *
+ * 必须带 `planCache.balances`：`neverProvisioned` 的账号（从未查到额度、且从未成功过）
+ * 会被 `healthy()` 排除，而本文件绝大多数用例考的是节流/轮询/亲和，需要账号是可调度的。
+ * 不带套餐的账号另有专门的用例覆盖（见 'never-provisioned accounts'）。
+ *
+ * 注意 `newAccountFields` **不接受** `planCache` 参数（它硬编码为 `null`，因为真实导入
+ * 路径下额度是事后查询写入的），故这里在 `save()` 之后用 `update()` 补上——直接往
+ * `newAccountFields({...planCache})` 里传会被静默丢弃，夹具看起来带了额度、实际没有。
+ */
+const add = async (over = {}) => {
+  const acc = await store.save(newAccountFields({
+    provider: 'bigmodel',
+    type: 'oauth',
+    jwt: 'j',
+    userInfo: { user_id: String(Math.random()).slice(2) },
+    ...over,
+  }))
+  if (over.planCache !== undefined) return acc
+  await store.update(acc.id, { planCache: { plans: [], balances: [{ modelName: 'GLM-5.3', total: 1000, remaining: 1000 }] } })
+  return store.get(acc.id)
+}
 // 注意：AccountStore.save/update 现为 async（Task 3 演进），下面 add() 的调用点均需 await。
 
 describe('AccountPool.pick', () => {
@@ -183,9 +227,9 @@ describe('AccountPool.pick', () => {
     const t = 1_000_000
     // A 早已过窗（旧实现里 used[0]，wait=0 → 把门打开）；B/C 刚用过仍在窗内。
     const accounts = [
-      { id: 'A', stats: { lastUsedAt: t - 60_000 } },
-      { id: 'B', stats: { lastUsedAt: t - 100 } },
-      { id: 'C', stats: { lastUsedAt: t - 200 } },
+      prov({ id: 'A', stats: { lastUsedAt: t - 60_000 } }),
+      prov({ id: 'B', stats: { lastUsedAt: t - 100 } }),
+      prov({ id: 'C', stats: { lastUsedAt: t - 200 } }),
     ]
     const p = new AccountPool(
       { list: () => accounts, update: () => Promise.resolve(null) },
@@ -202,8 +246,8 @@ describe('AccountPool.pick', () => {
   it('affinity hit cannot pick an in-window account opened by another passed-window account (repro-throttle2)', async () => {
     const t = 1_000_001
     const accounts = [
-      { id: 'X', stats: { lastUsedAt: t - 60_000 } }, // 已过窗
-      { id: 'Y', stats: { lastUsedAt: t - 50 } },     // 窗内，且是亲和绑定
+      prov({ id: 'X', stats: { lastUsedAt: t - 60_000 } }), // 已过窗
+      prov({ id: 'Y', stats: { lastUsedAt: t - 50 } }),     // 窗内，且是亲和绑定
     ]
     const p = new AccountPool(
       { list: () => accounts, update: () => Promise.resolve(null) },
@@ -229,15 +273,8 @@ describe('AccountPool.pick', () => {
     for (let trial = 0; trial < 400; trial++) {
       const clk = { t: 1_000_000 }
       const n = 3 + Math.floor(Math.random() * 3) // 3-5 号
-      const accs = Array.from({ length: n }, (_, i) => ({
-        id: `u${trial}-${i}-${Math.random().toString(36).slice(2, 8)}`,
-        enabled: true,
-        cooldownUntil: 0,
-        needsRelogin: false,
-        noPackage: false,
-        strikes: 0,
-        stats: { requests: 0, inputTokens: 0, outputTokens: 0, lastUsedAt: 0, lastError: null },
-      }))
+      const accs = Array.from({ length: n }, (_, i) =>
+        prov({ id: `u${trial}-${i}-${Math.random().toString(36).slice(2, 8)}` }))
       const pl = new AccountPool(
         { list: () => accs, update: () => Promise.resolve(null) },
         { minIntervalMs: MIN, cooldown3012Ms: 30 * 60_000, now: () => clk.t },
@@ -576,7 +613,9 @@ describe('earliestWaitMs 非单调缺陷（修复轮 4）', () => {
     const store = new AccountStore(ownDir)
     let t = 1_000_000
     const pool = new AccountPool(store, { minIntervalMs: 2000, cooldown3012Ms: 1800000, now: () => t })
-    const acc = newAccountFields({ provider: 'bigmodel', type: 'oauth', userInfo: { user_id: 'C' } })
+    // prov() 必须在**外层**：内层的 newAccountFields 会把 planCache 设回 null，
+    // 反过来嵌套会让这个号变成"从未确认套餐"而被 healthy() 排除、pick 直接回 null。
+    const acc = prov(newAccountFields({ provider: 'bigmodel', type: 'oauth', userInfo: { user_id: 'C' } }))
     await store.save(acc)
     // 该号 500ms 前用过（节流窗还剩 1500ms），且冷却再 1000ms 解禁
     await store.update(acc.id, { cooldownUntil: t + 1000 })
@@ -589,5 +628,78 @@ describe('earliestWaitMs 非单调缺陷（修复轮 4）', () => {
     t += w1
     const r = pool.pick(null)
     expect(r.account).not.toBeNull()
+  })
+})
+
+/**
+ * 【关键回归】从未确认套餐的账号不得进入轮询池。
+ *
+ * 实测事故：一个 `userInfo`/`plans` 皆空、`requests: 0` 的账号，五个标志位却全是健康形态，
+ * 于是被反复调度 —— **每次轮到就回上游 1005**（HTTP 200 但业务失败）。而 1005 在网关里
+ * 属"客户端错误直接透传"：不换号、不冷却、不计 strikes，该号因此永远保持"健康"，
+ * 形成死循环，实测造成约 20% 的请求失败。
+ *
+ * 判据必须是"**从未查到额度 且 从未成功过**"两条同时成立。只看空 `balances` 会误伤
+ * 刚导入还没点过「刷新套餐额度」的新号、以及有套餐但元数据没回填的正常号（实测
+ * `ecddf87c` 就是 userInfo 空 + balances 有值 + 346 次成功请求，完全正常）。
+ */
+describe('never-provisioned accounts（未确认套餐的号不进池）', () => {
+  /** 造一个 `newAccountFields` 原样（planCache=null、requests=0）的账号。 */
+  const rawAccount = async (over = {}) =>
+    store.save(newAccountFields({ provider: 'bigmodel', type: 'oauth', jwt: 'j', userInfo: { user_id: String(Math.random()).slice(2) }, ...over }))
+
+  it('从未查到额度且从未成功过 → 不进池，且不给出 waitMs（等不来）', async () => {
+    await rawAccount()
+    const r = pool.pick(null)
+    expect(r.account).toBeNull()
+    // waitMs 必须为 null：这类账号不会随时间自愈，报一个 waitMs 会让调用方空转重试。
+    expect(r.waitMs).toBeNull()
+    expect(r.warn).toBe('human action required')
+  })
+
+  it('一旦成功过一次（requests > 0）即重新获得入场资格', async () => {
+    const a = await rawAccount()
+    await store.update(a.id, (cur) => ({ stats: { ...cur.stats, requests: 1 } }))
+    expect(pool.pick(null).account?.id).toBe(a.id)
+  })
+
+  it('查到过额度（balances 非空）即入场，即便一次都没成功过', async () => {
+    const a = await rawAccount()
+    await store.update(a.id, { planCache: { plans: [], balances: [{ modelName: 'GLM-5.3', total: 1000, remaining: 1 }] } })
+    expect(pool.pick(null).account?.id).toBe(a.id)
+  })
+
+  it('余量正好为 0 仍算"查到过额度"：是否可跑交给上游判定，不在这里猜', async () => {
+    // 余量 0 与"没数据"是两回事：前者是确切事实（可能刚被重置/跨周期），后者是无从判断。
+    // 这里只排除后者；余量见底的提示由面板负责（quotaLevel），不在调度层做二次推断。
+    const a = await rawAccount()
+    await store.update(a.id, { planCache: { plans: [], balances: [{ modelName: 'GLM-5.3', total: 1000, remaining: 0 }] } })
+    expect(pool.healthy(store.get(a.id))).toBe(true)
+  })
+
+  it('balances 为空数组 → 视为未查到额度', async () => {
+    const a = await rawAccount()
+    await store.update(a.id, { planCache: { plans: [], balances: [] } })
+    expect(pool.healthy(store.get(a.id))).toBe(false)
+  })
+
+  it('pool 里混有坏号时，调度跳过它并照常选中正常号', async () => {
+    const bad = await rawAccount()
+    const good = await add()
+    const r = pool.pick(null)
+    expect(r.account?.id).toBe(good.id)
+    expect(r.account?.id).not.toBe(bad.id)
+  })
+
+  it('坏号不参与节流门：它不被调度，也就不该拖住正常号的节奏', async () => {
+    // 若坏号被算进 blocking，它会以 lastUsed=0 之外的历史姿态影响 waitMs；
+    // 正确行为是它对 pick 完全透明。
+    const bad = await rawAccount()
+    const good = await add()
+    const first = pool.pick(null)
+    expect(first.account.id).toBe(good.id)
+    clock.t += 10_000
+    expect(pool.pick(null).account?.id).toBe(good.id)
+    expect(pool.healthy(store.get(bad.id))).toBe(false)
   })
 })

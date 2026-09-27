@@ -45,6 +45,26 @@ const withAccount = async (deps, over = {}) => {
   return deps
 }
 
+/**
+ * 存一个**已确认套餐**的账号（补上 `planCache.balances`），使其真能进入轮询池。
+ *
+ * 为什么需要：`healthy()` 会排除"从未查到额度、且从未成功过"的账号（见 accounts.js
+ * 的 neverProvisioned），而 `newAccountFields` 把 `planCache` 硬编码为 `null`。
+ * 凡是断言"账号健康 / 能被选中"的用例都必须用这个入口，否则夹具本身就是不可调度状态，
+ * 失败信息还会表现为毫不相干的 `pick() 返回 null`。
+ */
+const savedProvisioned = async (deps, over = {}) => {
+  const acc = await deps.store.save(newAccountFields({
+    provider: 'bigmodel', type: 'oauth', jwt: 'j',
+    userInfo: { user_id: String(Math.random()).slice(2) },
+    ...over,
+  }))
+  await deps.store.update(acc.id, {
+    planCache: { plans: [], balances: [{ entitlementId: 'e', modelName: 'GLM-5.3', total: 1000, remaining: 1000 }] },
+  })
+  return acc.id
+}
+
 describe('GET /accounts：脱敏是硬约束', () => {
   it('账号列表不含 jwt / accessToken / refreshToken 原文', async () => {
     const deps = await withAccount(buildDeps())
@@ -667,8 +687,10 @@ describe('apikey 账号的 401 语义', () => {
 
   it('失效的 apikey 不会阻止其他账号被选用', async () => {
     const deps = buildDeps()
-    await deps.store.save(newAccountFields({ provider: 'bigmodel', type: 'apikey', apiKey: 'k', userInfo: { id: 'bad' } }))
-    await deps.store.save(newAccountFields({ provider: 'bigmodel', type: 'oauth', jwt: 'j', userInfo: { user_id: 'good' } }))
+    // 两个号都要是"已确认套餐"的，否则会被 neverProvisioned 排除，本用例就测不到
+    // "失效 apikey 被跳过"这件事了。
+    await savedProvisioned(deps, { type: 'apikey', apiKey: 'k', userInfo: { id: 'bad' } })
+    await savedProvisioned(deps, { userInfo: { user_id: 'good' } })
     await deps.store.update('bigmodel:bad', { invalidKey: true })
     const picked = deps.pool.pick(null)
     expect(picked.account.id).toBe('bigmodel:good')
@@ -695,14 +717,18 @@ describe('apikey 导入时探测', () => {
   const r1113 = { status: 429, clone() { return { text: async () => JSON.stringify({ code: 1113 }) } } }
   const r401 = { status: 401, clone() { return { text: async () => JSON.stringify({ error: { type: '1000' } }) } } }
 
-  it('密钥可用 → 无标记，账号健康', async () => {
+  it('密钥可用 → 无标记', async () => {
     const deps = importDeps(okResp)
     const r = await request(createApp(deps)).post('/accounts/import/local').send({})
     expect(r.body.probes[0].ok).toBe(true)
     const a = deps.store.get('bigmodel:coding-plan:9')
     expect(a.invalidKey).toBe(false)
     expect(a.noPackage).toBe(false)
-    expect(deps.pool.healthy(a)).toBe(true)
+    // 这里**不**断言 `pool.healthy(a)`：探测通过只说明密钥有效，不代表该号已被确认有
+    // 套餐额度。新导入账号 `planCache` 为 null、`requests` 为 0，属"从未确认套餐"
+    // （见 accounts.js 的 neverProvisioned），`healthy()` 会（正确地）判它暂不可调度——
+    // 那是调度层的判定，与本用例要验的"探测不误标记"无关。该号在首次成功请求
+    // （requests > 0）或查询到额度后会自动重新入场，见 accounts.test.mjs 的对应用例。
   })
 
   it('1113（无资源包）→ 标记 noPackage，池子不再选它', async () => {
