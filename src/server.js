@@ -341,7 +341,13 @@ export async function main() {
     log('[farm] 手动模式（FARM_AUTO_BROWSER=0）：未启动自动浏览器。')
     log(`[farm] 请用你自己的 Chrome 打开 ${farm.url} 并保持标签页。`)
   } else {
-    const browser = await launchFarmBrowser({ url: farm.url, headless: config.farmHeadless, chromePath: config.chromePath, log })
+    const browser = await launchFarmBrowser({
+      url: farm.url,
+      headless: config.farmHeadless,
+      chromePath: config.chromePath,
+      minimized: config.farmMinimized,
+      log,
+    })
     if (!browser) {
       log(`[farm] 自动浏览器未启动：请手动打开 ${farm.url} 并保持标签页`)
     }

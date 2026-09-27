@@ -123,6 +123,7 @@ export class RuntimeSettings {
         maxRetries: c.maxRetries,
         farmHeadless: c.farmHeadless,
         farmAutoBrowser: c.farmAutoBrowser,
+        farmMinimized: c.farmMinimized,
       },
       paramPool: paramPoolStatus,
     }

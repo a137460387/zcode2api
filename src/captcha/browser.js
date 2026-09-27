@@ -48,7 +48,7 @@ function desktopUA(chromePath) {
   return cachedUA
 }
 
-export async function launchFarmBrowser({ url, headless = false, chromePath = '', log = () => {} }) {
+export async function launchFarmBrowser({ url, headless = false, chromePath = '', minimized = false, log = () => {} }) {
   let pw
   try {
     pw = await import('playwright')
@@ -62,15 +62,31 @@ export async function launchFarmBrowser({ url, headless = false, chromePath = ''
       channel: chromePath ? undefined : 'chrome',
       headless,
       executablePath: chromePath || undefined,
+      /**
+       * `--start-minimized` 让有头窗口直接缩进任务栏，屏幕上看不到它。
+       *
+       * 这不等于回到无头：无头会被上游判 F011（见 config.js 的 farmHeadless），
+       * 而这里仍是**有头**浏览器，只是窗口最小化。实测该状态下农场照常产出
+       * （280 字符参数、fails 恒为 0）。
+       *
+       * 注意这是"当前实测可用"而非"机制上保证可用"：我们只知道 SDK 会认无头，
+       * 并不确切知道它查哪些特征。若哪天它开始检查窗口可见性，最小化会像无头
+       * 一样静默失效（表现为 F011、产出归零）。所以排查农场时先把它关掉，
+       * 用可见窗口复现，再判定问题。
+       */
+      args: minimized && !headless ? ['--start-minimized'] : [],
     })
     // 必须覆盖 UA（否则 SDK 见 `HeadlessChrome` 判 F001），且用本机 Chrome 的真实版本号
-    // （写死旧版本会与浏览器实际版本不符，参数可能被判低分 → 上游 3012）。见 desktopUA 注释。
+    // （写死旧版本会与本机浏览器不符，参数可能被判低分 → 上游 3012）。见 desktopUA 注释。
     const ua = desktopUA(chromePath)
     log(`[farm] 农场浏览器 UA 主版本 = ${ua.match(/Chrome\/(\d+)/)?.[1] ?? '?'}`)
     const context = await browser.newContext({ userAgent: ua, viewport: { width: 1280, height: 800 } })
     const page = await context.newPage()
     await page.goto(url, { waitUntil: 'domcontentloaded' })
-    log(`[farm] 自动农场浏览器已启动（headless=${headless}） → ${url}`)
+    // 把"窗口现在是什么状态"讲清楚：最小化后屏幕上没有窗口，用户看到这行才知道
+    // 该去哪儿找回它（任务栏），也才知道它并没有变成无头。
+    const windowMode = headless ? '无头' : minimized ? '有头（窗口已最小化到任务栏）' : '有头（窗口可见）'
+    log(`[farm] 自动农场浏览器已启动（${windowMode}） → ${url}`)
     return browser
   } catch (e) {
     // 启动成功后任何一步失败都要回收浏览器，否则每次失败都留下一组孤儿 Chrome 进程

@@ -667,7 +667,11 @@ function renderPool() {
   const url = (SETTINGS && SETTINGS.farmUrl) || ''
   const mode = rt.farmAutoBrowser === false
     ? '<span class="badge warn">手动模式</span>'
-    : (rt.farmHeadless ? '<span class="badge ok">后台无头</span>' : '<span class="badge info">有头窗口</span>')
+    : (rt.farmHeadless
+      ? '<span class="badge ok">后台无头</span>'
+      : (rt.farmMinimized
+        ? '<span class="badge info">有头（已最小化）</span>'
+        : '<span class="badge info">有头窗口</span>'))
   $('pp-farm').innerHTML = mode + (url ? ' <a href="' + esc(url) + '" target="_blank" rel="noopener">打开 farm 页</a>' : '')
   $('poolNote').textContent = p.lastPushAt ? ('最近产出 ' + ago(p.lastPushAt)) : ''
   renderFarmReport(p.farmReport)
@@ -901,7 +905,7 @@ async function loadSettings() {
       ['用量目录', s.usageDir],
       ['.env 文件', s.envFile],
       ['面板密码文件', s.panelFile],
-      ['农场浏览器', rt.farmAutoBrowser === false ? '手动模式（未自动启动）' : (rt.farmHeadless ? '后台无头（无可见窗口）' : '有头窗口')],
+      ['农场浏览器', rt.farmAutoBrowser === false ? '手动模式（未自动启动）' : (rt.farmHeadless ? '后台无头（无可见窗口）' : (rt.farmMinimized ? '有头（窗口已最小化到任务栏）' : '有头窗口（可见）'))],
     ]
     $('setInfo').innerHTML = rows.map(([k, v]) =>
       '<tr><td style="width:170px;color:var(--dim)">' + esc(k) + '</td><td class="mono">' + esc(v || '-') + '</td></tr>').join('')

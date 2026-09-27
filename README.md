@@ -36,6 +36,12 @@ npm start
 - farm 页：`http://127.0.0.1:28631/farm`
   - **默认后台模式**（`FARM_AUTO_BROWSER=1` + `FARM_HEADLESS=0`）：playwright 启动**有头**
     浏览器自动产参数。桌面会出现一个 Chrome 窗口——**别关它**，关掉即断供（详见下面"为什么默认有头"）。
+  - **不想看到那个窗口**：设 `FARM_MINIMIZED=1`，农场窗口启动即最小化到任务栏，
+    屏幕上看不到它。它**仍是有头浏览器**，不是回到无头——实测最小化状态下产出正常
+    （`total` 稳定增长、`fails=0`）、端到端请求可用。
+    代价要清楚：① 它仍可被误关（任务栏右键关闭 = 断供）；② 它依赖"SDK 不检查窗口可见性"
+    这一**尚未被机制性证实**的假设，哪天失效会**静默**退化成 F011 + 产出归零。
+    所以怀疑农场有问题时，先设回 `FARM_MINIMIZED=0` 用可见窗口复现再判断。
   - 手动模式（`FARM_AUTO_BROWSER=0`）：用你自己的 Chrome 打开上述地址并保持标签页。
     产出成功的标志是页面顶部出现绿色 `param 产出并推送成功`，且"池内 param"不为 `-`。
   - **为什么默认有头**：无头模式（`FARM_HEADLESS=1`）**已不可用**。实测无头下会稳定吃
@@ -75,7 +81,7 @@ npm start
 ```
 计划任务 → launch-hidden.vbs  隐藏控制台窗口（只隐藏这个，不是农场窗口）
          → start-gateway.bat  写 logs\gateway-startup.log，然后 node src/server.js
-         → 服务自己再拉起有头 Chrome（农场，可见）
+         → 服务自己再拉起有头 Chrome（农场；可见，或按 FARM_MINIMIZED=1 最小化到任务栏）
 ```
 
 - **日志**：`logs\gateway-startup.log`，每次启动**截断重写**（只看当前这次启动；要留历史就在重启前自己拷走）。

@@ -104,3 +104,51 @@ describe('launchFarmBrowser 的 UA 覆盖（契约）', () => {
     expect(source).not.toMatch(/Chrome\/\d+\.0\.0\.0/)
   })
 })
+
+// 【关键回归】最小化开关（FARM_MINIMIZED）。
+//
+// 背景：有头模式（默认）必然在桌面留一个可见 Chrome 窗口。`--start-minimized`
+// 让它直接缩进任务栏，屏幕上看不到——但它**仍是有头浏览器**，不是回到无头
+// （无头会被上游判 F011，实测产出归零）。这里锁住三条：
+//   1. minimized=true 且 headless=false → 传 --start-minimized
+//   2. minimized 缺省 → 不传该参数（默认行为不能被悄悄改掉）
+//   3. headless=true 时忽略 minimized（无头本就没窗口，传了也没意义）
+describe('launchFarmBrowser 的窗口最小化（契约）', () => {
+  /** 用 mock playwright 抓取真正传给 chromium.launch 的参数。 */
+  async function capturedLaunchOptions(opts) {
+    let got = null
+    vi.doMock('playwright', () => ({
+      chromium: {
+        launch: async (o) => {
+          got = o
+          return {
+            newContext: async () => ({
+              newPage: async () => ({ goto: async () => {} }),
+            }),
+            close: async () => {},
+          }
+        },
+      },
+    }))
+    const { launchFarmBrowser: fresh } = await import('../src/captcha/browser.js')
+    await fresh({ url: 'http://127.0.0.1:1/farm', log: () => {}, ...opts })
+    return got
+  }
+
+  it('有头 + minimized=true 时传入 --start-minimized', async () => {
+    const o = await capturedLaunchOptions({ headless: false, minimized: true })
+    expect(o.headless).toBe(false)
+    expect(o.args).toContain('--start-minimized')
+  })
+
+  it('缺省 / minimized=false 时不传任何 args（默认必须是普通可见窗口）', async () => {
+    expect((await capturedLaunchOptions({ headless: false })).args).toEqual([])
+    expect((await capturedLaunchOptions({ headless: false, minimized: false })).args).toEqual([])
+  })
+
+  it('headless=true 时忽略 minimized：无头没有窗口可最小化', async () => {
+    const o = await capturedLaunchOptions({ headless: true, minimized: true })
+    expect(o.headless).toBe(true)
+    expect(o.args).toEqual([])
+  })
+})

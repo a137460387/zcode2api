@@ -32,17 +32,19 @@ describe('loadConfig', () => {
     expect(c.cooldown3012Ms).toBe(30 * 60_000)
     expect(c.maxRetries).toBe(2)
     expect(c.farmHeadless).toBe(false)
+    expect(c.farmMinimized).toBe(false)
   })
 
   it('parses numeric and boolean env values', () => {
     const c = loadConfig({
       rootDir: '/tmp/x',
-      env: { PORT: '9000', API_KEY: 'sk-test', POOL_SIZE: '3', FARM_HEADLESS: '1', COOLDOWN_3012_MIN: '5' },
+      env: { PORT: '9000', API_KEY: 'sk-test', POOL_SIZE: '3', FARM_HEADLESS: '1', FARM_MINIMIZED: '1', COOLDOWN_3012_MIN: '5' },
     })
     expect(c.port).toBe(9000)
     expect(c.apiKey).toBe('sk-test')
     expect(c.poolSize).toBe(3)
     expect(c.farmHeadless).toBe(true)
+    expect(c.farmMinimized).toBe(true)
     expect(c.cooldown3012Ms).toBe(5 * 60_000)
   })
 

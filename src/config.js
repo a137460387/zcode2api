@@ -63,6 +63,18 @@ export function loadConfig({ rootDir = process.cwd(), env = process.env } = {}) 
     // 必要性：playwright 驱动的浏览器（即便覆盖 UA）仍带自动化特征，产出的 captcha 参数
     // 会被上游判低风险分并返回 3012；真实 Chrome 环境产出的参数才能通过（详见 README）。
     farmAutoBrowser: bool(env.FARM_AUTO_BROWSER, true),
+    /**
+     * 有头模式下把农场窗口直接最小化到任务栏，屏幕上就看不到它了。
+     *
+     * 默认关：窗口可见是最"诚实"的状态，出问题时一眼能看见；开着它属于把
+     * 一个可见窗口藏起来，收益只是清爽，代价是排查时容易忘了它存在。
+     *
+     * 只在有头模式下有效（headless=true 时忽略，无头本来就没有窗口）。
+     * 这不等于无头——实测最小化状态下农场照常产出。但它依赖"SDK 不检查窗口
+     * 可见性"这一尚未被机制性证实的假设，失效时会静默变成 F011 + 产出归零，
+     * 所以怀疑农场有问题时先关掉它复现。
+     */
+    farmMinimized: bool(env.FARM_MINIMIZED, false),
     chromePath: env.CHROME_PATH || '',
     poolSize: num(env.POOL_SIZE, 6, 1),
     paramTtlMs: num(env.PARAM_TTL_MS, 8 * 60_000, 0),

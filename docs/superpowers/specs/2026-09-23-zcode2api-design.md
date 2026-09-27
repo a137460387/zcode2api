@@ -200,6 +200,7 @@ status 端点确切 URL 在实现期用 `tools/` 里的 bundle 扫描脚本提�
 | `API_KEY` | 必填 | 对外鉴权 |
 | `POOL_DIR` | ./accounts | 账号文件目录 |
 | `FARM_HEADLESS` | 0 | 农场浏览器**有头**；设 1 走无头会被 SDK 判 `F011`，产不出参数 |
+| `FARM_MINIMIZED` | 0 | 有头时把农场窗口最小化到任务栏；仅 `FARM_HEADLESS=0` 有效 |
 | `CHROME_PATH` | 自动探测 | Chrome 可执行文件 |
 | `POOL_SIZE` | 6 | 参数池上限 |
 | `ACCOUNT_MIN_INTERVAL_MS` | 2000 | 单账号最小请求间隔 |
