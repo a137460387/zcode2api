@@ -52,7 +52,11 @@ const upstreamUrl = `http://127.0.0.1:${upstream.address().port}/api/v1/zcode-pl
 // ---- 真实依赖 ----
 const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'e2e-'))
 const store = new AccountStore(dir)
-await store.save(newAccountFields({ provider: 'bigmodel', type: 'oauth', jwt: 'JWT', userInfo: { user_id: '1', email: 'a@b.c' } }))
+const acc = await store.save(newAccountFields({ provider: 'bigmodel', type: 'oauth', jwt: 'JWT', userInfo: { user_id: '1', email: 'a@b.c' } }))
+// 同 tests/accounts.test.mjs 的 prov/add 夹具：`newAccountFields` 硬编码 planCache=null，
+// 而 `neverProvisioned` 的账号（planCache.balances 为空 且 stats.requests===0）会被
+// healthy() 排除——ab1f86b 之后这种账号不进轮询池，e2e 必须显式给它确认套餐。
+await store.update(acc.id, { planCache: { plans: [], balances: [{ modelName: 'GLM-5.3', total: 1000, remaining: 1000 }] } })
 const pool = new AccountPool(store, { minIntervalMs: 0, cooldown3012Ms: 1800000 })
 const paramPool = new ParamPool({})
 for (let i = 0; i < 10; i++) paramPool.push('P'.repeat(80) + i)
