@@ -94,8 +94,28 @@ npm start
   需结束监听 28630 的进程再 `Start-ScheduledTask`。
 - **重复触发是安全的**：`MultipleInstances=IgnoreNew`，服务已在跑时再触发不会起第二个实例
   （已验证：PID 不变、日志无第二次启动记录）。
+- **运行期崩溃不会被自动拉起**：上面的 `RestartCount=3` 只在**启动瞬时**失败时重试；
+  node 跑起来之后再崩，计划任务感知不到，要等下次登录。要崩溃自愈，注册看门任务（见下）。
 - **端到端验证**：`Start-ScheduledTask -TaskName zcode2api-Gateway`，然后确认
   `http://127.0.0.1:28630/health` 返回 200 且 `logs\gateway-startup.log` 里有 `[farm]` 行。
+
+### 崩溃看门（可选）
+
+`scripts/watchdog.mjs` 每 5 分钟探活一次 `http://<HOST>:<PORT>/health`，发现服务死了就
+按端口反查 PID 杀残留进程，然后 `Start-ScheduledTask zcode2api-Gateway`。
+
+```powershell
+node scripts/watchdog.mjs --register      # 注册成每 5 分钟跑一次的计划任务 zcode2api-Watchdog
+node scripts/watchdog.mjs --unregister    # 移除
+node scripts/watchdog.mjs                 # 手动跑一次探活（用于验证）
+```
+
+- 探活日志：`logs\watchdog.log`（追加，不滚动；一年也只几百 KB，定期手清即可）。
+- HOST 从 `.env` 读；`HOST=0.0.0.0` 时看门仍然探 `127.0.0.1`（本机回环总是可达）。
+- 不会误杀隔壁项目：按"监听端口"反查 PID，不按 `node src/server.js` 命令行匹配
+  （README 主章节对 trae2api 同命令行的警告在这里同样适用）。
+- **端到端验证**：`--register` 之后 `Stop-Process` 杀掉 node，5 分钟内 `http://127.0.0.1:28630/health`
+  应重新 200。
 
 > 排查这台机器上的进程时注意：**另一个项目 `trae2api` 的进程命令行也是 `node src/server.js`**
 > （它和自己的 `start-gateway.bat` 一起在 `D:\code\Ai\trae2api`，占 28620/28621）。
