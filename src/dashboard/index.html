@@ -605,15 +605,15 @@ async function logout() {
 let ACCOUNTS = []
 
 /**
- * 余量徽章：把"未查询 / 余量偏低"单独标出。
+ * 余量徽章：只把"未查询"单独标出。
  *
  * 存在的理由（实测）：面板状态列原先只有按 `healthy` 的绿"可用"，而 `healthy` 只看
- * `noPackage` 标志、不看余量数据。于是「从未查询过余量」和「Flash 只剩 2.8%」这两种
- * 账号，与满格账号在状态列上完全一样——只能靠用户自己盯余量条才发现。
+ * `noPackage` 标志、不看余量数据。「从未查询过余量」的账号与满格账号在状态列上完全
+ * 一样——只能靠用户自己盯余量条才发现。
  *
- * 不显示"已用尽"徽标：quotaLevel === 'empty' 时该模型的余量进度条本身就是 0% 红条，
- * 信息已经够显眼；状态列再叠一个红徽标只会把"为什么不可用"的真正原因（冷却/重登/停用）
- * 挤下去。低余量（'low'）则不同——它不是"已经跑不动"，是"快要跑不动"，值得预警。
+ * "余量偏低 / 已用尽"不再加徽标（实测反馈：浮在余量条上方不美观，且信息重复）——
+ * 余量列的进度条本身已经表达：低余量是黄/红细条 + 行内百分比 hint，用尽是 0% 红条。
+ * 状态列只留给"为什么不可用"的负向原因（冷却/重登/停用）与"未查询"这种可操作的提示。
  */
 function quotaBadge(a) {
   switch (a.quotaLevel) {
@@ -621,12 +621,6 @@ function quotaBadge(a) {
       // 不置红：没查询过≠没额度，可能只是还没点「刷新套餐额度」。
       return '<span class="badge warn" title="从未查询过套餐余量，无从判断；该账号仍会被正常轮询。'
         + '点上方「刷新套餐额度」查询">余量未知</span>'
-    case 'empty':
-      // 不再显示：余量列自身的 0% 红条已够醒目；状态列只留给"为什么不可用"的负向原因。
-      return ''
-    case 'low':
-      return '<span class="badge warn" title="至少一个模型余量低于 10%，很快会跑不动">余量偏低'
-        + (a.worstPct != null ? ' ' + a.worstPct.toFixed(1) + '%' : '') + '</span>'
     default:
       return ''
   }
@@ -713,15 +707,9 @@ function quotaCell(a) {
       + '<span class="vl">' + esc(fmt(r)) + ' / ' + esc(fmt(t)) + pctTxt + expTxt + '</span>'
       + '</div>'
   }).join('')
-  // 整号结论放在最前：低余量需要预警（它还不是失败，但快要失败）；
-  // 已用尽不再单独加徽标——该模型的余量进度条本身就是 0% 红条，再叠一个红徽标
-  // 会把状态列真正的不可用原因（冷却/重登/停用）挤下去。
-  const lvl = a.quotaLevel
-  const head = lvl === 'low'
-    ? '<div><span class="badge warn" title="至少一个模型余量已低于 10%，很快会跑不动">余量偏低'
-      + (a.worstPct != null ? ' ' + a.worstPct.toFixed(1) + '%' : '') + '</span></div>'
-    : ''
-  return head + rows
+  // "余量偏低 / 已用尽"都不在单元格头部加徽标（实测反馈：浮在条形图上方不美观，
+  // 且信息重复——低余量模型本身就是黄/红细条 + 行内百分比 hint，用尽是 0% 红条）。
+  return rows
 }
 
 function accountRow(a) {
