@@ -83,6 +83,14 @@ export function loadConfig({ rootDir = process.cwd(), env = process.env } = {}) 
     paramUsableMs: num(env.PARAM_USABLE_MS, 40_000, 0),
     minIntervalMs: num(env.ACCOUNT_MIN_INTERVAL_MS, 2000, 1),
     cooldown3012Ms: num(env.COOLDOWN_3012_MIN, 30, 0) * 60_000,
+    /**
+     * 1005 连续熔断：同一（账号, 模型）连续 C1005_TRIP 次 1005 → 不看余额直接对该模型
+     * 雪藏 C1005_BENCH_MIN 分钟（进程内）。动机：余额接口与模型端点口径打架时（实测某号
+     * 余额坚称 300 万、端点必回 1005，21 次连败并诱发 3012 全池级联，2026-09-30 凌晨），
+     * 让调度器自动绕开必然失败的组合。详见 accounts.js 的 benched1005。
+     */
+    c1005Trip: num(env.C1005_TRIP, 3, 1),
+    c1005BenchMs: num(env.C1005_BENCH_MIN, 30, 0) * 60_000,
     maxRetries: num(env.MAX_RETRIES, 2, 0),
   }
 }

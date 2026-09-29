@@ -308,7 +308,7 @@ export async function main() {
     log(`[zcode2api] uncaughtException（已忽略，服务继续运行）: ${err?.stack ?? err}`)
   })
   const store = new AccountStore(config.poolDir)
-  const pool = new AccountPool(store, { minIntervalMs: config.minIntervalMs, cooldown3012Ms: config.cooldown3012Ms })
+  const pool = new AccountPool(store, { minIntervalMs: config.minIntervalMs, cooldown3012Ms: config.cooldown3012Ms, c1005Trip: config.c1005Trip, c1005BenchMs: config.c1005BenchMs })
   const paramPool = new ParamPool({ ttlMs: config.paramTtlMs, maxSize: config.poolSize, usableMs: config.paramUsableMs })
   const requestLog = createRequestLog({})
   const usage = new UsageStore({ dir: path.join(config.rootDir, 'usage'), log })

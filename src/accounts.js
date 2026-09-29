@@ -1,10 +1,18 @@
 const AFFINITY_TTL = 2 * 60 * 60 * 1000
 
 export class AccountPool {
-  constructor(store, { minIntervalMs = 2000, cooldown3012Ms = 30 * 60_000, now = Date.now } = {}) {
+  constructor(store, {
+    minIntervalMs = 2000,
+    cooldown3012Ms = 30 * 60_000,
+    c1005Trip = 3,
+    c1005BenchMs = 30 * 60_000,
+    now = Date.now,
+  } = {}) {
     this.store = store
     this.minIntervalMs = minIntervalMs
     this.cooldown3012Ms = cooldown3012Ms
+    this.c1005Trip = c1005Trip
+    this.c1005BenchMs = c1005BenchMs
     this.now = now
     this.affinity = new Map()
     /**
@@ -17,6 +25,11 @@ export class AccountPool {
      * 落盘的 `lastUsedAt` 只作跨进程/重启后的持久记录。
      */
     this.lastPick = new Map()
+    /**
+     * 1005 连续熔断记账：`"${id}::${model}"` → `{ count, benchUntil }`（进程内，见
+     * `benched1005` 的说明——重启即重新给机会，不进账号文件、不进面板）。
+     */
+    this.c1005 = new Map()
   }
 
   /**
@@ -50,6 +63,7 @@ export class AccountPool {
       && !this.neverProvisioned(acc)
       && !this.allPlansExpired(acc, model)
       && !this.modelQuotaExhausted(acc, model)
+      && !this.benched1005(acc, model)
   }
 
   /**
@@ -167,6 +181,43 @@ export class AccountPool {
       if (remaining > 0) return false // 还有可用额度
     }
     return sawLiveForModel
+  }
+
+  /**
+   * 该（账号, 模型）是否正被 1005 熔断雪藏。
+   *
+   * 背景（2026-09-30 凌晨事故）：`368d44de` 的余额接口坚称 `GLM-5.3 remaining=300 万`，
+   * 模型端点却每请求必回 1005——两套上游系统口径打架时，`modelQuotaExhausted` 读到的
+   * 永远是"健康"，调度器反复把请求派给必然失败的号（当晚 21 次 1005 全部来自它）；
+   * 自愈的"刷新缓存后复检"被假数据骗过，无法闭环。客户端 retryable 重试 + 网关换号
+   * 又在 44 秒内连打 5 个号，诱发上游 3012 行为风控**全池级联**（15 号冷却 30 分钟）。
+   *
+   * 于是加一层**不信任余额接口**的实测熔断：同一（账号, 模型）连续 `c1005Trip` 次 1005
+   * （`note1005` 记账），不看余额直接对该模型雪藏 `c1005BenchMs`。计数只认成功清零
+   * （`markSuccess`）——雪藏**按模型**生效，该号其他模型不受牵连。
+   *
+   * 状态只存进程内存：重启即重新给机会（首个计费周期内多一两次试探是可接受的代价），
+   * 换来的是不必往账号文件塞需要面板渲染的新字段。不传 `model` 恒为 false——
+   * `earliestWaitMs()` 等账号级判定不受单模型雪藏牵连。
+   */
+  benched1005(acc, model) {
+    if (!model) return false
+    const hit = this.c1005.get(`${acc.id}::${String(model).toLowerCase()}`)
+    return hit !== undefined && hit.benchUntil > this.now()
+  }
+
+  /** 记一次 1005；连续达到 `c1005Trip` 即对该模型雪藏并把计数清零（解禁后从零重新数）。 */
+  note1005(id, model) {
+    if (!model) return
+    const key = `${id}::${String(model).toLowerCase()}`
+    const hit = this.c1005.get(key) ?? { count: 0, benchUntil: 0 }
+    if (hit.benchUntil > this.now()) return // 雪藏期内不再累计（在途请求的迟到 1005）
+    hit.count += 1
+    if (hit.count >= this.c1005Trip) {
+      hit.benchUntil = this.now() + this.c1005BenchMs
+      hit.count = 0
+    }
+    this.c1005.set(key, hit)
   }
 
   /**
@@ -487,7 +538,10 @@ export class AccountPool {
     if (sessionKey) this.affinity.set(sessionKey, { accountId, at: this.now() })
   }
 
-  markSuccess(account) {
+  markSuccess(account, model = null) {
+    // 成功即证明该模型在这个号上跑得通：清掉 1005 连击计数（若有）。
+    // 只清对应模型——flash 成功不能给 glm-5.3 的熔断计数作保。
+    if (model) this.c1005.delete(`${account.id}::${String(model).toLowerCase()}`)
     return this.store.update(account.id, (cur) => ({
       cooldownUntil: 0,
       strikes: 0,
@@ -495,7 +549,9 @@ export class AccountPool {
     }))
   }
 
-  markError(account, { status, code }) {
+  markError(account, { status, code, model = null }) {
+    // 1005 连击记账在落盘临界区之外：只写进程内存（`this.c1005`），不进账号文件。
+    if (code === 1005) this.note1005(account.id, model)
     return this.store.update(account.id, (cur) => {
       const a = cur ?? account
       const stats = { ...a.stats, lastError: { status, code, at: this.now() } }

@@ -189,13 +189,14 @@ export function createGateway({ pool, paramPool, senders, config, log = () => {}
       const code = parseCode(text)
       const isOk = res.status === 200 && (code === null || code === 0)
       if (isOk) {
-        await pool.markSuccess(account)
+        await pool.markSuccess(account, anthropicBody?.model ?? null)
         return { response: res, account }
       }
       log(`[gateway] ${account.id} -> HTTP ${res.status} code=${code}`)
       // 只传真实 status/code；3012 冷却梯度、401 needsRelogin、1113 noPackage、
       // 429 冷却与 strikes 累计（5 次停用）全在池的 markError 内部实现，网关不重复判断。
-      await pool.markError(account, { status: res.status, code })
+      // model 供池做 1005 连击熔断记账（按账号+模型雪藏）。
+      await pool.markError(account, { status: res.status, code, model: anthropicBody?.model ?? null })
 
       // 3007 = captcha 校验失败的**参数**问题：换参重试，**不换号、不冷却**（同一账号继续发）。
       if (code === 3007 && paramRetries < maxRetries) {
