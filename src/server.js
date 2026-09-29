@@ -11,6 +11,8 @@ import { launchFarmBrowser } from './captcha/browser.js'
 import { sendZcodePlan } from './upstream/zcode-plan.js'
 import { sendBigModel } from './upstream/bigmodel-api.js'
 import { createGateway } from './gateway.js'
+import { fetchBalance } from './billing.js'
+import { createPlanCacheRefresher } from './plan-cache.js'
 import { UsageStore, createRequestLog } from './usage.js'
 import { mapToZcodePlan, publicModelIds } from './models.js'
 import { openaiToAnthropic, anthropicToOpenAI } from './protocol/convert.js'
@@ -324,11 +326,15 @@ export async function main() {
     log,
   })
   const farm = startFarmServer({ paramPool, port: config.farmPort, host: config.host, certDir: config.certDir })
+  // 1005（额度运行中途耗尽）时由网关触发刷新：把 planCache 拉回真实值，
+  // 池里现成的 modelQuotaExhausted 随即把死号排除（详见 plan-cache.js 顶部说明）。
+  const refreshPlanCache = createPlanCacheRefresher({ store, fetchBalance, log })
   const gateway = createGateway({
     pool,
     paramPool,
     config,
     log,
+    refreshPlanCache,
     senders: {
       oauth: ({ account, body, param, sessionId }) =>
         sendZcodePlan({ jwt: account.jwt, param, body, sessionId }),

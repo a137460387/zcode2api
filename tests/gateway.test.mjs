@@ -460,6 +460,122 @@ describe('gateway.complete', () => {
   })
 })
 
+// ── 1005：额度运行中途耗尽的自愈路径 ──────────────────────────────────────────
+// 实测背景：免费日包在运行中途烧穿时上游回 1005（HTTP 200 包业务码），而 planCache
+// 只在面板手动刷新时更新——缓存跟上前账号始终"健康"、被反复调度（9efaa210 连吃
+// 15 次后 ecddf87c 接棒）。网关应在 1005 时刷新缓存并复检，不可用即换号重试。
+describe('gateway 1005：额度耗尽自愈（刷新缓存 + 换号）', () => {
+  const err1005 = () => err(200, '{"code":1005,"msg":"quota exceeded"}')
+
+  it('刷新后确认耗尽：换号重试，客户端拿到 200（无感）', async () => {
+    const a1 = acc('a1'), a2 = acc('a2')
+    let cacheExhausted = false
+    const refreshed = []
+    const refreshPlanCache = async (account) => { refreshed.push(account.id); cacheExhausted = true }
+    let picks = 0
+    const pool = {
+      pick: () => (++picks === 1 ? { account: a1, waitMs: 0 } : { account: a2, waitMs: 0 }),
+      // 模拟真实 AccountPool：healthy 读取 planCache（这里由 refreshPlanCache 翻转）
+      healthy: (account) => !(account.id === 'a1' && cacheExhausted),
+      markSuccess: async () => {},
+      markError: async (a, e) => a.errors.push(e),
+    }
+    const g = createGateway({
+      pool,
+      paramPool: { take: async () => 'P' },
+      senders: { oauth: async ({ account }) => (account.id === 'a1' ? err1005() : ok()), apikey: async () => ok() },
+      config: { maxRetries: 2 },
+      refreshPlanCache,
+    })
+    const r = await g.complete({ model: 'glm-5.3-flash' }, {})
+    expect(r.response.status).toBe(200)
+    expect(r.account.id).toBe('a2')
+    expect(refreshed).toEqual(['a1'])
+    expect(a1.errors[0].code).toBe(1005)
+  })
+
+  it('刷新后仍健康（1005 另有成因）：保持原有 502 透传，不换号不循环', async () => {
+    const a1 = acc('a1')
+    let picks = 0
+    let refreshes = 0
+    const pool = {
+      pick: () => { picks++; return { account: a1, waitMs: 0 } },
+      healthy: () => true,
+      markSuccess: async () => {},
+      markError: async (a, e) => a.errors.push(e),
+    }
+    const g = createGateway({
+      pool,
+      paramPool: { take: async () => 'P' },
+      senders: { oauth: async () => err1005(), apikey: async () => ok() },
+      config: { maxRetries: 2 },
+      refreshPlanCache: async () => { refreshes++ },
+    })
+    await expect(g.complete({}, {})).rejects.toMatchObject({ status: 502, code: 1005 })
+    expect(refreshes).toBe(1)
+    expect(picks).toBe(1)
+  })
+
+  it('未注入 refreshPlanCache：行为与修复前一致（直接透传 502）', async () => {
+    const a1 = acc('a1')
+    const pool = fakePool([{ account: a1, waitMs: 0 }])
+    const g = createGateway({
+      pool,
+      paramPool: { take: async () => 'P' },
+      senders: { oauth: async () => err1005(), apikey: async () => ok() },
+      config: { maxRetries: 2 },
+    })
+    await expect(g.complete({}, {})).rejects.toMatchObject({ status: 502, code: 1005 })
+  })
+
+  it('刷新抛错（注入方违约）：被吞掉并按旧缓存透传，不影响请求路径', async () => {
+    const a1 = acc('a1')
+    const pool = fakePool([{ account: a1, waitMs: 0 }])
+    const g = createGateway({
+      pool,
+      paramPool: { take: async () => 'P' },
+      senders: { oauth: async () => err1005(), apikey: async () => ok() },
+      config: { maxRetries: 2 },
+      refreshPlanCache: async () => { throw new Error('boom') },
+    })
+    await expect(g.complete({}, {})).rejects.toMatchObject({ status: 502, code: 1005 })
+  })
+
+  it('连续多个号都耗尽：受 accountSwitches 上限保护，最终抛出带 accountId 的 1005', async () => {
+    const a1 = acc('a1'), a2 = acc('a2')
+    let picks = 0
+    const pool = {
+      pick: () => ({ account: [a1, a2][picks++] ?? null, waitMs: 0 }),
+      healthy: () => false,
+      markSuccess: async () => {},
+      markError: async (a, e) => a.errors.push(e),
+    }
+    const g = createGateway({
+      pool,
+      paramPool: { take: async () => 'P' },
+      senders: { oauth: async () => err1005(), apikey: async () => ok() },
+      config: { maxRetries: 1 },
+      refreshPlanCache: async () => {},
+    })
+    await expect(g.complete({}, {})).rejects.toMatchObject({ status: 502, code: 1005, accountId: 'a2' })
+  })
+
+  it('apikey 账号不触发刷新（余额接口不认它），直接透传', async () => {
+    const k1 = acc('k1', 'apikey')
+    let refreshes = 0
+    const pool = fakePool([{ account: k1, waitMs: 0 }])
+    const g = createGateway({
+      pool,
+      paramPool: { take: async () => 'P' },
+      senders: { oauth: async () => ok(), apikey: async () => err1005() },
+      config: { maxRetries: 2 },
+      refreshPlanCache: async () => { refreshes++ },
+    })
+    await expect(g.complete({}, {})).rejects.toMatchObject({ status: 502, code: 1005 })
+    expect(refreshes).toBe(0)
+  })
+})
+
 // 池对"节流中"（秒级，正常路径）与"冷却中"（30min~24h，本次请求等下去也不会成功）
 // 返回同样的形态（正 waitMs、无 warn），网关必须靠累计等待上限区分，
 // 否则一次 HTTP 请求会干睡在冷却窗里（实测 waitMs=1799990 → 30 分钟）。

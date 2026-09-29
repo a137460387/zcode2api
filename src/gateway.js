@@ -22,7 +22,7 @@ const parseCode = (text) => {
   try { return JSON.parse(text).code ?? null } catch { return null }
 }
 
-export function createGateway({ pool, paramPool, senders, config, log = () => {} }) {
+export function createGateway({ pool, paramPool, senders, config, log = () => {}, refreshPlanCache = null }) {
   // 默认值与 config.js 的 maxRetries 保持一致：漏传时应取"有重试"而不是"零重试"
   // （`config.maxRetries ?? 0` 会让换号/换参在漏传时静默失效，与 `> undefined` 恒 false 是同一类错误）。
   const maxRetries = config.maxRetries ?? 2
@@ -198,6 +198,38 @@ export function createGateway({ pool, paramPool, senders, config, log = () => {}
        * 原样交给客户端会凭空扩大凭据泄露面。只保留 status 与业务码，详情走 `log`。
        */
       const brief = `upstream HTTP ${res.status}${code != null ? ` code=${code}` : ''}`
+      /**
+       * 1005 实测语义是"该号额度在运行中途耗尽"（免费日包烧穿），不是请求本身有错：
+       * 同一个请求换一个号就能成功。而 planCache 唯一的常规写入方是面板手动刷新
+       * （panel/api.js），缓存跟上前该号在池里始终"健康"、被反复调度
+       * （实测 9efaa210 连吃 15 次 1005 后 ecddf87c 接棒）。
+       *
+       * 故收到 1005 时触发一次（去重后的）套餐缓存刷新，再复检健康度：
+       * - 复检不可用 → 换号重试，当前请求自愈，客户端无感；
+       * - 复检仍可用（1005 另有成因、刷新失败、或测试假池没有 healthy）→ 落到下方
+       *   原有的"客户端错误透传"，不循环、不放大。
+       * 刷新器自身承诺不抛错（见 plan-cache.js），这里的 try/catch 是对注入方的防御。
+       */
+      if (code === 1005 && account.type === 'oauth' && typeof refreshPlanCache === 'function') {
+        try {
+          await refreshPlanCache(account)
+        } catch { /* 刷新失败按旧缓存判断，走透传 */ }
+        const usable = typeof pool.healthy === 'function' ? pool.healthy(account, anthropicBody?.model) : true
+        if (!usable) {
+          const err = new GatewayError({
+            status: 502,
+            code,
+            message: brief,
+            upstreamStatus: res.status,
+            accountId: account.id,
+            hint: '该账号额度已耗尽（1005）：套餐缓存已刷新并换号重试；日额度次日自动恢复',
+          })
+          if (++accountSwitches > maxRetries) throw err
+          lastRetryable = err
+          account = null
+          continue
+        }
+      }
       const riskOrServer = code === 3012 || res.status === 429 || res.status >= 500
       const credDead = res.status === 401 || code === 1113
       if (riskOrServer || credDead) {
