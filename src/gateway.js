@@ -175,6 +175,15 @@ export function createGateway({ pool, paramPool, senders, config, log = () => {}
        * 故先 `clone()` 出副本用于判定，原响应体留给调用方消费。
        * （测试用的假响应对象没有 clone，回退为直接读取——那时 body 语义由假对象自己保证。）
        */
+      // 流式响应绝不能整包读码：clone().text() 会把 tee 的另一支拉到底，complete() 直到
+      // 上游生成完才返回——客户端 TTFB == 总耗时（实测 216s 的行全是这么来的；直连探针证明
+      // 上游本身 2~8s 就开始逐块吐 SSE）。SSE 按 content-type 识别直接放行；非流式（错误体
+      // 是完整 JSON）才整包读码。SSE 里即使混有业务码，下方 JSON.parse 也解析不了，无损失。
+      const contentType = String(res.headers?.get?.('content-type') ?? '')
+      if (contentType.includes('text/event-stream')) {
+        await pool.markSuccess(account)
+        return { response: res, account }
+      }
       const probe = typeof res.clone === 'function' ? res.clone() : res
       const text = await probe.text().catch(() => '')
       const code = parseCode(text)
