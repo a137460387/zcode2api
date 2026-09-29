@@ -15,12 +15,13 @@ import { AccountStore, newAccountFields } from '../src/auth/store.js'
 import { AccountPool } from '../src/accounts.js'
 import { createGateway } from '../src/gateway.js'
 
-const mkPool = (store, clock) => new AccountPool(store, {
+const mkPool = (store, clock, over = {}) => new AccountPool(store, {
   minIntervalMs: 0, // 测试不考节流；clock 完全可控
   cooldown3012Ms: 30 * 60_000,
   c1005Trip: 3,
   c1005BenchMs: 30 * 60_000,
   now: () => clock.t,
+  ...over,
 })
 
 const cur = (store, acc) => store.list().find((a) => a.id === acc.id)
@@ -60,7 +61,9 @@ describe('1005 连续熔断（benched1005）', () => {
   })
 
   it('pick 按模型绕开被雪藏的号；另一模型照常选中它', () => {
+    // 对称雪藏（a1@glm-5.3、a2@flash）：断言与随机生成的账号 id 排序无关
     for (let i = 0; i < 3; i++) pool.markError(a1, { status: 200, code: 1005, model: 'glm-5.3' })
+    for (let i = 0; i < 3; i++) pool.markError(a2, { status: 200, code: 1005, model: 'glm-5.3-flash' })
     expect(pool.pick(null, { model: 'glm-5.3' }).account.id).toBe(a2.id)
     expect(pool.pick(null, { model: 'glm-5.3-flash' }).account.id).toBe(a1.id)
   })
@@ -91,15 +94,17 @@ describe('1005 连续熔断（benched1005）', () => {
     expect(pool.healthy(cur(store, a1), 'glm-5.3')).toBe(true)
   })
 
-  it('网关集成：第 3 次 1005 走 healthy 复检失败 → 换号成功，不再透传 502', async () => {
-    // 预热：a1 已连吃 2 次 1005（此刻仍"健康"）
-    pool.markError(a1, { status: 200, code: 1005, model: 'glm-5.3' })
-    pool.markError(a1, { status: 200, code: 1005, model: 'glm-5.3' })
-    let a1Calls = 0
+  it('网关集成：1005 熔断生效 → healthy 复检失败 → 换号成功，不再透传 502', async () => {
+    // c1005Trip=1：免去对"随机生成的账号 id 决定谁先被选中"的依赖——
+    // 网关第一个尝试的号就是事故号，一次 1005 即熔断换号。
+    const pool1 = mkPool(store, clock, { c1005Trip: 1 })
+    let failingId = null
+    let failCalls = 0
     const senders = {
       oauth: async ({ account }) => {
-        if (account.id === a1.id) {
-          a1Calls++
+        if (failingId === null) failingId = account.id
+        if (account.id === failingId) {
+          failCalls++
           return { status: 200, text: async () => '{"code":1005,"msg":"exceed quota limit"}' }
         }
         return { status: 200, text: async () => '{"code":0}' }
@@ -107,7 +112,7 @@ describe('1005 连续熔断（benched1005）', () => {
       apikey: async () => ({ status: 200, text: async () => '{"code":0}' }),
     }
     const g = createGateway({
-      pool,
+      pool: pool1,
       paramPool: { take: async () => 'P' },
       senders,
       config: { maxRetries: 2 },
@@ -116,7 +121,7 @@ describe('1005 连续熔断（benched1005）', () => {
     })
     const r = await g.complete({ model: 'glm-5.3' }, {})
     expect(r.response.status).toBe(200)
-    expect(r.account.id).toBe(a2.id)
-    expect(a1Calls).toBe(1) // 第 3 次 1005 落在 a1；复检失败后换号，a2 一次成功
+    expect(r.account.id).not.toBe(failingId)
+    expect(failCalls).toBe(1) // 熔断后复检即失败，事故号只被打一次
   })
 })

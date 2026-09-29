@@ -242,7 +242,7 @@ describe('gateway.complete', () => {
     await expect(g.complete({}, {})).rejects.toMatchObject({ status: 429, code: 3012 })
     // 只传真实 status/code；网关不自行写 cooldownUntil / strikes
     expect(calls.length).toBe(1)
-    expect(calls[0].e).toEqual({ status: 405, code: 3012 })
+    expect(calls[0].e).toEqual({ status: 405, code: 3012, model: null })
   })
 
   it('awaits the async pool methods (no lost markError/markSuccess)', async () => {
