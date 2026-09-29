@@ -13,7 +13,10 @@
 > - ✅ **管理面板**：账号增删启停、**扫描本机多实例登录**（含 Coding Plan key）、套餐余量、
 >   参数池与农场状态、用量分析（含首字延迟 / 生成速度 / 缓存命中率）、
 >   运行参数热更新与 `.env` 回写、面板密码、局域网/免密访问开关。
-> - ✅ 462 个单元/集成测试 + 端到端冒烟全通过（`npm test` 一次跑完两者）。
+> - ✅ **验证码降级为保险丝（2026-09-29）**：上游 3.14.4 起默认关闭模型请求验证码校验，
+>   15 个账号无参直发实测全部通过验证码层（4 个完整 200 + 业务层 1005/3009，零 3007）；
+>   农场断供不再导致 503。详见 [3007 与验证码的降级](#3007-与验证码的降级2026-09-29)。
+> - ✅ 506 个单元/集成测试 + 端到端冒烟全通过（`npm test` 一次跑完两者）。
 >
 > **关键突破（曾经 3012 的根因）**：上游网关对请求做**内容检查**——`system` 字段里
 > 必须含 ZCode 身份块，否则直接返回 `3012 "method not allowed"`（对外文案为
@@ -34,8 +37,13 @@ npm start
 - API：`http://127.0.0.1:28630/v1`（OpenAI `/v1/chat/completions`、Anthropic `/v1/messages`）
 - **管理面板**：`http://127.0.0.1:28630/` —— 本机直接开，**不需要密码**（见 [怎么进后台](#怎么进后台)）
 - farm 页：`http://127.0.0.1:28631/farm`
+  - **2026-09-29 起农场降级为保险丝**：上游 3.14.4 默认不再校验模型请求验证码（见
+    [3007 与验证码的降级](#3007-与验证码的降级2026-09-29)），农场断供**不再**导致请求失败——
+    网关自动无参直发。本节说的"断供"指**参数产出**断供，不是 API 不可用；只有上游恢复校验
+    （请求回 3007）时，农场才重新成为硬依赖（届时网关的换参重试会自动接上）。
   - **默认后台模式**（`FARM_AUTO_BROWSER=1` + `FARM_HEADLESS=0`）：playwright 启动**有头**
-    浏览器自动产参数。桌面会出现一个 Chrome 窗口——**别关它**，关掉即断供（详见下面"为什么默认有头"）。
+    浏览器自动产参数。桌面会出现一个 Chrome 窗口——关掉即参数断供（API 仍可用，
+    详见下面"为什么默认有头"）。
   - **不想看到那个窗口**：设 `FARM_MINIMIZED=1`，农场窗口启动即最小化到任务栏，
     屏幕上看不到它。它**仍是有头浏览器**，不是回到无头——实测最小化状态下产出正常
     （`total` 稳定增长、`fails=0`）、端到端请求可用。
@@ -239,7 +247,7 @@ npm run e2e         # 只跑端到端冒烟：真实 server + 真实 Response �
 
 每个实例收两类东西：
 
-- **OAuth 账号**（`zcodejwttoken`）→ 走一次性 captcha 的免费通道
+- **OAuth 账号**（`zcodejwttoken`）→ 走免费通道（3.14.4 起上游默认不校验 captcha，参数可选）
 - **Coding Plan API Key**（客户端里绑定的 `account-provider:coding-plan:...:api-key`）
   → 走 `open.bigmodel.cn` 标准通道，**不需要 captcha**
 
@@ -269,7 +277,7 @@ npm run e2e         # 只跑端到端冒烟：真实 server + 真实 Response �
 
 | 账号类型 | 上游 | 需 captcha | 适用 |
 |---|---|---|---|
-| oauth | `zcode.z.ai/api/v1/zcode-plan/anthropic` | 每请求一个一次性参数（farm 供给） | Start Plan / Global Build 免费额度 |
+| oauth | `zcode.z.ai/api/v1/zcode-plan/anthropic` | 默认不校验（3.14.4 起）：有参数则带，farm 是保险丝 | Start Plan / Global Build 免费额度 |
 | apikey | `open.bigmodel.cn/api/anthropic` | 否 | 付费 GLM Coding Plan key |
 
 ## 客户端接入
@@ -309,8 +317,8 @@ npm run e2e         # 只跑端到端冒烟：真实 server + 真实 Response �
 | `system` 字段 | 3 块官方身份块（带 `cache_control: ephemeral`） | 无 / 仅用户 system |
 | 首轮 user 消息 | 前挂 `<system-reminder>…# currentDate…</system-reminder>` | 纯用户文本 |
 | 模型名 | 小写 `glm-5.3` | 大写 `GLM-5.3` |
-| `user-agent` | `ZCode/3.14.3 ai-sdk/anthropic/3.0.81` | `…ai-sdk/provider-utils/4.0.27 runtime/node.js/24` |
-| `x-zcode-app-version` | `3.14.3` | 缺失 |
+| `user-agent` | `ZCode/3.14.4 ai-sdk/anthropic/3.0.81` | `…ai-sdk/provider-utils/4.0.27 runtime/node.js/24` |
+| `x-zcode-app-version` | `3.14.4` | 缺失 |
 | `accept-encoding` | `gzip` | 缺失 |
 | `x-title` | `Z Code@cli` | `Z Code@electron` |
 | `x-query-id` / `x-session-id` | 不带 | 带了 |
@@ -370,6 +378,40 @@ GLM-5.3-Flash       → 200（含 thinking 块）
 
 耗尽型的号在午夜日额度重置、缓存刷新后自动回归轮询，全程无需人工干预。
 
+## 3007 与验证码的降级（2026-09-29）
+
+**官方客户端 3.14.4 更新日志**："为了进一步优化免费套餐的使用体验，关闭模型请求验证码校验。"
+
+逆向两版桌面客户端（v3.14.3 → v3.14.4，`app.asar` 全量 diff + 逐文件哈希）确认了机制：
+
+- 整套阿里云验证码机器（AliyunCaptcha.js 加载、certifyId 的 F008 去重、调度器的
+  `captcha-retry`、验证码网络诊断）**两版都在**，唯一变化是渲染进程的 captcha 准备函数
+  新增一个提前返回分支：服务端远程配置 `configs.captcha` 里出现 `skip_model_request: true`
+  （或 `enabled: false`）时，客户端返回**空 headers** 直发——不解题、不带
+  `x-aliyun-captcha-verify-param`。3.14.3 里拿不到有效配置会直接抛错。
+  即：**校验开关在服务端，客户端只是学会了服从**。
+- 除该分支外无其他暗改：两版 host 进程 `x-*` 请求头集合完全一致，端点与签名未变。
+
+**实测（2026-09-29）**：按项目自身的 header/body 构造器复刻官方形态但**去掉两个验证码头**，
+对本机全部 15 个 OAuth 账号各发一个 16 token 的最小请求：4 个完整 200 生成响应、
+5 个 `1005`（额度尽）、6 个 `3009`（并发占用），**零个 3007**——无参请求全部通过验证码层，
+直接到达业务层。
+
+**网关的对应改动**（farm 从热依赖降级为保险丝）：
+
+- `src/upstream/headers.js`：验证码头改为**按需携带**——有参数才带，无参数绝不带。
+  绝不能写 `'x-…': param` 了事：`fetch` 会把 `undefined` 序列化成字符串 `"undefined"`
+  污染上游风控，而单测的 `toBeUndefined()` 断言掩盖这一点（属性存在但值为 undefined 时照样通过）。
+  默认 `x-zcode-app-version` 同步升到 `3.14.4`，与官方客户端对齐。
+- `src/gateway.js`：`paramPool.take()` 失败（农场断供）不再走 `__paramError → 503`，
+  而是**无参直发**。上游若恢复校验（服务端把配置翻回去），请求会回 `3007`，走既有的
+  "换参重试、不换号、不冷却"路径重新取参——农场自动回归热路径，不需要改代码。
+- 回归测试：`tests/captcha-skip.test.mjs`（无参时验证码**键不存在**而非值为 undefined、
+  有参照常带双头、版本号 3.14.4、农场断供时请求照常 200）。
+
+**运维影响**：农场浏览器停掉（`FARM_AUTO_BROWSER=0` 或关掉 Chrome 窗口）不影响可用性；
+留着它则请求继续带参，与旧版行为一致。两种模式都正确，按喜好选。
+
 ## 风险与已知限制
 
 - 上游对模型端点有风控：`3012` 会触发账号冷却（默认 30min，24h 内第 3 次起 24h，5 次停用）。
@@ -377,7 +419,12 @@ GLM-5.3-Flash       → 200（含 thinking 块）
 - **`system` 字段形态与上游策略强耦合**：若官方客户端升级后改变身份块结构，
   需要同步更新 `src/upstream/zcode-system.json` 与组装逻辑，否则会重新出现 3012。
 - farm 依赖阿里云验证码 SDK 配置（SceneId `11xygtvd` / prefix `no8xfe`）。该配置由服务端下发，
-  可用 `GET https://zcode.z.ai/api/v1/client/configs`（带 JWT）读取，便于核对是否变更。
+  可用 `GET https://zcode.z.ai/api/v1/client/configs`（带 JWT）读取，便于核对是否变更；
+  其中的 `configs.captcha.skip_model_request` 就是 3.14.4 的校验开关（见
+  [3007 与验证码的降级](#3007-与验证码的降级2026-09-29)）。
+- **上游随时可恢复验证码校验**：那是一次远程配置翻转，立即对全体客户端生效。届时未跑农场的
+  部署会开始吃 3007（换参重试耗尽后透传）——把农场开起来即可，网关的换参重试会自动接上，
+  无需改代码。
 - farm 的浏览器 UA 覆盖**已不足以**骗过 SDK：UA 必须覆盖且版本要真实（playwright 在 headless 下
   默认 UA 含 `HeadlessChrome/<ver>`，SDK 见之即返回 `F001`），`src/captcha/browser.js` 会自动探测
   本机 Chrome 版本并构造桌面 UA。但**单靠 UA 已经救不回无头模式**——SDK 现在还会看 Canvas/WebGL/GPU

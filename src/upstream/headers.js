@@ -13,7 +13,7 @@ const uuid = () => crypto.randomUUID()
  * - `accept-encoding: gzip`（官方固定带）
  * - **不带** `x-query-id` / `x-session-id`（仅 coding-plan 路径才带）
  */
-export function buildZcodePlanHeaders({ jwt, param, sessionId, appVersion = '3.14.3', clientTitle = 'cli' }) {
+export function buildZcodePlanHeaders({ jwt, param, sessionId, appVersion = '3.14.4', clientTitle = 'cli' }) {
   return {
     'accept-encoding': 'gzip',
     'anthropic-version': '2023-06-01',
@@ -21,8 +21,14 @@ export function buildZcodePlanHeaders({ jwt, param, sessionId, appVersion = '3.1
     'content-type': 'application/json',
     'http-referer': 'https://zcode.z.ai',
     'user-agent': `ZCode/${appVersion} ai-sdk/anthropic/3.0.81`,
-    'x-aliyun-captcha-verify-param': param,
-    'x-aliyun-captcha-verify-region': 'cn',
+    // 3.14.4 起上游默认不再校验验证码（官方 skip_model_request 分支返回空 headers，
+    // 实测无参直发 200）：param 缺省时**不携带**验证码头。绝不能写成 `'x-...': param`——
+    // fetch 会把 undefined 序列化成字符串 "undefined" 污染上游风控（单测的
+    // toBeUndefined 掩盖了这一点：属性存在但值为 undefined 时断言照样通过）。
+    ...(param ? {
+      'x-aliyun-captcha-verify-param': param,
+      'x-aliyun-captcha-verify-region': 'cn',
+    } : {}),
     'x-api-key': jwt,
     'x-client-language': 'zh-CN',
     'x-client-timezone': 'Asia/Shanghai',

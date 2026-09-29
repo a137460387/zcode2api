@@ -23,3 +23,4 @@ node_modules/
 
 # 审查/执行过程的临时工作目录（进度账本、探针、报告），不入库
 .superpowers/
+.client-snapshots/

@@ -43,11 +43,15 @@ export function createGateway({ pool, paramPool, senders, config, log = () => {}
     }
     // 取参数失败是**本地农场产出不足**，与账号健康完全无关：
     // 必须与"上游请求失败"区分，否则会把健康账号标记为出错、还白耗一次换号额度。
-    let param
+    let param = null
     try {
       param = await paramPool.take()
     } catch (e) {
-      return { __paramError: e }
+      // 3.14.4 起上游默认不再校验验证码（官方 skip_model_request 分支返回空 headers，
+      // 实测无参直发 200）：农场断供时**无参直发**，把农场从热依赖降级为保险丝。
+      // 上游若恢复校验会回 3007 → complete() 既有的换参重试会再次尝试取参，
+      // 那时农场仍无货才真正不可用。绝不能在这里返回错误：农场一断供就全站 503。
+      log(`[gateway] 农场无参数，无参直发（上游 3.14.4 默认不校验验证码）：${e.message}`)
     }
     return senders.oauth({ account, body, param, sessionId })
   }
@@ -157,13 +161,9 @@ export function createGateway({ pool, paramPool, senders, config, log = () => {}
         account = null
         continue
       }
-      if (res && res.__paramError) {
-        throw new GatewayError({
-          status: 503,
-          message: `captcha param unavailable: ${res.__paramError.message}`,
-          hint: '农场未供给验证码参数：请在浏览器打开 farm 页并保持标签页运行',
-        })
-      }
+      // 农场断供不再硬失败（3.14.4 起上游默认不校验验证码）：sendOnce 已降级为
+      // 无参直发；上游若恢复校验会回 3007，由下方"换参重试"路径唤起农场。
+      // 原"__paramError → 503"分支已死代码化并移除——农场只剩保险丝职责。
       /**
        * 上游可能以 HTTP 200 包业务错误码（本项目多处如此：3001/3007/3012/1113 都在 body 的
        * `code` 字段），故**必须解析 body 判定**，不能只看 `res.status`。
